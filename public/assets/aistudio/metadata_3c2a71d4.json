@@ -1,0 +1,8 @@
+{
+  "name": "Seven Sunday ETMS",
+  "description": "Seven Sunday Enterprise Management System with real device connectivity, attendance register & print view, OT multipliers (1.75x/2.0x/2.5x), leave management, secretary documents, supply chain, Sales & CRM, double-entry accounting, and internal corporate chat.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

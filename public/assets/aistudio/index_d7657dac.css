@@ -1,0 +1,97 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+
+@layer base {
+  :root {
+    --font-display: 'Plus Jakarta Sans', 'Noto Sans Ethiopic', system-ui, -apple-system, sans-serif;
+    --font-sans: 'DM Sans', 'Noto Sans Ethiopic', system-ui, -apple-system, sans-serif;
+    --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
+
+    --ss-primary: #087CEB;
+    --ss-secondary: #18243A;
+    --ss-accent: #38BDF8;
+    --ss-background: #F8FAFC;
+    --ss-text: #172033;
+    --ss-white: #FFFFFF;
+  }
+
+  body {
+    font-family: var(--font-sans);
+    background-color: var(--ss-background);
+    color: var(--ss-text);
+  }
+
+  .dark body {
+    background-color: #0b1120;
+    color: #f1f5f9;
+  }
+
+  h1, h2, h3, h4, .font-display {
+    font-family: var(--font-display);
+  }
+
+  .font-mono, .tabular-nums {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+/* True A4 Document Preview Sheet */
+.a4-sheet {
+  width: 210mm;
+  min-height: 297mm;
+  padding: 18mm 16mm;
+  background: #FFFFFF;
+  color: #172033;
+  box-sizing: border-box;
+}
+
+/* True A4 Landscape Payroll Sheet */
+.a4-landscape-sheet {
+  width: 297mm;
+  min-height: 210mm;
+  padding: 12mm 14mm;
+  background: #FFFFFF;
+  color: #172033;
+  box-sizing: border-box;
+}
+
+@media print {
+  @page {
+    size: A4 portrait;
+    margin: 10mm;
+  }
+
+  body {
+    background: #ffffff !important;
+    color: #172033 !important;
+  }
+
+  .no-print {
+    display: none !important;
+  }
+
+  .print-only-container {
+    display: block !important;
+    width: 100% !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    border: none !important;
+    box-shadow: none !important;
+    background: #ffffff !important;
+    color: #172033 !important;
+  }
+
+  .a4-sheet,
+  .a4-landscape-sheet {
+    width: 100% !important;
+    min-height: auto !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    box-shadow: none !important;
+    border: none !important;
+  }
+
+  .print-break-avoid {
+    break-inside: avoid;
+  }
+}
