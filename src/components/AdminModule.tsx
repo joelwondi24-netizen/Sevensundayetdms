@@ -55,7 +55,9 @@ const ALL_ROLES: UserRole[] = [
   'Warehouse Manager',
   'Procurement Officer',
   'Sales Manager',
+  'Attendance Officer',
   'Security Supervisor',
+  'Security Guard',
   'Employee',
   'Auditor',
   'Viewer',
@@ -68,6 +70,7 @@ const ALL_MATRIX_MODULES: Array<{ key: ModuleKey; label: string }> = [
   { key: 'hr', label: 'HR & ID' },
   { key: 'devices', label: 'Device Conn.' },
   { key: 'attendance', label: 'Attendance' },
+  { key: 'scheduling', label: 'Shifts & Schedule' },
   { key: 'leave', label: 'Leave' },
   { key: 'payroll', label: 'Payroll' },
   { key: 'secretary', label: 'Secretary' },
@@ -99,6 +102,7 @@ export const DEFAULT_RBAC_MATRIX: Record<UserRole, ModuleKey[]> = {
     'approvals',
     'hr',
     'attendance',
+    'scheduling',
     'leave',
     'secretary',
     'company-forms',
@@ -116,6 +120,7 @@ export const DEFAULT_RBAC_MATRIX: Record<UserRole, ModuleKey[]> = {
     'hr',
     'devices',
     'attendance',
+    'scheduling',
     'leave',
     'payroll',
     'secretary',
@@ -182,9 +187,35 @@ export const DEFAULT_RBAC_MATRIX: Record<UserRole, ModuleKey[]> = {
     'sync',
   ],
   'Sales Manager': ['dashboard', 'company-forms', 'sales-crm', 'materials', 'reports', 'chat', 'sync'],
-  'Security Supervisor': ['dashboard', 'company-forms', 'gate-pass', 'devices', 'attendance', 'vehicles', 'assets', 'chat', 'sync'],
-  Auditor: ['dashboard', 'company-forms', 'gate-pass', 'gin', 'finance', 'payroll', 'reports', 'audit', 'approvals', 'chat', 'sync'],
-  Employee: ['dashboard', 'attendance', 'leave', 'company-forms', 'gate-pass', 'material-requests', 'chat', 'sync'],
+  'Attendance Officer': [
+    'dashboard',
+    'approvals',
+    'hr',
+    'devices',
+    'attendance',
+    'scheduling',
+    'leave',
+    'company-forms',
+    'reports',
+    'chat',
+    'sync',
+  ],
+  'Security Supervisor': [
+    'dashboard',
+    'company-forms',
+    'gate-pass',
+    'devices',
+    'attendance',
+    'scheduling',
+    'vehicles',
+    'assets',
+    'reports',
+    'chat',
+    'sync',
+  ],
+  'Security Guard': ['dashboard', 'gate-pass', 'attendance', 'scheduling', 'company-forms', 'chat', 'sync'],
+  Auditor: ['dashboard', 'company-forms', 'gate-pass', 'gin', 'finance', 'payroll', 'scheduling', 'reports', 'audit', 'approvals', 'chat', 'sync'],
+  Employee: ['dashboard', 'attendance', 'scheduling', 'leave', 'company-forms', 'gate-pass', 'material-requests', 'chat', 'sync'],
   Viewer: ['dashboard', 'chat', 'sync'],
 };
 
@@ -567,7 +598,7 @@ export const AdminModule: React.FC<AdminModuleProps> = ({
               System Administrator & Company Governance Console
             </h2>
             <p className="text-xs text-slate-500 dark:text-slate-400">
-              Full-platform System Administrator controls: customize all 25 modules, multi-tenant workspaces, approving departments, 6 languages, branding, RBAC, and SMTP.
+              Full-platform System Administrator controls: customize all {ALL_MATRIX_MODULES.length} modules, multi-tenant workspaces, approving departments, 6 languages, branding, RBAC, and SMTP.
             </p>
           </div>
           <div className="flex items-center gap-2">
@@ -854,7 +885,7 @@ export const AdminModule: React.FC<AdminModuleProps> = ({
           <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-6 space-y-4">
             <div>
               <h4 className="text-sm font-bold text-[#172033] dark:text-white">
-                All 25 Platform Modules — Custom Sidebar Labels, Header Titles & Active Status
+                All {ALL_MATRIX_MODULES.length} Platform Modules — Custom Sidebar Labels, Header Titles & Active Status
               </h4>
               <p className="text-xs text-slate-500 dark:text-slate-400">
                 Leave custom labels blank to use automatic 6-language translations, or enter custom names for this tenant. System Administrator always retains Admin & Dashboard access.

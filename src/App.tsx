@@ -4,6 +4,7 @@ import {
   Bell,
   BookOpen,
   Building2,
+  CalendarClock,
   CalendarOff,
   ClipboardCheck,
   ClipboardList,
@@ -53,6 +54,7 @@ import { OperationsCenterModule } from './components/OperationsCenterModule';
 import { OfflineIndicator, PWAInstallButton } from './components/PWAInstallButton';
 import { ReportsModule } from './components/ReportsModule';
 import { SalesCrmModule } from './components/SalesCrmModule';
+import { SchedulingModule } from './components/SchedulingModule';
 import { SecretaryModule } from './components/SecretaryModule';
 import { SupplyChainModule, type SupplyChainTab } from './components/SupplyChainModule';
 import { ALL_COMPANY_FORMS } from './data/companyFormsCatalog';
@@ -87,6 +89,7 @@ const ALL_MODULE_KEYS: ModuleKey[] = [
   'hr',
   'devices',
   'attendance',
+  'scheduling',
   'leave',
   'payroll',
   'secretary',
@@ -191,6 +194,7 @@ const NAV_GROUPS: NavGroup[] = [
       { key: 'hr', fallbackLabel: 'HR & Staff ID Cards', icon: <Users className="w-4 h-4" /> },
       { key: 'devices', fallbackLabel: 'Device Connections', icon: <Cpu className="w-4 h-4" /> },
       { key: 'attendance', fallbackLabel: 'Attendance Register & OT', icon: <Clock className="w-4 h-4" /> },
+      { key: 'scheduling', fallbackLabel: 'Staff Scheduling & Shifts', icon: <CalendarClock className="w-4 h-4" /> },
       { key: 'leave', fallbackLabel: 'Leave Management', icon: <CalendarOff className="w-4 h-4" /> },
       { key: 'payroll', fallbackLabel: 'Payroll & Ethiopian Tax', icon: <Wallet className="w-4 h-4" /> },
       { key: 'secretary', fallbackLabel: 'Secretary & A4 Documents', icon: <FileText className="w-4 h-4" /> },
@@ -238,10 +242,11 @@ const MODULE_TITLES: Record<ModuleKey, string> = {
   hr: 'Human Resources, Registration Format & QR Staff IDs',
   devices: 'Device Connections Management',
   attendance: 'Attendance Register & Overtime Multipliers',
+  scheduling: 'Staff Scheduling, 3/4-Shift Management & Dept Timetables',
   leave: 'Leave Management',
   payroll: 'Payroll, Bonus & Ethiopian Statutory Tax Rules',
   secretary: 'Secretary Department & A4 Official Company Documents',
-  'company-forms': 'Complete Company Forms (16 Departments) & Staff Evaluation',
+  'company-forms': 'Complete Company Forms (17 Departments) & Staff Evaluation',
   'gate-pass': 'Single-Use Security Gate Pass & Exit Control',
   materials: 'Materials Master Catalog & Movements',
   'material-requests': 'Materials Request',
@@ -788,7 +793,7 @@ export default function App() {
             >
               <Search className="w-3.5 h-3.5 text-[#087CEB]" />
               <span className="hidden md:inline font-medium">
-                {translateUi(lang, 'search_placeholder', 'Search modules, 305 forms, records...')}
+                {translateUi(lang, 'search_placeholder', `Search modules, ${ALL_COMPANY_FORMS.length} forms, records...`)}
               </span>
               <span className="md:hidden font-medium">{translateUi(lang, 'search_short', 'Search')}</span>
               <kbd className="hidden lg:inline-flex items-center px-1.5 py-0.5 text-[10px] font-mono font-bold text-[#18243A] dark:text-[#38BDF8] bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded">
@@ -922,6 +927,16 @@ export default function App() {
             <AttendanceModule
               currency={currency}
               calendarMode={calendarMode}
+              currentUserRole={currentUser.role}
+              onRefreshDashboard={refreshDashboard}
+            />
+          )}
+          {activeModule === 'scheduling' && (
+            <SchedulingModule
+              company={company}
+              calendarMode={calendarMode}
+              currentUserRole={currentUser.role}
+              currentUserCode={currentUser.email}
               onRefreshDashboard={refreshDashboard}
             />
           )}
@@ -999,7 +1014,7 @@ export default function App() {
               <input
                 type="text"
                 autoFocus
-                placeholder={translateUi(lang, 'search_placeholder', 'Search modules, 305 company forms, staff, gate passes, SKUs, approvals...')}
+                placeholder={translateUi(lang, 'search_placeholder', `Search modules, ${ALL_COMPANY_FORMS.length} company forms, staff, schedules, gate passes, SKUs...`)}
                 value={globalSearch}
                 onChange={(e) => setGlobalSearch(e.target.value)}
                 className="flex-1 text-sm bg-transparent text-[#172033] dark:text-white focus:outline-none"
@@ -1035,9 +1050,9 @@ export default function App() {
                     {(
                       [
                         ['dashboard', 'Operations & Financial Dashboard'],
-                        ['devices', 'Device Connections & Live Probes'],
-                        ['gate-pass', 'Single-Use Gate Pass Issuance'],
-                        ['company-forms', 'Company Forms (305 Templates) & Evaluations'],
+                        ['scheduling', '3-Shift & 4-Shift Scheduling & Dept Timetables'],
+                        ['attendance', 'Morning / Afternoon / Night Attendance & OT'],
+                        ['company-forms', `Company Forms (${ALL_COMPANY_FORMS.length} Templates) & Attendance Sheets`],
                         ['payroll', 'Payroll Sheet, Absence & Overtime'],
                         ['admin', 'System Administrator & Multi-Tenancy'],
                       ] as Array<[ModuleKey, string]>

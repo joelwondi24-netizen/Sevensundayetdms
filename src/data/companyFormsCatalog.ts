@@ -51,6 +51,7 @@ export const COMPANY_FORM_DEPARTMENTS: DepartmentFormsGroup[] = [
   { key: 'legal', name: 'Legal & Regulatory Affairs', shortName: 'Legal', prefix: 'SS-LEG', count: 16, forms: [] },
   { key: 'customer-care', name: 'Customer Care & After-Sales', shortName: 'Customer Care', prefix: 'SS-CSR', count: 17, forms: [] },
   { key: 'management', name: 'Executive Management & Strategy', shortName: 'Management', prefix: 'SS-MGT', count: 20, forms: [] },
+  { key: 'attendance-shifts', name: 'Attendance, Shifts & Duty Forms', shortName: 'Attendance & Shifts', prefix: 'SS-ATT', count: 11, forms: [] },
 ];
 
 export const DEFAULT_STAFF_EVALUATION_CRITERIA: StaffEvaluationRow[] = [
@@ -400,9 +401,153 @@ const FORM_TITLES_BY_DEPT: Record<string, string[]> = {
     'Monthly P&L Executive Sign-Off',
     'Executive Leadership & Manager Evaluation Rubric',
   ],
+  'attendance-shifts': [
+    'Daily Attendance Sheet',
+    'Weekly Attendance Summary',
+    'Monthly Attendance Register',
+    'Morning, Afternoon & Night Shifts Roster',
+    'Employee Lateness Record',
+    'Absence Records Register',
+    'Overtime Hours Authorization & Log',
+    'Department Attendance Summary',
+    'Security Guard Duty Schedules',
+    'Weekend and Holiday Attendance Log',
+    'Shift Performance Evaluation Form',
+  ],
 };
 
-function buildDepartmentFields(deptKey: string, title: string, isEvaluation: boolean): CompanyFormFieldDef[] {
+function buildAttendanceShiftFields(code: string, title: string): CompanyFormFieldDef[] {
+  const base: CompanyFormFieldDef[] = [
+    { key: 'branch_location', label: 'Branch / Facility', type: 'select', options: ['Addis Ababa HQ', 'Adama Factory', 'Hawassa Depot'], defaultValue: 'Addis Ababa HQ' },
+    { key: 'department', label: 'Department / Unit', type: 'text', placeholder: 'All Departments or Production / Security' },
+    { key: 'supervisor', label: 'Shift Supervisor / Attendance Officer', type: 'text', placeholder: 'Officer full name' },
+  ];
+
+  switch (code) {
+    case 'SS-ATT-01':
+      return [
+        ...base,
+        { key: 'attendance_date', label: 'Attendance Date', type: 'date' },
+        { key: 'shift_filter', label: 'Shift Coverage', type: 'select', options: ['All Shifts', 'Morning Shift', 'Afternoon Shift', 'Night Shift', 'Day Shift'], defaultValue: 'All Shifts' },
+        { key: 'present_count', label: 'Present Staff Count', type: 'number', placeholder: '0' },
+        { key: 'absent_late_summary', label: 'Daily Roll Call Notes', type: 'textarea', placeholder: 'Daily headcount verification, late arrivals, and handover remarks...' },
+      ];
+    case 'SS-ATT-02':
+      return [
+        ...base,
+        { key: 'week_start', label: 'Week Start Date', type: 'date' },
+        { key: 'week_end', label: 'Week End Date', type: 'date' },
+        { key: 'total_hours', label: 'Total Worked Hours', type: 'number', placeholder: '0' },
+        { key: 'weekly_summary', label: 'Weekly Attendance & Compliance Notes', type: 'textarea', placeholder: 'Summary of weekly attendance rate, absences, and shift coverage...' },
+      ];
+    case 'SS-ATT-03':
+      return [
+        ...base,
+        { key: 'month_period', label: 'Attendance Month (YYYY-MM)', type: 'text', placeholder: '2026-11' },
+        { key: 'working_days', label: 'Standard Working Days', type: 'number', defaultValue: '26' },
+        { key: 'payroll_cutoff', label: 'Payroll Lock Status', type: 'select', options: ['Open Register', 'Pending HR Verification', 'Closed & Locked for Payroll'], defaultValue: 'Open Register' },
+        { key: 'monthly_notes', label: 'Monthly Reconciliation Notes', type: 'textarea', placeholder: 'Monthly attendance reconciliation before payroll run...' },
+      ];
+    case 'SS-ATT-04':
+      return [
+        ...base,
+        { key: 'effective_date', label: 'Roster Date / Period', type: 'date' },
+        { key: 'rotation_system', label: 'Shift System', type: 'select', options: ['3-Shift (Morning / Afternoon / Night)', '4-Shift Continuous (A/B/C/D)', 'Day + Overtime'], defaultValue: '3-Shift (Morning / Afternoon / Night)' },
+        { key: 'handover_protocol', label: 'Shift Handover & Rest Notes', type: 'textarea', placeholder: 'Morning (06:00-14:00), Afternoon (14:00-22:00), Night (22:00-06:00) rotation details...' },
+      ];
+    case 'SS-ATT-05':
+      return [
+        ...base,
+        { key: 'period_date', label: 'Reporting Date / Period', type: 'date' },
+        { key: 'grace_minutes', label: 'Grace Threshold (Minutes)', type: 'number', defaultValue: '10' },
+        { key: 'total_late_minutes', label: 'Total Late Minutes Recorded', type: 'number', placeholder: '0' },
+        { key: 'disciplinary_notes', label: 'Lateness Follow-Up & Counseling', type: 'textarea', placeholder: 'Root causes, warning notices, and supervisor review...' },
+      ];
+    case 'SS-ATT-06':
+      return [
+        ...base,
+        { key: 'period_date', label: 'Absence Reporting Date', type: 'date' },
+        { key: 'absence_category', label: 'Absence Classification', type: 'select', options: ['All Absences', 'Unexcused Absence', 'Approved Leave', 'Medical / Emergency'], defaultValue: 'All Absences' },
+        { key: 'total_absence_hours', label: 'Total Absence Hours', type: 'number', placeholder: '0' },
+        { key: 'absence_notes', label: 'Absence Verification & Payroll Deduction Notes', type: 'textarea', placeholder: 'HR verification against approved leaves and payroll deduction rules...' },
+      ];
+    case 'SS-ATT-07':
+      return [
+        ...base,
+        { key: 'ot_date', label: 'Overtime Date / Period', type: 'date' },
+        { key: 'ot_category', label: 'Overtime Multiplier Category', type: 'select', options: ['All Categories', 'Normal OT (1.5x)', 'Night OT (1.75x)', 'Sunday OT (2.0x)', 'Holiday OT (2.5x)'], defaultValue: 'All Categories' },
+        { key: 'total_ot_hours', label: 'Total Approved OT Hours', type: 'number', placeholder: '0' },
+        { key: 'ot_justification', label: 'Operational Justification for Overtime', type: 'textarea', placeholder: 'Production urgency, rush dispatch, maintenance, or guard coverage justification...' },
+      ];
+    case 'SS-ATT-08':
+      return [
+        ...base,
+        { key: 'report_date', label: 'Reporting Date', type: 'date' },
+        { key: 'dept_manager', label: 'Department Manager', type: 'text', placeholder: 'Manager full name' },
+        { key: 'attendance_rate_pct', label: 'Department Attendance Rate (%)', type: 'number', placeholder: '95' },
+        { key: 'dept_remarks', label: 'Departmental Workforce Coverage Notes', type: 'textarea', placeholder: 'Headcount vs scheduled vs present breakdown across teams...' },
+      ];
+    case 'SS-ATT-09':
+      return [
+        ...base,
+        { key: 'duty_date', label: 'Guard Roster Date', type: 'date' },
+        { key: 'gate_post', label: 'Gate / Security Post', type: 'select', options: ['All Posts', 'Main Entrance Gate', 'Warehouse Perimeter', 'Factory Floor Gate', 'Control Room / CCTV'], defaultValue: 'All Posts' },
+        { key: 'shift_coverage', label: '24/7 Coverage Verification', type: 'select', options: ['24-Hour Continuous (3x8h)', '4-Crew Rotating (A/B/C/D)', 'Special Event Security'], defaultValue: '24-Hour Continuous (3x8h)' },
+        { key: 'guard_briefing', label: 'Security Handover & Incident Brief', type: 'textarea', placeholder: 'Key custody, gate pass log verification, patrol schedule, and radio check...' },
+      ];
+    case 'SS-ATT-10':
+      return [
+        ...base,
+        { key: 'holiday_date', label: 'Weekend / Public Holiday Date', type: 'date' },
+        { key: 'day_classification', label: 'Day Classification & Rate', type: 'select', options: ['Sunday / Weekly Rest (2.0x)', 'Ethiopian Public Holiday (2.5x)', 'Saturday Half/Full Shift'], defaultValue: 'Sunday / Weekly Rest (2.0x)' },
+        { key: 'holiday_name', label: 'Holiday / Weekend Title', type: 'text', placeholder: 'e.g. Sunday Shift / Enkutatash / Meskel' },
+        { key: 'holiday_approval_notes', label: 'Authorization & Compensation Notes', type: 'textarea', placeholder: 'Pre-approval reference and payroll multiplier verification...' },
+      ];
+    case 'SS-ATT-11':
+    default:
+      return [
+        ...base,
+        { key: 'eval_period', label: 'Shift Evaluation Period', type: 'text', placeholder: 'e.g. November 2026 / Week 46' },
+        { key: 'shift_evaluated', label: 'Evaluated Shift', type: 'select', options: ['All Shifts', 'Morning Shift', 'Afternoon Shift', 'Night Shift', 'Security Guard Shift'], defaultValue: 'All Shifts' },
+        { key: 'punctuality_score', label: 'Overall Punctuality & Adherence (%)', type: 'number', placeholder: '94' },
+        { key: 'performance_notes', label: 'Shift Productivity & Handover Evaluation', type: 'textarea', placeholder: `Performance review notes for ${title}...` },
+      ];
+  }
+}
+
+function buildAttendanceShiftColumns(code: string): string[] {
+  switch (code) {
+    case 'SS-ATT-01':
+      return ['Staff ID', 'Full Name', 'Department', 'Shift', 'Check-In', 'Check-Out', 'Status'];
+    case 'SS-ATT-02':
+      return ['Staff ID', 'Full Name', 'Department', 'Days Present', 'Late (Min)', 'OT Hours', 'Weekly Status'];
+    case 'SS-ATT-03':
+      return ['Staff ID', 'Full Name', 'Department', 'Reg Hrs', 'Absence Hrs', 'OT Hrs', 'OT Pay (ETB)'];
+    case 'SS-ATT-04':
+      return ['Staff ID', 'Full Name', 'Department', 'Morning (In-Out)', 'Afternoon (In-Out)', 'Night (In-Out)', 'Status'];
+    case 'SS-ATT-05':
+      return ['Staff ID', 'Full Name', 'Department', 'Date', 'Scheduled Start', 'Actual Check-In', 'Late (Min)'];
+    case 'SS-ATT-06':
+      return ['Staff ID', 'Full Name', 'Department', 'Date', 'Absence Hours', 'Reason / Leave Ref', 'Status'];
+    case 'SS-ATT-07':
+      return ['Staff ID', 'Full Name', 'Date', 'OT Category', 'Multiplier', 'OT Hours', 'OT Amount (ETB)'];
+    case 'SS-ATT-08':
+      return ['Department', 'Manager', 'Assigned Staff', 'Present', 'Late', 'Absent', 'Attendance %'];
+    case 'SS-ATT-09':
+      return ['Date', 'Guard ID & Name', 'Security Post', 'Shift & Time', 'Check-In / Out', 'Status'];
+    case 'SS-ATT-10':
+      return ['Date', 'Staff ID & Name', 'Day / Holiday Type', 'Shift Time', 'Hours Worked', 'Multiplier & Pay'];
+    case 'SS-ATT-11':
+      return ['Shift Name', 'Assigned Logs', 'On-Time Count', 'Late Count', 'Absence Hrs', 'OT Hrs', 'Score %'];
+    default:
+      return ['Staff ID', 'Full Name', 'Department', 'Shift', 'Hours', 'Status'];
+  }
+}
+
+function buildDepartmentFields(deptKey: string, title: string, isEvaluation: boolean, code: string): CompanyFormFieldDef[] {
+  if (deptKey === 'attendance-shifts') {
+    return buildAttendanceShiftFields(code, title);
+  }
   const common: CompanyFormFieldDef[] = [
     { key: 'branch_location', label: 'Branch / Facility', type: 'select', options: ['Addis Ababa HQ', 'Adama Factory', 'Hawassa Depot'], defaultValue: 'Addis Ababa HQ' },
     { key: 'priority', label: 'Priority Level', type: 'select', options: ['Normal', 'Urgent', 'Critical'], defaultValue: 'Normal' },
@@ -456,7 +601,10 @@ function buildDepartmentFields(deptKey: string, title: string, isEvaluation: boo
   }
 }
 
-function buildDepartmentColumns(deptKey: string): string[] {
+function buildDepartmentColumns(deptKey: string, code: string): string[] {
+  if (deptKey === 'attendance-shifts') {
+    return buildAttendanceShiftColumns(code);
+  }
   switch (deptKey) {
     case 'finance':
       return ['Account Code', 'Description / Particulars', 'Debit (ETB)', 'Credit (ETB)'];
@@ -482,15 +630,15 @@ for (const dept of COMPANY_FORM_DEPARTMENTS) {
   for (let i = 1; i <= dept.count; i += 1) {
     const code = `${dept.prefix}-${String(i).padStart(2, '0')}`;
     const name = titles[i - 1] || `${dept.name} Standard Form #${i}`;
-    const isEvaluation = code === 'SS-HR-18' || code === 'SS-MGT-20';
+    const isEvaluation = code === 'SS-HR-18' || code === 'SS-MGT-20' || code === 'SS-ATT-11';
     const formDef: CompanyFormDef = {
       no: globalSeq++,
       code,
       name,
       departmentKey: dept.key,
       departmentName: dept.name,
-      fields: buildDepartmentFields(dept.key, name, isEvaluation),
-      defaultColumns: buildDepartmentColumns(dept.key),
+      fields: buildDepartmentFields(dept.key, name, isEvaluation && code !== 'SS-ATT-11', code),
+      defaultColumns: buildDepartmentColumns(dept.key, code),
       isEvaluation,
     };
     forms.push(formDef);

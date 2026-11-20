@@ -2,6 +2,8 @@ import React, { useEffect, useMemo, useState } from 'react';
 import {
   Award,
   Check,
+  Clock,
+  Database,
   Download,
   Eye,
   FilePlus2,
@@ -26,10 +28,15 @@ import {
   type StaffEvaluationRow,
 } from '../data/companyFormsCatalog';
 import type {
+  AttendanceRecord,
   CompanyFormSubmission,
   CompanyFormTemplateOverride,
   CompanySettings,
+  DepartmentRecord,
   EmployeeProfile,
+  HolidayRecord,
+  ShiftDefinition,
+  StaffScheduleRecord,
 } from '../types';
 import { toEthiopianDateString } from '../utils/ethiopianCalendar';
 import { RealQrCode } from './RealQrCode';
@@ -334,6 +341,232 @@ export const CompanyFormsModule: React.FC<CompanyFormsModuleProps> = ({
     setNotice(`Loaded editable sample data for ${resolvedForm.code} (${resolvedForm.name}). Edit any field or print A4.`);
   };
 
+  const handleLoadLiveAttendanceShiftData = async (openPreview = false) => {
+    setError(null);
+    setNotice(null);
+    setPreviewSubmission(null);
+    try {
+      const [attList, schedList, shiftList, deptList, holList] = await Promise.all([
+        api.get<AttendanceRecord[]>('/api/attendance').catch(() => [] as AttendanceRecord[]),
+        api.get<StaffScheduleRecord[]>('/api/scheduling').catch(() => [] as StaffScheduleRecord[]),
+        api.get<ShiftDefinition[]>('/api/shifts').catch(() => [] as ShiftDefinition[]),
+        api.get<DepartmentRecord[]>('/api/departments').catch(() => [] as DepartmentRecord[]),
+        api.get<HolidayRecord[]>('/api/holidays').catch(() => [] as HolidayRecord[]),
+      ]);
+
+      const today = submissionDate || new Date().toISOString().slice(0, 10);
+      const code = resolvedForm.code;
+      const cols = [...resolvedForm.defaultColumns];
+      let rows: string[][] = [];
+      const nextVals: Record<string, string> = { ...fieldValues };
+
+      if (code === 'SS-ATT-01') {
+        const targetDate = nextVals.attendance_date || today;
+        const daily = attList.filter((a) => a.attendance_date === targetDate);
+        const source = daily.length > 0 ? daily : attList.slice(0, 20);
+        nextVals.attendance_date = targetDate;
+        nextVals.present_count = String(source.filter((a) => a.status !== 'Absent' && a.status !== 'On Leave').length);
+        nextVals.absent_late_summary = `Live attendance snapshot for ${targetDate}: ${source.length} records loaded (${source.filter((a) => (a.late_minutes || 0) > 0).length} late, ${source.filter((a) => a.status === 'Absent').length} absent).`;
+        rows = source.map((a) => [
+          a.employee_code,
+          a.employee_name,
+          a.department,
+          `${a.shift_name} (${a.shift_period || 'Day'})`,
+          a.check_in || '—',
+          a.check_out || '—',
+          `${a.status}${(a.late_minutes || 0) > 0 ? ` (+${a.late_minutes}m)` : ''}`,
+        ]);
+      } else if (code === 'SS-ATT-02') {
+        const byEmp = new Map<string, { name: string; dept: string; days: number; late: number; ot: number; abs: number }>();
+        for (const a of attList) {
+          const cur = byEmp.get(a.employee_code) || { name: a.employee_name, dept: a.department, days: 0, late: 0, ot: 0, abs: 0 };
+          if (a.status !== 'Absent') cur.days += 1;
+          cur.late += Number(a.late_minutes || 0);
+          cur.ot += Number(a.ot_hours || 0);
+          cur.abs += Number(a.absence_hours || 0);
+          byEmp.set(a.employee_code, cur);
+        }
+        const totalHrs = attList.reduce((s, a) => s + Number(a.regular_hours || 0) + Number(a.ot_hours || 0), 0);
+        nextVals.total_hours = totalHrs.toFixed(1);
+        nextVals.weekly_summary = `Aggregated weekly attendance across ${byEmp.size} staff members (${totalHrs.toFixed(1)} total hours).`;
+        rows = Array.from(byEmp.entries()).map(([id, v]) => [
+          id,
+          v.name,
+          v.dept,
+          String(v.days),
+          String(v.late),
+          v.ot.toFixed(1),
+          v.abs > 0 ? `${v.abs}h Abs` : 'Compliant',
+        ]);
+      } else if (code === 'SS-ATT-03') {
+        const monthPrefix = (nextVals.month_period || today.slice(0, 7)).slice(0, 7);
+        nextVals.month_period = monthPrefix;
+        const monthly = attList.filter((a) => a.attendance_date.startsWith(monthPrefix));
+        const source = monthly.length > 0 ? monthly : attList;
+        const byEmp = new Map<string, { name: string; dept: string; reg: number; abs: number; ot: number; pay: number }>();
+        for (const a of source) {
+          const cur = byEmp.get(a.employee_code) || { name: a.employee_name, dept: a.department, reg: 0, abs: 0, ot: 0, pay: 0 };
+          cur.reg += Number(a.regular_hours || 0);
+          cur.abs += Number(a.absence_hours || 0);
+          cur.ot += Number(a.ot_hours || 0);
+          cur.pay += Number(a.ot_pay || 0);
+          byEmp.set(a.employee_code, cur);
+        }
+        nextVals.monthly_notes = `Monthly register compiled for ${monthPrefix} covering ${byEmp.size} active employees.`;
+        rows = Array.from(byEmp.entries()).map(([id, v]) => [
+          id,
+          v.name,
+          v.dept,
+          v.reg.toFixed(1),
+          v.abs.toFixed(1),
+          v.ot.toFixed(1),
+          v.pay.toFixed(2),
+        ]);
+      } else if (code === 'SS-ATT-04') {
+        rows = attList.slice(0, 25).map((a) => [
+          a.employee_code,
+          a.employee_name,
+          a.department,
+          a.morning_check_in ? `${a.morning_check_in}–${a.morning_check_out || '--:--'}` : '—',
+          a.afternoon_check_in ? `${a.afternoon_check_in}–${a.afternoon_check_out || '--:--'}` : '—',
+          a.night_check_in ? `${a.night_check_in}–${a.night_check_out || '--:--'}` : '—',
+          a.status,
+        ]);
+        if (rows.length === 0 && schedList.length > 0) {
+          rows = schedList.slice(0, 25).map((s) => [
+            s.employee_id,
+            s.employee_name,
+            s.department,
+            s.shift_name.toLowerCase().includes('morning') ? `${s.start_time}–${s.end_time}` : '—',
+            s.shift_name.toLowerCase().includes('afternoon') ? `${s.start_time}–${s.end_time}` : '—',
+            s.shift_name.toLowerCase().includes('night') ? `${s.start_time}–${s.end_time}` : '—',
+            s.availability_status,
+          ]);
+        }
+        nextVals.handover_protocol = `Loaded ${rows.length} multi-session (Morning / Afternoon / Night) records from database.`;
+      } else if (code === 'SS-ATT-05') {
+        const lates = attList.filter((a) => Number(a.late_minutes || 0) > 0 || a.status.includes('Late'));
+        const totalLate = lates.reduce((s, a) => s + Number(a.late_minutes || 0), 0);
+        nextVals.total_late_minutes = String(totalLate);
+        nextVals.disciplinary_notes = `${lates.length} late arrival records totaling ${totalLate} minutes.`;
+        rows = lates.map((a) => [
+          a.employee_code,
+          a.employee_name,
+          a.department,
+          a.attendance_date,
+          a.scheduled_start || '08:00',
+          a.check_in || '—',
+          `${a.late_minutes || 0} min`,
+        ]);
+      } else if (code === 'SS-ATT-06') {
+        const absList = attList.filter((a) => Number(a.absence_hours || 0) > 0 || a.status === 'Absent' || a.status === 'On Leave');
+        const totalAbs = absList.reduce((s, a) => s + Number(a.absence_hours || 0), 0);
+        nextVals.total_absence_hours = totalAbs.toFixed(1);
+        nextVals.absence_notes = `${absList.length} absence/leave entries totaling ${totalAbs.toFixed(1)} hours.`;
+        rows = absList.map((a) => [
+          a.employee_code,
+          a.employee_name,
+          a.department,
+          a.attendance_date,
+          String(a.absence_hours || (a.status === 'Absent' ? 8 : 0)),
+          a.notes || a.status,
+          a.status,
+        ]);
+      } else if (code === 'SS-ATT-07') {
+        const otList = attList.filter((a) => Number(a.ot_hours || 0) > 0 || Number(a.ot_pay || 0) > 0);
+        const totalOt = otList.reduce((s, a) => s + Number(a.ot_hours || 0), 0);
+        nextVals.total_ot_hours = totalOt.toFixed(1);
+        nextVals.ot_justification = `Loaded ${otList.length} categorized overtime entries totaling ${totalOt.toFixed(1)} OT hours.`;
+        rows = otList.map((a) => [
+          a.employee_code,
+          a.employee_name,
+          a.attendance_date,
+          a.ot_type,
+          `${a.ot_multiplier}x`,
+          String(a.ot_hours),
+          Number(a.ot_pay || 0).toFixed(2),
+        ]);
+      } else if (code === 'SS-ATT-08') {
+        const deptNames = Array.from(new Set([...deptList.map((d) => d.name), ...employees.map((e) => e.department)]));
+        rows = deptNames.map((dName) => {
+          const deptObj = deptList.find((d) => d.name === dName);
+          const staffCount = employees.filter((e) => e.department === dName).length;
+          const deptLogs = attList.filter((a) => a.department === dName);
+          const present = deptLogs.filter((a) => a.status !== 'Absent' && a.status !== 'On Leave').length;
+          const late = deptLogs.filter((a) => (a.late_minutes || 0) > 0).length;
+          const absent = deptLogs.filter((a) => a.status === 'Absent').length;
+          const rate = deptLogs.length > 0 ? `${Math.round((present / deptLogs.length) * 100)}%` : '100%';
+          return [dName, deptObj?.manager_name || 'Dept Manager', String(staffCount), String(present), String(late), String(absent), rate];
+        });
+        nextVals.dept_remarks = `Live attendance summary across ${rows.length} departments.`;
+      } else if (code === 'SS-ATT-09') {
+        const guardScheds = schedList.filter(
+          (s) =>
+            s.department.toLowerCase().includes('security') ||
+            s.shift_name.toLowerCase().includes('security') ||
+            s.shift_name.toLowerCase().includes('guard')
+        );
+        const source = guardScheds.length > 0 ? guardScheds : schedList.slice(0, 15);
+        rows = source.map((s) => {
+          const attMatch = attList.find((a) => a.employee_code === s.employee_id && a.attendance_date === s.schedule_date);
+          return [
+            s.schedule_date,
+            `${s.employee_id} · ${s.employee_name}`,
+            s.department || 'Security Gate',
+            `${s.shift_name} (${s.start_time}–${s.end_time})`,
+            attMatch ? `${attMatch.check_in}–${attMatch.check_out}` : 'Scheduled',
+            attMatch ? attMatch.status : s.approval_status,
+          ];
+        });
+        nextVals.guard_briefing = `Security guard duty roster populated with ${rows.length} shift assignments.`;
+      } else if (code === 'SS-ATT-10') {
+        const holSet = new Set(holList.map((h) => h.holiday_date));
+        const wkndHol = attList.filter((a) => {
+          const day = new Date(`${a.attendance_date}T00:00:00`).getDay();
+          return day === 0 || day === 6 || holSet.has(a.attendance_date) || a.ot_type === 'Sunday' || a.ot_type === 'Holiday';
+        });
+        rows = wkndHol.map((a) => {
+          const holMatch = holList.find((h) => h.holiday_date === a.attendance_date);
+          const dayType = holMatch ? `${holMatch.name} (Holiday)` : a.ot_type === 'Holiday' ? 'Holiday Shift' : 'Weekend / Sunday';
+          return [
+            a.attendance_date,
+            `${a.employee_code} · ${a.employee_name}`,
+            dayType,
+            `${a.check_in}–${a.check_out}`,
+            String((Number(a.regular_hours || 0) + Number(a.ot_hours || 0)).toFixed(1)),
+            `${a.ot_multiplier}x · ${Number(a.ot_pay || 0).toFixed(2)} ETB`,
+          ];
+        });
+        nextVals.holiday_approval_notes = `Found ${rows.length} weekend and Ethiopian holiday attendance records.`;
+      } else if (code === 'SS-ATT-11') {
+        const shiftNames = Array.from(new Set([...shiftList.map((s) => s.shift_name), ...attList.map((a) => a.shift_name)]));
+        rows = shiftNames.map((sName) => {
+          const logs = attList.filter((a) => a.shift_name === sName);
+          const onTime = logs.filter((a) => (a.late_minutes || 0) === 0 && a.status !== 'Absent').length;
+          const late = logs.filter((a) => (a.late_minutes || 0) > 0).length;
+          const absHrs = logs.reduce((s, a) => s + Number(a.absence_hours || 0), 0);
+          const otHrs = logs.reduce((s, a) => s + Number(a.ot_hours || 0), 0);
+          const score = logs.length > 0 ? `${Math.round((onTime / logs.length) * 100)}%` : '100%';
+          return [sName, String(logs.length), String(onTime), String(late), absHrs.toFixed(1), otHrs.toFixed(1), score];
+        });
+        nextVals.performance_notes = `Shift performance matrix compiled across ${rows.length} shift types (${attList.length} attendance logs).`;
+      }
+
+      if (rows.length === 0) {
+        rows = [cols.map((_, idx) => (idx === 0 ? 'No matching live rows for current filter' : '—'))];
+      }
+
+      setFieldValues(nextVals);
+      setTableColumns(cols);
+      setTableRows(rows);
+      setRemarks(`Populated from live Seven Sunday SQLite Attendance & Workforce Scheduling database on ${new Date().toLocaleDateString()}.`);
+      if (openPreview) setWorkspaceTab('preview');
+      setNotice(`Populated ${resolvedForm.code} (${resolvedForm.name}) with ${rows.length} live attendance/shift rows. Edit any cell before saving or printing.`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to populate live attendance & shift records');
+    }
+  };
+
   const loadSubmissionIntoEditor = (sub: CompanyFormSubmission, openTab: 'fill' | 'preview' = 'fill') => {
     setSelectedFormCode(sub.form_code);
     setActiveDeptKey(sub.department_key);
@@ -586,10 +819,21 @@ export const CompanyFormsModule: React.FC<CompanyFormsModuleProps> = ({
             Complete Company Forms & Staff Evaluation Center
           </h2>
           <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-            {COMPANY_FORM_DEPARTMENTS.length} Departments · {ALL_COMPANY_FORMS.length} Editable Official Forms · Weighted Staff Evaluation Rubric · A4 Print View with Logo, Stamp & QR
+            {COMPANY_FORM_DEPARTMENTS.length} Departments · {ALL_COMPANY_FORMS.length} Editable Official Forms · Attendance & Shifts · Staff Evaluation Rubric · A4 Print View
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2 shrink-0">
+          <button
+            type="button"
+            onClick={() => {
+              const attForm = ALL_COMPANY_FORMS.find((f) => f.code === 'SS-ATT-01');
+              if (attForm) handleSelectCatalogForm(attForm);
+            }}
+            className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-bold text-white bg-[#18243A] hover:bg-[#172033] rounded-lg whitespace-nowrap"
+          >
+            <Clock className="w-3.5 h-3.5 text-[#38BDF8]" />
+            Attendance & Shift Forms (11)
+          </button>
           <button
             type="button"
             onClick={() => handleLoadSampleData(true)}
@@ -641,22 +885,22 @@ export const CompanyFormsModule: React.FC<CompanyFormsModuleProps> = ({
         </div>
       )}
 
-      {/* Main Split Workspace: Left 16-Dept Catalog (4 cols) + Right Editable Form Workspace (8 cols) */}
+      {/* Main Split Workspace: Left 17-Dept Catalog (4 cols) + Right Editable Form Workspace (8 cols) */}
       <div className="grid grid-cols-1 xl:grid-cols-12 gap-6 items-start">
-        {/* LEFT PANEL: 16 Departments & 305 Form Selector */}
+        {/* LEFT PANEL: 17 Departments & 316 Form Selector */}
         <div className="no-print xl:col-span-4 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden">
           <div className="p-4 border-b border-slate-200 dark:border-slate-800 space-y-3">
             <div className="flex items-center justify-between">
               <h3 className="text-sm font-bold text-[#172033] dark:text-white">
                 Form Directory ({ALL_COMPANY_FORMS.length} Forms)
               </h3>
-              <span className="text-xs font-mono text-slate-500">16 Depts</span>
+              <span className="text-xs font-mono text-slate-500">{COMPANY_FORM_DEPARTMENTS.length} Depts</span>
             </div>
             <div className="relative">
               <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-2.5 pointer-events-none" />
               <input
                 type="text"
-                placeholder="Search all 305 forms by name or code..."
+                placeholder={`Search all ${ALL_COMPANY_FORMS.length} forms by name or code...`}
                 value={catalogSearch}
                 onChange={(e) => setCatalogSearch(e.target.value)}
                 className="w-full pl-8 pr-7 py-1.5 text-xs bg-[#F8FAFC] dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg focus:outline-none focus:border-[#087CEB]"
@@ -1275,6 +1519,16 @@ export const CompanyFormsModule: React.FC<CompanyFormsModuleProps> = ({
                   )}
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
+                  {resolvedForm.code.startsWith('SS-ATT-') && (
+                    <button
+                      type="button"
+                      onClick={() => handleLoadLiveAttendanceShiftData(false)}
+                      className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-bold text-white bg-[#18243A] hover:bg-[#172033] rounded-lg whitespace-nowrap"
+                    >
+                      <Database className="w-3.5 h-3.5 text-[#38BDF8]" />
+                      Load Live Attendance & Shifts
+                    </button>
+                  )}
                   <button
                     type="button"
                     onClick={() => handleLoadSampleData(false)}
@@ -1502,6 +1756,16 @@ export const CompanyFormsModule: React.FC<CompanyFormsModuleProps> = ({
                   </div>
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
+                  {resolvedForm.code.startsWith('SS-ATT-') && (
+                    <button
+                      type="button"
+                      onClick={() => handleLoadLiveAttendanceShiftData(true)}
+                      className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-bold text-white bg-[#18243A] hover:bg-[#172033] rounded-lg whitespace-nowrap"
+                    >
+                      <Database className="w-3.5 h-3.5 text-[#38BDF8]" />
+                      Load Live Attendance
+                    </button>
+                  )}
                   <button
                     type="button"
                     onClick={() => handleLoadSampleData(true)}
@@ -1765,7 +2029,7 @@ export const CompanyFormsModule: React.FC<CompanyFormsModuleProps> = ({
               onChange={(e) => setRegisterDeptFilter(e.target.value)}
               className="px-3 py-1.5 text-xs bg-[#F8FAFC] dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg"
             >
-              <option value="all">All 16 Departments</option>
+              <option value="all">All {COMPANY_FORM_DEPARTMENTS.length} Departments</option>
               {COMPANY_FORM_DEPARTMENTS.map((d) => (
                 <option key={d.key} value={d.key}>
                   {d.shortName}

@@ -19,9 +19,11 @@ const QUICK_ACCOUNTS = [
   { label: 'System Admin', email: 'sysadmin@sevensunday.et', role: 'System Administrator' },
   { label: 'Super Admin', email: 'admin@sevensunday.et', role: 'Super Administrator' },
   { label: 'HR & Secretary', email: 'secretary@sevensunday.et', role: 'Human Resource Manager' },
+  { label: 'Attendance Officer', email: 'attendance@sevensunday.et', role: 'Attendance Officer' },
+  { label: 'Security Guard', email: 'guard@sevensunday.et', role: 'Security Guard' },
   { label: 'Finance CFO', email: 'finance@sevensunday.et', role: 'Finance Manager' },
   { label: 'Inventory Lead', email: 'inventory@sevensunday.et', role: 'Inventory Manager' },
-  { label: 'Employee (Restricted)', email: 'viewer@sevensunday.et', role: 'Employee' },
+  { label: 'Employee (Staff)', email: 'viewer@sevensunday.et', role: 'Employee' },
 ];
 
 export const LoginScreen: React.FC<LoginScreenProps> = ({

@@ -4,6 +4,7 @@ import {
   ArrowRight,
   BarChart3,
   BookOpen,
+  CalendarClock,
   CalendarOff,
   ClipboardCheck,
   Clock,
@@ -78,9 +79,16 @@ export const DashboardModule: React.FC<DashboardModuleProps> = ({
     {
       title: 'Attendance & Overtime',
       value: `${summary?.totalAttendanceToday ?? 0} logs`,
-      detail: `${summary?.openRegisters ?? 0} open · ${summary?.closedRegisters ?? 0} closed · OT ${money(summary?.totalOtPay ?? 0)}`,
+      detail: `${summary?.lateArrivalsCount ?? 0} late · ${summary?.openRegisters ?? 0} open · OT ${money(summary?.totalOtPay ?? 0)}`,
       module: 'attendance',
       icon: <Clock className="w-4 h-4 text-[#087CEB]" />,
+    },
+    {
+      title: 'Staff Scheduling & Shifts',
+      value: `${summary?.scheduledShiftsToday ?? 0} shifts`,
+      detail: '3-Shift & 4-Shift timetables · Conflict detector',
+      module: 'scheduling',
+      icon: <CalendarClock className="w-4 h-4 text-[#087CEB]" />,
     },
     {
       title: 'Monthly Payroll Net',
@@ -92,7 +100,7 @@ export const DashboardModule: React.FC<DashboardModuleProps> = ({
     {
       title: 'Company Forms & Evaluations',
       value: `${summary?.totalFormSubmissions ?? 0} filed`,
-      detail: `${summary?.pendingFormApprovals ?? 0} pending review · 305 templates`,
+      detail: `${summary?.pendingFormApprovals ?? 0} pending review · 316 templates`,
       module: 'company-forms',
       icon: <ClipboardCheck className="w-4 h-4 text-[#087CEB]" />,
     },
@@ -452,6 +460,16 @@ export const DashboardModule: React.FC<DashboardModuleProps> = ({
                 Single-Use Gate Pass
               </button>
             )}
+            {allowedModules.includes('scheduling') && (
+              <button
+                type="button"
+                onClick={() => onNavigate('scheduling')}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-[#172033] dark:text-slate-200 bg-[#F8FAFC] dark:bg-slate-800 border border-slate-200 dark:border-slate-700 hover:border-[#087CEB] rounded-lg transition-colors whitespace-nowrap shrink-0"
+              >
+                <CalendarClock className="w-3.5 h-3.5 text-[#087CEB]" />
+                Shifts & Timetables
+              </button>
+            )}
             {allowedModules.includes('company-forms') && (
               <button
                 type="button"
@@ -459,7 +477,7 @@ export const DashboardModule: React.FC<DashboardModuleProps> = ({
                 className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-[#172033] dark:text-slate-200 bg-[#F8FAFC] dark:bg-slate-800 border border-slate-200 dark:border-slate-700 hover:border-[#087CEB] rounded-lg transition-colors whitespace-nowrap shrink-0"
               >
                 <ClipboardCheck className="w-3.5 h-3.5 text-[#087CEB]" />
-                Company Forms (305)
+                Company Forms (316)
               </button>
             )}
             {allowedModules.includes('devices') && (

@@ -632,6 +632,104 @@ CREATE TABLE IF NOT EXISTS imported_files (
   notes TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS shifts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id INTEGER NOT NULL DEFAULT 1,
+  shift_code TEXT NOT NULL,
+  shift_name TEXT NOT NULL,
+  shift_category TEXT NOT NULL DEFAULT 'Day Shift',
+  scheduling_system TEXT NOT NULL DEFAULT '3-Shift',
+  start_time TEXT NOT NULL DEFAULT '08:00',
+  end_time TEXT NOT NULL DEFAULT '17:00',
+  break_minutes INTEGER NOT NULL DEFAULT 60,
+  working_days TEXT NOT NULL DEFAULT '["Mon","Tue","Wed","Thu","Fri"]',
+  rest_days TEXT NOT NULL DEFAULT '["Sat","Sun"]',
+  min_rest_hours INTEGER NOT NULL DEFAULT 11,
+  is_rotating INTEGER NOT NULL DEFAULT 0,
+  rotation_pattern TEXT NOT NULL DEFAULT 'Fixed',
+  color_hex TEXT NOT NULL DEFAULT '#2563eb',
+  ot_multiplier REAL NOT NULL DEFAULT 1.5,
+  grace_late_minutes INTEGER NOT NULL DEFAULT 15,
+  status TEXT NOT NULL DEFAULT 'Active',
+  notes TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS departments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id INTEGER NOT NULL DEFAULT 1,
+  dept_code TEXT NOT NULL,
+  name TEXT NOT NULL,
+  manager_employee_id TEXT NOT NULL DEFAULT '',
+  manager_name TEXT NOT NULL DEFAULT '',
+  scheduling_system TEXT NOT NULL DEFAULT 'Standard',
+  default_shift_id INTEGER,
+  working_days TEXT NOT NULL DEFAULT '["Mon","Tue","Wed","Thu","Fri"]',
+  rest_days TEXT NOT NULL DEFAULT '["Sat","Sun"]',
+  weekend_schedule_enabled INTEGER NOT NULL DEFAULT 0,
+  holiday_schedule_enabled INTEGER NOT NULL DEFAULT 0,
+  security_guard_coverage TEXT NOT NULL DEFAULT 'Standard Business Hours',
+  monthly_timetable_notes TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'Active',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS staff_schedules (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id INTEGER NOT NULL DEFAULT 1,
+  schedule_code TEXT NOT NULL,
+  employee_id TEXT NOT NULL,
+  employee_name TEXT NOT NULL,
+  department TEXT NOT NULL DEFAULT 'Operations',
+  shift_id INTEGER,
+  shift_name TEXT NOT NULL,
+  shift_category TEXT NOT NULL DEFAULT 'Day Shift',
+  schedule_date TEXT NOT NULL,
+  end_date TEXT NOT NULL,
+  start_time TEXT NOT NULL DEFAULT '08:00',
+  end_time TEXT NOT NULL DEFAULT '17:00',
+  break_minutes INTEGER NOT NULL DEFAULT 60,
+  schedule_type TEXT NOT NULL DEFAULT 'Regular',
+  rotation_group TEXT NOT NULL DEFAULT '',
+  availability_status TEXT NOT NULL DEFAULT 'Assigned',
+  replacement_employee_id TEXT NOT NULL DEFAULT '',
+  replacement_employee_name TEXT NOT NULL DEFAULT '',
+  change_reason TEXT NOT NULL DEFAULT '',
+  approval_status TEXT NOT NULL DEFAULT 'Approved',
+  approved_by TEXT NOT NULL DEFAULT '',
+  created_by TEXT NOT NULL DEFAULT 'System Operator',
+  updated_by TEXT NOT NULL DEFAULT 'System Operator',
+  notes TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS holidays_calendar (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id INTEGER NOT NULL DEFAULT 1,
+  holiday_date TEXT NOT NULL,
+  name TEXT NOT NULL,
+  is_paid INTEGER NOT NULL DEFAULT 1,
+  ot_multiplier REAL NOT NULL DEFAULT 2.5,
+  notes TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS workforce_rules (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id INTEGER NOT NULL DEFAULT 1,
+  late_grace_minutes INTEGER NOT NULL DEFAULT 15,
+  early_departure_grace_minutes INTEGER NOT NULL DEFAULT 10,
+  default_break_minutes INTEGER NOT NULL DEFAULT 60,
+  min_rest_hours_between_shifts INTEGER NOT NULL DEFAULT 11,
+  auto_detect_conflicts INTEGER NOT NULL DEFAULT 1,
+  require_manager_approval INTEGER NOT NULL DEFAULT 1,
+  default_shift_system TEXT NOT NULL DEFAULT '3-Shift',
+  updated_at TEXT NOT NULL
+);
 `);
 
 // Ensure new columns exist on older DBs safely
@@ -656,6 +754,24 @@ ensureColumn('devices', 'api_key', "TEXT NOT NULL DEFAULT ''");
 ensureColumn('devices', 'last_sync_at', 'TEXT');
 ensureColumn('devices', 'punch_count', 'INTEGER NOT NULL DEFAULT 0');
 
+// Extended Attendance Management columns (Morning/Afternoon/Night + Automatic Calculations + Audit)
+ensureColumn('attendance_records', 'shift_id', 'INTEGER');
+ensureColumn('attendance_records', 'shift_period', "TEXT NOT NULL DEFAULT 'Day'");
+ensureColumn('attendance_records', 'morning_check_in', "TEXT NOT NULL DEFAULT ''");
+ensureColumn('attendance_records', 'morning_check_out', "TEXT NOT NULL DEFAULT ''");
+ensureColumn('attendance_records', 'afternoon_check_in', "TEXT NOT NULL DEFAULT ''");
+ensureColumn('attendance_records', 'afternoon_check_out', "TEXT NOT NULL DEFAULT ''");
+ensureColumn('attendance_records', 'night_check_in', "TEXT NOT NULL DEFAULT ''");
+ensureColumn('attendance_records', 'night_check_out', "TEXT NOT NULL DEFAULT ''");
+ensureColumn('attendance_records', 'scheduled_start', "TEXT NOT NULL DEFAULT '08:00'");
+ensureColumn('attendance_records', 'scheduled_end', "TEXT NOT NULL DEFAULT '17:00'");
+ensureColumn('attendance_records', 'late_minutes', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('attendance_records', 'early_departure_minutes', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('attendance_records', 'break_minutes', 'INTEGER NOT NULL DEFAULT 60');
+ensureColumn('attendance_records', 'absence_hours', 'REAL NOT NULL DEFAULT 0');
+ensureColumn('attendance_records', 'updated_by', "TEXT NOT NULL DEFAULT ''");
+ensureColumn('attendance_records', 'updated_at', "TEXT NOT NULL DEFAULT ''");
+
 // Multi-Tenant isolation columns across all operational tables (default 1 = Primary HQ Tenant)
 const TENANT_SCOPED_TABLES = [
   'users',
@@ -664,6 +780,11 @@ const TENANT_SCOPED_TABLES = [
   'payroll_runs',
   'devices',
   'attendance_records',
+  'shifts',
+  'departments',
+  'staff_schedules',
+  'holidays_calendar',
+  'workforce_rules',
   'leaves',
   'company_documents',
   'company_form_templates',
@@ -931,12 +1052,26 @@ function seedIfEmpty() {
     insUser.run('SS-EMP-05', 'Sara Tesfaye', 'viewer@sevensunday.et', 'SevenSunday@2026', 'Operations', 'Operations Staff', 'Employee', now);
   }
 
-  // Always idempotently ensure System Administrator account exists even on existing DBs
+  // Always idempotently ensure System Administrator, Attendance Officer & Security Guard accounts exist even on existing DBs
   const hasSysAdmin = db.prepare("SELECT id FROM users WHERE lower(email) = 'sysadmin@sevensunday.et'").get();
   if (!hasSysAdmin) {
     db.prepare(`
       INSERT INTO users (tenant_id, employee_code, full_name, email, password, department, job_title, role, status, created_at)
       VALUES (1, 'SS-SYS-00', 'System Administrator', 'sysadmin@sevensunday.et', 'SevenSunday@2026', 'Platform Governance', 'Chief System Administrator', 'System Administrator', 'Active', ?)
+    `).run(now);
+  }
+  const hasAttOfficer = db.prepare("SELECT id FROM users WHERE lower(email) = 'attendance@sevensunday.et'").get();
+  if (!hasAttOfficer) {
+    db.prepare(`
+      INSERT INTO users (tenant_id, employee_code, full_name, email, password, department, job_title, role, status, created_at)
+      VALUES (1, 'SS-ATT-06', 'Abebe Bikila', 'attendance@sevensunday.et', 'SevenSunday@2026', 'Human Resources', 'Attendance & Shift Officer', 'Attendance Officer', 'Active', ?)
+    `).run(now);
+  }
+  const hasGuardUser = db.prepare("SELECT id FROM users WHERE lower(email) = 'guard@sevensunday.et'").get();
+  if (!hasGuardUser) {
+    db.prepare(`
+      INSERT INTO users (tenant_id, employee_code, full_name, email, password, department, job_title, role, status, created_at)
+      VALUES (1, 'SS-SEC-07', 'Tadesse Lemma', 'guard@sevensunday.et', 'SevenSunday@2026', 'Security', 'Gate & Patrol Security Guard', 'Security Guard', 'Active', ?)
     `).run(now);
   }
 
@@ -1485,6 +1620,175 @@ function seedIfEmpty() {
         chInfo.lastInsertRowid, 'System Administrator', 'System Administrator', `Initialized isolated multi-tenant workspace for ${tExists.brand_name}.`, now
       );
     }
+    seedWorkforceDefaultsForTenant(tid);
+  }
+
+  // Ensure Tenant 1 (and all existing tenants) have default shifts, departments, holidays & workforce rules
+  const allTenantRows = db.prepare('SELECT id FROM tenants').all() as Array<{ id: number }>;
+  for (const tRow of allTenantRows) {
+    seedWorkforceDefaultsForTenant(tRow.id);
+  }
+  seedWorkforceDefaultsForTenant(1);
+
+  // Seed realistic current-week staff schedules on Tenant 1 if empty
+  const schedCnt = (db.prepare('SELECT COUNT(*) as c FROM staff_schedules WHERE tenant_id = 1').get() as { c: number }).c;
+  if (schedCnt === 0) {
+    const t1Shifts = db.prepare('SELECT * FROM shifts WHERE tenant_id = 1').all() as Array<Record<string, unknown>>;
+    const t1Emps = db.prepare("SELECT employee_id, full_name, department FROM employees WHERE tenant_id = 1 AND status = 'Active' ORDER BY id ASC LIMIT 8").all() as Array<{ employee_id: string; full_name: string; department: string }>;
+    const shiftByCat = (cat: string) => t1Shifts.find((s) => s.shift_category === cat) || t1Shifts[0];
+    const today = new Date();
+    const dayOffsetIso = (offset: number) => {
+      const d = new Date(today);
+      d.setDate(d.getDate() + offset);
+      return d.toISOString().slice(0, 10);
+    };
+    if (t1Shifts.length > 0 && t1Emps.length > 0) {
+      const insSched = db.prepare(`
+        INSERT INTO staff_schedules (
+          tenant_id, schedule_code, employee_id, employee_name, department, shift_id, shift_name, shift_category,
+          schedule_date, end_date, start_time, end_time, break_minutes, schedule_type, rotation_group,
+          availability_status, approval_status, approved_by, created_by, updated_by, notes, created_at, updated_at
+        ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Assigned', 'Approved', 'System Administrator', 'System Administrator', 'System Administrator', ?, ?, ?)
+      `);
+      const cycleCats = ['Morning Shift', 'Afternoon Shift', 'Night Shift', 'Day Shift', 'Security Guard Shift', 'Morning Shift', 'Afternoon Shift', 'Day Shift'];
+      let seq = 1;
+      for (let empIdx = 0; empIdx < t1Emps.length; empIdx++) {
+        const emp = t1Emps[empIdx];
+        const cat = emp.department === 'Security' ? 'Security Guard Shift' : cycleCats[empIdx % cycleCats.length];
+        const sh = shiftByCat(cat);
+        for (let dOff = -1; dOff <= 4; dOff++) {
+          const dt = dayOffsetIso(dOff);
+          const schedType = cat === 'Security Guard Shift' ? 'Security Guard' : sh.is_rotating ? 'Rotating' : 'Regular';
+          insSched.run(
+            `SCH-1-${String(seq++).padStart(4, '0')}`,
+            emp.employee_id,
+            emp.full_name,
+            emp.department,
+            Number(sh.id),
+            String(sh.shift_name),
+            String(sh.shift_category),
+            dt,
+            dt,
+            String(sh.start_time),
+            String(sh.end_time),
+            Number(sh.break_minutes) || 30,
+            schedType,
+            sh.is_rotating ? `Group-${(empIdx % 3) + 1}` : 'Standard',
+            `Auto-seeded ${cat} timetable entry`,
+            now,
+            now
+          );
+        }
+      }
+    }
+  }
+}
+
+function seedWorkforceDefaultsForTenant(tenantId: number) {
+  const now = new Date().toISOString();
+  const shiftCnt = (db.prepare('SELECT COUNT(*) as c FROM shifts WHERE tenant_id = ?').get(tenantId) as { c: number }).c;
+  if (shiftCnt === 0) {
+    const insShift = db.prepare(`
+      INSERT INTO shifts (
+        tenant_id, shift_code, shift_name, shift_category, scheduling_system, start_time, end_time,
+        break_minutes, working_days, rest_days, min_rest_hours, is_rotating, rotation_pattern,
+        color_hex, ot_multiplier, grace_late_minutes, status, notes, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Active', ?, ?, ?)
+    `);
+    const defaultShifts = [
+      ['SHF-DAY', 'Day Shift', 'Day Shift', 'Standard', '08:00', '17:00', 60, '["Mon","Tue","Wed","Thu","Fri"]', '["Sat","Sun"]', 11, 0, 'Fixed Standard', '#2563eb', 1.5, 15, 'Standard administrative & daytime operations'],
+      ['SHF-MRN', 'Morning Shift', 'Morning Shift', '3-Shift', '06:00', '14:00', 30, '["Mon","Tue","Wed","Thu","Fri","Sat"]', '["Sun"]', 11, 1, 'Weekly 3-Shift Rotation', '#0ea5e9', 1.5, 10, 'Early plant & service morning shift'],
+      ['SHF-AFT', 'Afternoon Shift', 'Afternoon Shift', '3-Shift', '14:00', '22:00', 30, '["Mon","Tue","Wed","Thu","Fri","Sat"]', '["Sun"]', 11, 1, 'Weekly 3-Shift Rotation', '#f59e0b', 1.5, 10, 'Mid-day / swing production shift'],
+      ['SHF-NGT', 'Night Shift', 'Night Shift', '3-Shift', '22:00', '06:00', 30, '["Mon","Tue","Wed","Thu","Fri","Sat"]', '["Sun"]', 12, 1, 'Day-to-Night Rotation', '#6366f1', 1.75, 10, 'Overnight operations shift (1.75x night rate)'],
+      ['SHF-WKD', 'Weekend Shift', 'Weekend Shift', '4-Shift', '08:00', '16:00', 45, '["Sat","Sun"]', '["Mon","Tue","Wed","Thu","Fri"]', 11, 0, 'Weekend Coverage', '#10b981', 2.0, 15, 'Saturday & Sunday coverage crew'],
+      ['SHF-HOL', 'Holiday Shift', 'Holiday Shift', '4-Shift', '08:00', '16:00', 45, '["Sun"]', '[]', 12, 0, 'Public Holiday Duty', '#ec4899', 2.5, 15, 'Official public holiday essential staff'],
+      ['SHF-SEC', 'Security Guard Shift', 'Security Guard Shift', 'Security 24/7', '18:00', '06:00', 45, '["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]', '[]', 12, 1, '4-Team 24/7 Security Rotation', '#0f172a', 1.75, 5, 'Gate control, patrol & perimeter duty'],
+      ['SHF-SPC', 'Special Duty Shift', 'Special Duty Shift', '4-Shift', '09:00', '17:00', 45, '["Mon","Tue","Wed","Thu","Fri"]', '["Sat","Sun"]', 11, 0, 'Task Assignment', '#8b5cf6', 1.5, 10, 'Audits, maintenance shutdown & special dispatch'],
+      ['SHF-OTM', 'Overtime Shift', 'Overtime Shift', 'Standard', '17:00', '21:00', 15, '["Mon","Tue","Wed","Thu","Fri","Sat"]', '["Sun"]', 11, 0, 'On-Demand Overtime', '#ea580c', 1.75, 5, 'Extended production & deadline overtime block'],
+    ] as const;
+    for (const s of defaultShifts) {
+      insShift.run(tenantId, ...s, now, now);
+    }
+  }
+
+  const rulesExist = db.prepare('SELECT id FROM workforce_rules WHERE tenant_id = ?').get(tenantId);
+  if (!rulesExist) {
+    db.prepare(`
+      INSERT INTO workforce_rules (
+        tenant_id, late_grace_minutes, early_departure_grace_minutes, default_break_minutes,
+        min_rest_hours_between_shifts, auto_detect_conflicts, require_manager_approval, default_shift_system, updated_at
+      ) VALUES (?, 15, 10, 60, 11, 1, 1, '3-Shift', ?)
+    `).run(tenantId, now);
+  }
+
+  const deptCnt = (db.prepare('SELECT COUNT(*) as c FROM departments WHERE tenant_id = ?').get(tenantId) as { c: number }).c;
+  if (deptCnt === 0) {
+    const rawDepts = tenantId === 1
+      ? (db.prepare('SELECT departments FROM company_settings WHERE id = 1').get() as { departments: string } | undefined)?.departments
+      : (db.prepare('SELECT departments FROM tenants WHERE id = ?').get(tenantId) as { departments: string } | undefined)?.departments;
+    const deptNames = (rawDepts || 'Production,Human Resources,Secretary,Finance,Inventory,Quality Assurance,Security,Sales & CRM,Operations')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (!deptNames.some((d) => d.toLowerCase().includes('security'))) deptNames.push('Security');
+
+    const shiftsForTenant = db.prepare('SELECT id, shift_category FROM shifts WHERE tenant_id = ?').all(tenantId) as Array<{ id: number; shift_category: string }>;
+    const empsForTenant = db.prepare('SELECT employee_id, full_name, department FROM employees WHERE tenant_id = ? ORDER BY id ASC').all(tenantId) as Array<{ employee_id: string; full_name: string; department: string }>;
+    const insDept = db.prepare(`
+      INSERT INTO departments (
+        tenant_id, dept_code, name, manager_employee_id, manager_name, scheduling_system, default_shift_id,
+        working_days, rest_days, weekend_schedule_enabled, holiday_schedule_enabled, security_guard_coverage,
+        monthly_timetable_notes, status, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Active', ?, ?)
+    `);
+    deptNames.forEach((dName, idx) => {
+      const isProd = /prod|quality|ops|manufact|water/i.test(dName);
+      const isSec = /security|guard/i.test(dName);
+      const sys = isSec ? 'Security 24/7' : isProd ? '3-Shift' : 'Standard';
+      const targetCat = isSec ? 'Security Guard Shift' : isProd ? 'Morning Shift' : 'Day Shift';
+      const sh = shiftsForTenant.find((s) => s.shift_category === targetCat) || shiftsForTenant[0];
+      const mgr = empsForTenant.find((e) => e.department.toLowerCase() === dName.toLowerCase()) || null;
+      const workDays = isSec ? '["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]' : isProd ? '["Mon","Tue","Wed","Thu","Fri","Sat"]' : '["Mon","Tue","Wed","Thu","Fri"]';
+      const restDays = isSec ? '[]' : isProd ? '["Sun"]' : '["Sat","Sun"]';
+      insDept.run(
+        tenantId,
+        `DEPT-${String(idx + 1).padStart(2, '0')}`,
+        dName,
+        mgr ? mgr.employee_id : '',
+        mgr ? mgr.full_name : 'Department Lead',
+        sys,
+        sh ? sh.id : null,
+        workDays,
+        restDays,
+        isSec || isProd ? 1 : 0,
+        isSec ? 1 : 0,
+        isSec ? '24/7 Gate & Perimeter Guard Rotation' : isProd ? 'Plant Shift Supervisor Desk' : 'Standard Business Hours',
+        `${dName} department weekly & monthly rotating timetable`,
+        now,
+        now
+      );
+    });
+  }
+
+  const holCnt = (db.prepare('SELECT COUNT(*) as c FROM holidays_calendar WHERE tenant_id = ?').get(tenantId) as { c: number }).c;
+  if (holCnt === 0) {
+    const year = new Date().getFullYear();
+    const insHol = db.prepare(`
+      INSERT INTO holidays_calendar (tenant_id, holiday_date, name, is_paid, ot_multiplier, notes, created_at)
+      VALUES (?, ?, ?, 1, 2.5, ?, ?)
+    `);
+    const holidays = [
+      [`${year}-01-07`, 'Ethiopian Christmas (Genna)', 'National public holiday (2.5x OT)'],
+      [`${year}-01-19`, 'Epiphany (Timkat)', 'National public holiday (2.5x OT)'],
+      [`${year}-03-02`, 'Victory of Adwa', 'National public holiday (2.5x OT)'],
+      [`${year}-05-01`, 'International Labour Day', 'National public holiday (2.5x OT)'],
+      [`${year}-05-05`, 'Ethiopian Patriots Victory Day', 'National public holiday (2.5x OT)'],
+      [`${year}-09-11`, 'Ethiopian New Year (Enkutatash)', 'National public holiday (2.5x OT)'],
+      [`${year}-09-27`, 'Finding of the True Cross (Meskel)', 'National public holiday (2.5x OT)'],
+    ];
+    for (const [dt, nm, notes] of holidays) {
+      insHol.run(tenantId, dt, nm, notes, now);
+    }
   }
 }
 
@@ -1538,6 +1842,43 @@ function getActorName(req: express.Request): string {
   return String(req.headers['x-actor-name'] || 'System Operator');
 }
 
+function getActorRole(req: express.Request): string {
+  return String(req.headers['x-actor-role'] || '');
+}
+
+const ATTENDANCE_MANAGER_ROLES = new Set([
+  'System Administrator',
+  'Super Administrator',
+  'Company Owner',
+  'General Manager',
+  'Human Resource Manager',
+  'HR Manager',
+  'Department Manager',
+  'Attendance Officer',
+  'Security Supervisor',
+]);
+
+const SHIFT_DEPT_ADMIN_ROLES = new Set([
+  'System Administrator',
+  'Super Administrator',
+  'Company Owner',
+  'General Manager',
+  'Human Resource Manager',
+  'HR Manager',
+  'Department Manager',
+]);
+
+function requireRole(req: express.Request, res: express.Response, allowed: Set<string>, actionDesc: string): boolean {
+  const role = getActorRole(req);
+  // If internal or missing header in non-user background scripts, treat gracefully only if explicit role wasn't blocked;
+  // Wait: if header is present and not allowed, block with 403!
+  if (role && !allowed.has(role)) {
+    res.status(403).json({ error: `Permission denied (${role}) for ${actionDesc}.` });
+    return false;
+  }
+  return true;
+}
+
 function provisionTenantDefaults(tenantId: number, brandName: string) {
   const now = new Date().toISOString();
   const ledgerCnt = (db.prepare('SELECT COUNT(*) as c FROM ledger_accounts WHERE tenant_id = ?').get(tenantId) as { c: number }).c;
@@ -1559,6 +1900,7 @@ function provisionTenantDefaults(tenantId: number, brandName: string) {
       'INSERT INTO chat_messages (channel_id, sender_name, sender_role, content, attachment_name, created_at) VALUES (?, ?, ?, ?, NULL, ?)'
     ).run(info.lastInsertRowid, 'System Administrator', 'System Administrator', `Workspace initialized for ${brandName}.`, now);
   }
+  seedWorkforceDefaultsForTenant(tenantId);
 }
 
 function buildCompanySettingsForTenant(tenantId: number) {
@@ -2092,42 +2434,60 @@ app.put('/api/employees/:id', (req, res) => {
   const tid = getTenantId(req);
   const id = Number(req.params.id);
   const b = req.body || {};
-  db.prepare(
+  const existing = db.prepare('SELECT employee_id FROM employees WHERE id = ? AND tenant_id = ?').get(id, tid) as { employee_id: string } | undefined;
+  const tx = db.transaction(() => {
+    db.prepare(
+      `
+      UPDATE employees SET
+        full_name=?, gender=?, dob=?, phone=?, email=?, address=?, national_id=?,
+        emergency_contact=?, emergency_contact_phone=?, department=?, job_title=?, employment_type=?,
+        start_date=?, contract_expiry=?, basic_salary=?, bank_account=?, education=?, experience=?,
+        photo_data=?, education_doc_name=?, education_doc_data=?
+      WHERE id = ? AND tenant_id = ?
     `
-    UPDATE employees SET
-      full_name=?, gender=?, dob=?, phone=?, email=?, address=?, national_id=?,
-      emergency_contact=?, emergency_contact_phone=?, department=?, job_title=?, employment_type=?,
-      start_date=?, contract_expiry=?, basic_salary=?, bank_account=?, education=?, experience=?,
-      photo_data=?, education_doc_name=?, education_doc_data=?
-    WHERE id = ? AND tenant_id = ?
-  `
-  ).run(
-    b.full_name,
-    b.gender || 'Male',
-    b.dob || '',
-    b.phone || '',
-    b.email || '',
-    b.address || '',
-    b.national_id || '',
-    b.emergency_contact || '',
-    b.emergency_contact_phone || '',
-    b.department || 'Operations',
-    b.job_title || 'Staff',
-    b.employment_type || 'Permanent',
-    b.start_date || new Date().toISOString().slice(0, 10),
-    b.contract_expiry || '',
-    Number(b.basic_salary) || 0,
-    b.bank_account || '',
-    b.education || '',
-    b.experience || '',
-    b.photo_data || '',
-    b.education_doc_name || '',
-    b.education_doc_data || '',
-    id,
-    tid
-  );
+    ).run(
+      b.full_name,
+      b.gender || 'Male',
+      b.dob || '',
+      b.phone || '',
+      b.email || '',
+      b.address || '',
+      b.national_id || '',
+      b.emergency_contact || '',
+      b.emergency_contact_phone || '',
+      b.department || 'Operations',
+      b.job_title || 'Staff',
+      b.employment_type || 'Permanent',
+      b.start_date || new Date().toISOString().slice(0, 10),
+      b.contract_expiry || '',
+      Number(b.basic_salary) || 0,
+      b.bank_account || '',
+      b.education || '',
+      b.experience || '',
+      b.photo_data || '',
+      b.education_doc_name || '',
+      b.education_doc_data || '',
+      id,
+      tid
+    );
+    // Automatically synchronize central employee updates across Attendance, Schedules, Payroll, Leaves, Assets, Forms & Dept Managers
+    if (existing?.employee_id) {
+      const code = existing.employee_id;
+      const name = String(b.full_name || '');
+      const dept = String(b.department || 'Operations');
+      db.prepare('UPDATE attendance_records SET employee_name = ?, department = ? WHERE tenant_id = ? AND employee_code = ?').run(name, dept, tid, code);
+      db.prepare('UPDATE staff_schedules SET employee_name = ?, department = ? WHERE tenant_id = ? AND employee_id = ?').run(name, dept, tid, code);
+      db.prepare('UPDATE staff_schedules SET replacement_employee_name = ? WHERE tenant_id = ? AND replacement_employee_id = ?').run(name, tid, code);
+      db.prepare('UPDATE payroll_records SET employee_name = ?, department = ? WHERE tenant_id = ? AND employee_code = ?').run(name, dept, tid, code);
+      db.prepare('UPDATE leaves SET employee_name = ?, department = ? WHERE tenant_id = ? AND employee_code = ?').run(name, dept, tid, code);
+      db.prepare('UPDATE assets_uniforms SET employee_name = ? WHERE tenant_id = ? AND employee_id = ?').run(name, tid, code);
+      db.prepare('UPDATE company_form_submissions SET employee_name = ?, department_name = ? WHERE tenant_id = ? AND employee_code = ?').run(name, dept, tid, code);
+      db.prepare('UPDATE departments SET manager_name = ? WHERE tenant_id = ? AND manager_employee_id = ?').run(name, tid, code);
+    }
+  });
+  tx();
   const updated = db.prepare('SELECT * FROM employees WHERE id = ? AND tenant_id = ?').get(id, tid);
-  logAudit(req, 'UPDATE', 'HR', `Updated employee ${b.full_name}`, tid);
+  logAudit(req, 'UPDATE', 'HR', `Updated central employee ${b.full_name} & synchronized connected modules`, tid);
   res.json(updated);
 });
 
@@ -2887,7 +3247,136 @@ app.delete('/api/devices/:id', (req, res) => {
   res.json({ ok: true });
 });
 
-// Attendance
+// ============================================================================
+// TIME MATH, ATTENDANCE ENGINE & STAFF SCHEDULING CONFLICT DETECTION
+// ============================================================================
+function timeToMinutes(hhmm: string): number {
+  const m = String(hhmm || '').match(/^(\d{1,2}):(\d{2})/);
+  if (!m) return 0;
+  return Number(m[1]) * 60 + Number(m[2]);
+}
+
+function diffShiftDurationMinutes(start: string, end: string): number {
+  const s = timeToMinutes(start);
+  let e = timeToMinutes(end);
+  if (e <= s) e += 1440; // overnight shift crossing midnight
+  return Math.max(0, e - s);
+}
+
+function dateDayIndex(dateStr: string): number {
+  const ms = Date.parse(`${dateStr}T00:00:00Z`);
+  if (Number.isNaN(ms)) return 0;
+  return Math.floor(ms / 86400000);
+}
+
+function scheduleIntervalMinutes(dateStr: string, startTime: string, endTime: string) {
+  const base = dateDayIndex(dateStr) * 1440;
+  const s = timeToMinutes(startTime);
+  let e = timeToMinutes(endTime);
+  if (e <= s) e += 1440;
+  return { start: base + s, end: base + e };
+}
+
+function syncTenantDepartmentStrings(tid: number) {
+  const rows = db.prepare("SELECT name FROM departments WHERE tenant_id = ? AND status = 'Active' ORDER BY id ASC").all(tid) as Array<{ name: string }>;
+  const csv = rows.map((r) => r.name).join(',');
+  if (tid === 1) {
+    db.prepare('UPDATE company_settings SET departments = ? WHERE id = 1').run(csv);
+  }
+  db.prepare('UPDATE tenants SET departments = ? WHERE id = ?').run(csv, tid);
+}
+
+function detectScheduleConflicts(
+  tid: number,
+  employeeId: string,
+  scheduleDate: string,
+  startTime: string,
+  endTime: string,
+  excludeId?: number
+) {
+  const rules = (db.prepare('SELECT * FROM workforce_rules WHERE tenant_id = ?').get(tid) as Record<string, unknown> | undefined) || {
+    min_rest_hours_between_shifts: 11,
+  };
+  const requiredRestHours = Number(rules.min_rest_hours_between_shifts ?? 11);
+  const requiredRestMinutes = requiredRestHours * 60;
+  const candidate = scheduleIntervalMinutes(scheduleDate, startTime, endTime);
+
+  const dIdx = dateDayIndex(scheduleDate);
+  const prevDate = new Date((dIdx - 1) * 86400000).toISOString().slice(0, 10);
+  const nextDate = new Date((dIdx + 1) * 86400000).toISOString().slice(0, 10);
+
+  const nearby = db
+    .prepare(
+      `
+    SELECT id, schedule_code, schedule_date, shift_name, start_time, end_time, approval_status
+    FROM staff_schedules
+    WHERE tenant_id = ? AND employee_id = ? AND schedule_date BETWEEN ? AND ? AND approval_status != 'Rejected'
+  `
+    )
+    .all(tid, employeeId, prevDate, nextDate) as Array<{
+    id: number;
+    schedule_code: string;
+    schedule_date: string;
+    shift_name: string;
+    start_time: string;
+    end_time: string;
+    approval_status: string;
+  }>;
+
+  const overlaps: Array<{ id: number; schedule_code: string; schedule_date: string; shift_name: string; start_time: string; end_time: string }> = [];
+  const restViolations: Array<{ id: number; schedule_code: string; schedule_date: string; shift_name: string; restHours: number; requiredHours: number }> = [];
+
+  for (const row of nearby) {
+    if (excludeId && row.id === excludeId) continue;
+    const existing = scheduleIntervalMinutes(row.schedule_date, row.start_time, row.end_time);
+    if (candidate.start < existing.end && existing.start < candidate.end) {
+      overlaps.push({
+        id: row.id,
+        schedule_code: row.schedule_code,
+        schedule_date: row.schedule_date,
+        shift_name: row.shift_name,
+        start_time: row.start_time,
+        end_time: row.end_time,
+      });
+    } else {
+      const gapMins = candidate.start >= existing.end ? candidate.start - existing.end : existing.start - candidate.end;
+      if (gapMins < requiredRestMinutes) {
+        restViolations.push({
+          id: row.id,
+          schedule_code: row.schedule_code,
+          schedule_date: row.schedule_date,
+          shift_name: row.shift_name,
+          restHours: Number((gapMins / 60).toFixed(1)),
+          requiredHours: requiredRestHours,
+        });
+      }
+    }
+  }
+
+  const leaveConflicts = db
+    .prepare(
+      `
+    SELECT id, leave_type, start_date, end_date, status
+    FROM leaves
+    WHERE tenant_id = ? AND employee_code = ? AND status = 'Approved' AND start_date <= ? AND end_date >= ?
+  `
+    )
+    .all(tid, employeeId, scheduleDate, scheduleDate) as Array<{
+    id: number;
+    leave_type: string;
+    start_date: string;
+    end_date: string;
+    status: string;
+  }>;
+
+  return {
+    hasConflict: overlaps.length > 0 || restViolations.length > 0 || leaveConflicts.length > 0,
+    overlaps,
+    restViolations,
+    leaveConflicts,
+  };
+}
+
 function computeAttOt(otType: string, otHours: number, hourlyRate: number, tenantId = 1) {
   const { otRow: ot } = getRulesAndOt(tenantId);
   let mult = 1;
@@ -2900,142 +3389,1100 @@ function computeAttOt(otType: string, otHours: number, hourlyRate: number, tenan
   return { mult, pay };
 }
 
-app.get('/api/attendance', (req, res) => {
-  const tid = getTenantId(req);
-  res.json(db.prepare('SELECT * FROM attendance_records WHERE tenant_id = ? ORDER BY id DESC').all(tid));
-});
+function resolveAttendancePayload(b: Record<string, unknown>, tid: number) {
+  const rules = (db.prepare('SELECT * FROM workforce_rules WHERE tenant_id = ?').get(tid) as Record<string, unknown> | undefined) || {
+    late_grace_minutes: 15,
+    early_departure_grace_minutes: 10,
+    default_break_minutes: 60,
+  };
+  const empCode = String(b.employee_code || 'SS-EMP').trim();
+  const emp = db
+    .prepare('SELECT employee_id, full_name, department, basic_salary FROM employees WHERE tenant_id = ? AND employee_id = ?')
+    .get(tid, empCode) as { employee_id: string; full_name: string; department: string; basic_salary: number } | undefined;
 
-app.post('/api/attendance', (req, res) => {
-  const tid = getTenantId(req);
-  const b = req.body || {};
-  const now = new Date().toISOString();
-  const hourly = Number(b.hourly_rate) || 100;
-  const otHours = Number(b.ot_hours) || 0;
-  const otType = b.ot_type || 'None';
-  const { mult, pay } = computeAttOt(otType, otHours, hourly, tid);
-  const info = db
-    .prepare(
-      `
-    INSERT INTO attendance_records (
-      tenant_id, employee_code, employee_name, department, attendance_date, shift_name, check_in, check_out,
-      hourly_rate, regular_hours, ot_type, ot_hours, ot_multiplier, ot_pay, status, register_state, notes, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Open', ?, ?)
-  `
-    )
-    .run(
-      tid,
-      b.employee_code || 'SS-EMP',
-      b.employee_name || 'Staff',
-      b.department || 'Operations',
-      b.attendance_date || now.slice(0, 10),
-      b.shift_name || 'Day Shift',
-      b.check_in || '08:00',
-      b.check_out || '17:00',
-      hourly,
-      Number(b.regular_hours) || 8,
-      otType,
-      otHours,
-      mult,
-      pay,
-      b.status || 'Present',
-      b.notes || '',
-      now
-    );
-  res.status(201).json(db.prepare('SELECT * FROM attendance_records WHERE id = ?').get(info.lastInsertRowid));
-});
+  const employeeName = String(b.employee_name || emp?.full_name || 'Staff');
+  const department = String(b.department || emp?.department || 'Operations');
+  const attendanceDate = String(b.attendance_date || new Date().toISOString().slice(0, 10));
+  const hourlyRate =
+    Number(b.hourly_rate) > 0
+      ? Number(b.hourly_rate)
+      : emp?.basic_salary
+      ? Number((emp.basic_salary / 208).toFixed(2))
+      : 100;
 
-app.put('/api/attendance/:id', (req, res) => {
-  const tid = getTenantId(req);
-  const id = Number(req.params.id);
-  const b = req.body || {};
-  const hourly = Number(b.hourly_rate) || 100;
-  const otHours = Number(b.ot_hours) || 0;
-  const otType = b.ot_type || 'None';
-  const { mult, pay } = computeAttOt(otType, otHours, hourly, tid);
-  db.prepare(
-    `
-    UPDATE attendance_records SET
-      employee_code=?, employee_name=?, department=?, attendance_date=?, shift_name=?, check_in=?, check_out=?,
-      hourly_rate=?, regular_hours=?, ot_type=?, ot_hours=?, ot_multiplier=?, ot_pay=?, status=?, notes=?
-    WHERE id = ? AND tenant_id = ?
-  `
-  ).run(
-    b.employee_code,
-    b.employee_name,
-    b.department,
-    b.attendance_date,
-    b.shift_name,
-    b.check_in,
-    b.check_out,
-    hourly,
-    Number(b.regular_hours) || 8,
+  // Match shift from payload or assigned schedule
+  let shiftRow: Record<string, unknown> | undefined;
+  if (b.shift_id) {
+    shiftRow = db.prepare('SELECT * FROM shifts WHERE id = ? AND tenant_id = ?').get(Number(b.shift_id), tid) as Record<string, unknown> | undefined;
+  }
+  if (!shiftRow && b.shift_name) {
+    shiftRow = db.prepare('SELECT * FROM shifts WHERE shift_name = ? AND tenant_id = ?').get(String(b.shift_name), tid) as Record<string, unknown> | undefined;
+  }
+  const schedRow = db
+    .prepare("SELECT * FROM staff_schedules WHERE tenant_id = ? AND employee_id = ? AND schedule_date = ? AND approval_status != 'Rejected' ORDER BY id DESC LIMIT 1")
+    .get(tid, empCode, attendanceDate) as Record<string, unknown> | undefined;
+
+  const shiftId = b.shift_id ? Number(b.shift_id) : shiftRow ? Number(shiftRow.id) : schedRow?.shift_id ? Number(schedRow.shift_id) : null;
+  const shiftName = String(b.shift_name || shiftRow?.shift_name || schedRow?.shift_name || 'Day Shift');
+  const shiftPeriod = String(
+    b.shift_period ||
+      (shiftName.toLowerCase().includes('morning')
+        ? 'Morning'
+        : shiftName.toLowerCase().includes('afternoon')
+        ? 'Afternoon'
+        : shiftName.toLowerCase().includes('night')
+        ? 'Night'
+        : shiftName.toLowerCase().includes('security')
+        ? 'Security'
+        : shiftName.toLowerCase().includes('weekend')
+        ? 'Weekend'
+        : shiftName.toLowerCase().includes('holiday')
+        ? 'Holiday'
+        : 'Day')
+  );
+
+  const scheduledStart = String(b.scheduled_start || shiftRow?.start_time || schedRow?.start_time || (shiftPeriod === 'Morning' ? '06:00' : shiftPeriod === 'Afternoon' ? '14:00' : shiftPeriod === 'Night' ? '22:00' : '08:00'));
+  const scheduledEnd = String(b.scheduled_end || shiftRow?.end_time || schedRow?.end_time || (shiftPeriod === 'Morning' ? '14:00' : shiftPeriod === 'Afternoon' ? '22:00' : shiftPeriod === 'Night' ? '06:00' : '17:00'));
+  const breakMinutes = Number(b.break_minutes ?? shiftRow?.break_minutes ?? schedRow?.break_minutes ?? rules.default_break_minutes ?? 60);
+
+  const morningIn = String(b.morning_check_in || '');
+  const morningOut = String(b.morning_check_out || '');
+  const afternoonIn = String(b.afternoon_check_in || '');
+  const afternoonOut = String(b.afternoon_check_out || '');
+  const nightIn = String(b.night_check_in || '');
+  const nightOut = String(b.night_check_out || '');
+
+  // Primary check-in & check-out fallback across Morning / Afternoon / Night punches
+  const firstPunchIn =
+    String(b.check_in || '').trim() ||
+    morningIn ||
+    afternoonIn ||
+    nightIn ||
+    (b.status === 'Absent' || b.status === 'On Leave' ? '--:--' : scheduledStart);
+  const lastPunchOut =
+    String(b.check_out || '').trim() ||
+    nightOut ||
+    afternoonOut ||
+    morningOut ||
+    (b.status === 'Absent' || b.status === 'On Leave' ? '--:--' : scheduledEnd);
+
+  const lateGrace = Number(shiftRow?.grace_late_minutes ?? rules.late_grace_minutes ?? 15);
+  const earlyGrace = Number(rules.early_departure_grace_minutes ?? 10);
+
+  const isAbsentOrLeave = b.status === 'Absent' || b.status === 'On Leave' || firstPunchIn === '--:--';
+  let lateMinutes = Number(b.late_minutes ?? -1);
+  let earlyDepartureMinutes = Number(b.early_departure_minutes ?? -1);
+  let regularHours = Number(b.regular_hours ?? -1);
+  let absenceHours = Number(b.absence_hours ?? -1);
+
+  if (isAbsentOrLeave) {
+    lateMinutes = 0;
+    earlyDepartureMinutes = 0;
+    regularHours = 0;
+    const schedNetHours = Math.max(0, (diffShiftDurationMinutes(scheduledStart, scheduledEnd) - breakMinutes) / 60);
+    absenceHours = absenceHours >= 0 ? absenceHours : Number(schedNetHours.toFixed(2));
+  } else {
+    const schedStartMin = timeToMinutes(scheduledStart);
+    const actualInMin = timeToMinutes(firstPunchIn);
+    if (lateMinutes < 0) {
+      const diffIn = actualInMin - schedStartMin;
+      lateMinutes = diffIn > lateGrace ? diffIn : 0;
+    }
+
+    const schedDur = diffShiftDurationMinutes(scheduledStart, scheduledEnd);
+    const actualDur = diffShiftDurationMinutes(firstPunchIn, lastPunchOut);
+    if (earlyDepartureMinutes < 0) {
+      const endGap = schedDur - (actualInMin - schedStartMin + actualDur);
+      earlyDepartureMinutes = endGap > earlyGrace ? endGap : 0;
+    }
+
+    if (regularHours < 0) {
+      const workedNetHrs = Math.max(0, (actualDur - breakMinutes) / 60);
+      regularHours = Number(Math.min(8, workedNetHrs).toFixed(2));
+    }
+    if (absenceHours < 0) {
+      const missedHrs = Math.max(0, (lateMinutes + earlyDepartureMinutes) / 60);
+      absenceHours = Number(missedHrs.toFixed(2));
+    }
+  }
+
+  let otType = String(b.ot_type || 'None');
+  let otHours = Number(b.ot_hours ?? -1);
+  if (otHours < 0) {
+    if (isAbsentOrLeave) {
+      otHours = 0;
+    } else {
+      const schedNetMins = Math.max(0, diffShiftDurationMinutes(scheduledStart, scheduledEnd) - breakMinutes);
+      const actualNetMins = Math.max(0, diffShiftDurationMinutes(firstPunchIn, lastPunchOut) - breakMinutes);
+      otHours = actualNetMins > schedNetMins + 15 ? Number(((actualNetMins - schedNetMins) / 60).toFixed(2)) : 0;
+    }
+  }
+  if (otHours > 0 && otType === 'None') {
+    otType = shiftPeriod === 'Night' ? 'Night' : shiftPeriod === 'Holiday' ? 'Holiday' : shiftPeriod === 'Weekend' ? 'Sunday' : 'Regular';
+  }
+  const { mult, pay } = computeAttOt(otType, otHours, hourlyRate, tid);
+
+  let derivedStatus = String(b.status || '');
+  if (!derivedStatus || derivedStatus === 'Auto') {
+    if (lateMinutes > 0 && earlyDepartureMinutes > 0) derivedStatus = 'Late & Early';
+    else if (lateMinutes > 0) derivedStatus = 'Late';
+    else if (earlyDepartureMinutes > 0) derivedStatus = 'Early Exit';
+    else if (regularHours > 0 && regularHours < 4.5) derivedStatus = 'Half-Day';
+    else derivedStatus = 'Present';
+  }
+
+  return {
+    empCode,
+    employeeName,
+    department,
+    attendanceDate,
+    shiftId,
+    shiftName,
+    shiftPeriod,
+    firstPunchIn,
+    lastPunchOut,
+    morningIn,
+    morningOut,
+    afternoonIn,
+    afternoonOut,
+    nightIn,
+    nightOut,
+    scheduledStart,
+    scheduledEnd,
+    hourlyRate,
+    regularHours,
+    lateMinutes,
+    earlyDepartureMinutes,
+    breakMinutes,
+    absenceHours,
     otType,
     otHours,
     mult,
     pay,
-    b.status || 'Present',
-    b.notes || '',
+    derivedStatus,
+    notes: String(b.notes || ''),
+  };
+}
+
+app.get('/api/attendance', (req, res) => {
+  const tid = getTenantId(req);
+  const { from, to, department, shift_period } = req.query;
+  const where: string[] = ['tenant_id = ?'];
+  const params: unknown[] = [tid];
+  if (from) {
+    where.push('attendance_date >= ?');
+    params.push(String(from));
+  }
+  if (to) {
+    where.push('attendance_date <= ?');
+    params.push(String(to));
+  }
+  if (department && department !== 'All') {
+    where.push('department = ?');
+    params.push(String(department));
+  }
+  if (shift_period && shift_period !== 'All') {
+    where.push('shift_period = ?');
+    params.push(String(shift_period));
+  }
+  res.json(db.prepare(`SELECT * FROM attendance_records WHERE ${where.join(' AND ')} ORDER BY attendance_date DESC, id DESC`).all(...params));
+});
+
+app.post('/api/attendance', (req, res) => {
+  const tid = getTenantId(req);
+  const b = (req.body || {}) as Record<string, unknown>;
+  const now = new Date().toISOString();
+  const actor = getActorName(req);
+  const r = resolveAttendancePayload(b, tid);
+  const info = db
+    .prepare(
+      `
+    INSERT INTO attendance_records (
+      tenant_id, employee_code, employee_name, department, attendance_date, shift_id, shift_name, shift_period,
+      check_in, check_out, morning_check_in, morning_check_out, afternoon_check_in, afternoon_check_out,
+      night_check_in, night_check_out, scheduled_start, scheduled_end, hourly_rate, regular_hours,
+      late_minutes, early_departure_minutes, break_minutes, absence_hours,
+      ot_type, ot_hours, ot_multiplier, ot_pay, status, register_state, notes, updated_by, updated_at, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Open', ?, ?, ?, ?)
+  `
+    )
+    .run(
+      tid,
+      r.empCode,
+      r.employeeName,
+      r.department,
+      r.attendanceDate,
+      r.shiftId,
+      r.shiftName,
+      r.shiftPeriod,
+      r.firstPunchIn,
+      r.lastPunchOut,
+      r.morningIn,
+      r.morningOut,
+      r.afternoonIn,
+      r.afternoonOut,
+      r.nightIn,
+      r.nightOut,
+      r.scheduledStart,
+      r.scheduledEnd,
+      r.hourlyRate,
+      r.regularHours,
+      r.lateMinutes,
+      r.earlyDepartureMinutes,
+      r.breakMinutes,
+      r.absenceHours,
+      r.otType,
+      r.otHours,
+      r.mult,
+      r.pay,
+      r.derivedStatus,
+      r.notes,
+      actor,
+      now,
+      now
+    );
+  logAudit(req, 'CREATE', 'Attendance', `Recorded ${r.shiftPeriod} attendance for ${r.employeeName} (${r.empCode}) on ${r.attendanceDate} [${r.derivedStatus}]`, tid);
+  res.status(201).json(db.prepare('SELECT * FROM attendance_records WHERE id = ?').get(info.lastInsertRowid));
+});
+
+app.put('/api/attendance/:id', (req, res) => {
+  if (!requireRole(req, res, ATTENDANCE_MANAGER_ROLES, 'editing attendance records')) return;
+  const tid = getTenantId(req);
+  const id = Number(req.params.id);
+  const existing = db.prepare('SELECT * FROM attendance_records WHERE id = ? AND tenant_id = ?').get(id, tid) as Record<string, unknown> | undefined;
+  if (!existing) {
+    res.status(404).json({ error: 'Attendance record not found.' });
+    return;
+  }
+  const role = getActorRole(req);
+  const isAdminOrHr = SHIFT_DEPT_ADMIN_ROLES.has(role) || !role;
+  if (existing.register_state === 'Closed' && !isAdminOrHr) {
+    res.status(403).json({ error: 'Closed attendance register can only be modified by an Administrator or HR Manager.' });
+    return;
+  }
+  const b = (req.body || {}) as Record<string, unknown>;
+  const now = new Date().toISOString();
+  const actor = getActorName(req);
+  const r = resolveAttendancePayload(b, tid);
+  db.prepare(
+    `
+    UPDATE attendance_records SET
+      employee_code=?, employee_name=?, department=?, attendance_date=?, shift_id=?, shift_name=?, shift_period=?,
+      check_in=?, check_out=?, morning_check_in=?, morning_check_out=?, afternoon_check_in=?, afternoon_check_out=?,
+      night_check_in=?, night_check_out=?, scheduled_start=?, scheduled_end=?, hourly_rate=?, regular_hours=?,
+      late_minutes=?, early_departure_minutes=?, break_minutes=?, absence_hours=?,
+      ot_type=?, ot_hours=?, ot_multiplier=?, ot_pay=?, status=?, notes=?, updated_by=?, updated_at=?
+    WHERE id = ? AND tenant_id = ?
+  `
+  ).run(
+    r.empCode,
+    r.employeeName,
+    r.department,
+    r.attendanceDate,
+    r.shiftId,
+    r.shiftName,
+    r.shiftPeriod,
+    r.firstPunchIn,
+    r.lastPunchOut,
+    r.morningIn,
+    r.morningOut,
+    r.afternoonIn,
+    r.afternoonOut,
+    r.nightIn,
+    r.nightOut,
+    r.scheduledStart,
+    r.scheduledEnd,
+    r.hourlyRate,
+    r.regularHours,
+    r.lateMinutes,
+    r.earlyDepartureMinutes,
+    r.breakMinutes,
+    r.absenceHours,
+    r.otType,
+    r.otHours,
+    r.mult,
+    r.pay,
+    r.derivedStatus,
+    r.notes,
+    actor,
+    now,
     id,
     tid
   );
+  logAudit(req, 'UPDATE', 'Attendance', `Corrected attendance #${id} for ${r.employeeName} (${r.attendanceDate}) -> ${r.derivedStatus}`, tid);
   res.json(db.prepare('SELECT * FROM attendance_records WHERE id = ? AND tenant_id = ?').get(id, tid));
 });
 
 app.post('/api/attendance/import', (req, res) => {
+  if (!requireRole(req, res, ATTENDANCE_MANAGER_ROLES, 'importing attendance logs')) return;
   const tid = getTenantId(req);
   const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
   const now = new Date().toISOString();
+  const actor = getActorName(req);
   const ins = db.prepare(`
     INSERT INTO attendance_records (
-      tenant_id, employee_code, employee_name, department, attendance_date, shift_name, check_in, check_out,
-      hourly_rate, regular_hours, ot_type, ot_hours, ot_multiplier, ot_pay, status, register_state, notes, created_at
-    ) VALUES (?, ?, ?, ?, ?, 'Imported Shift', ?, ?, 100, 8, ?, ?, ?, ?, 'Present', 'Open', 'CSV Import', ?)
+      tenant_id, employee_code, employee_name, department, attendance_date, shift_id, shift_name, shift_period,
+      check_in, check_out, morning_check_in, morning_check_out, afternoon_check_in, afternoon_check_out,
+      night_check_in, night_check_out, scheduled_start, scheduled_end, hourly_rate, regular_hours,
+      late_minutes, early_departure_minutes, break_minutes, absence_hours,
+      ot_type, ot_hours, ot_multiplier, ot_pay, status, register_state, notes, updated_by, updated_at, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Open', ?, ?, ?, ?)
   `);
-  for (const r of rows) {
-    const otType = r.ot_type || 'None';
-    const otHours = Number(r.ot_hours) || 0;
-    const { mult, pay } = computeAttOt(otType, otHours, 100, tid);
+  for (const row of rows) {
+    const r = resolveAttendancePayload({ ...row, notes: row.notes || 'CSV Import' }, tid);
     ins.run(
       tid,
-      r.employee_code || 'SS-EMP',
-      r.employee_name || 'Staff',
-      r.department || 'Operations',
-      r.attendance_date || now.slice(0, 10),
-      r.check_in || '08:00',
-      r.check_out || '17:00',
-      otType,
-      otHours,
-      mult,
-      pay,
+      r.empCode,
+      r.employeeName,
+      r.department,
+      r.attendanceDate,
+      r.shiftId,
+      r.shiftName,
+      r.shiftPeriod,
+      r.firstPunchIn,
+      r.lastPunchOut,
+      r.morningIn,
+      r.morningOut,
+      r.afternoonIn,
+      r.afternoonOut,
+      r.nightIn,
+      r.nightOut,
+      r.scheduledStart,
+      r.scheduledEnd,
+      r.hourlyRate,
+      r.regularHours,
+      r.lateMinutes,
+      r.earlyDepartureMinutes,
+      r.breakMinutes,
+      r.absenceHours,
+      r.otType,
+      r.otHours,
+      r.mult,
+      r.pay,
+      r.derivedStatus,
+      r.notes,
+      actor,
+      now,
       now
     );
   }
+  logAudit(req, 'IMPORT', 'Attendance', `Imported ${rows.length} attendance records via CSV`, tid);
   res.json({ imported: rows.length });
 });
 
 app.patch('/api/attendance/:id/close', (req, res) => {
+  if (!requireRole(req, res, ATTENDANCE_MANAGER_ROLES, 'closing/opening attendance registers')) return;
   const tid = getTenantId(req);
   const id = Number(req.params.id);
   const state = req.body?.register_state || 'Closed';
-  db.prepare('UPDATE attendance_records SET register_state = ? WHERE id = ? AND tenant_id = ?').run(state, id, tid);
+  const now = new Date().toISOString();
+  db.prepare('UPDATE attendance_records SET register_state = ?, updated_by = ?, updated_at = ? WHERE id = ? AND tenant_id = ?').run(
+    state,
+    getActorName(req),
+    now,
+    id,
+    tid
+  );
+  logAudit(req, 'UPDATE', 'Attendance', `Set attendance #${id} register state to ${state}`, tid);
   res.json(db.prepare('SELECT * FROM attendance_records WHERE id = ? AND tenant_id = ?').get(id, tid));
 });
 
 app.post('/api/attendance/close-all', (req, res) => {
+  if (!requireRole(req, res, ATTENDANCE_MANAGER_ROLES, 'bulk closing attendance registers')) return;
   const tid = getTenantId(req);
   const d = req.body?.attendance_date;
+  const now = new Date().toISOString();
   if (d) {
-    db.prepare("UPDATE attendance_records SET register_state = 'Closed' WHERE tenant_id = ? AND attendance_date = ?").run(tid, d);
+    db.prepare("UPDATE attendance_records SET register_state = 'Closed', updated_by = ?, updated_at = ? WHERE tenant_id = ? AND attendance_date = ?").run(
+      getActorName(req),
+      now,
+      tid,
+      d
+    );
   } else {
-    db.prepare("UPDATE attendance_records SET register_state = 'Closed' WHERE tenant_id = ?").run(tid);
+    db.prepare("UPDATE attendance_records SET register_state = 'Closed', updated_by = ?, updated_at = ? WHERE tenant_id = ?").run(
+      getActorName(req),
+      now,
+      tid
+    );
   }
+  logAudit(req, 'CLOSE_ALL', 'Attendance', `Closed attendance registers${d ? ` for ${d}` : ''}`, tid);
   res.json({ ok: true });
 });
 
 app.delete('/api/attendance/:id', (req, res) => {
+  if (!requireRole(req, res, SHIFT_DEPT_ADMIN_ROLES, 'deleting attendance records')) return;
   const tid = getTenantId(req);
-  db.prepare('DELETE FROM attendance_records WHERE id = ? AND tenant_id = ?').run(Number(req.params.id), tid);
+  const id = Number(req.params.id);
+  db.prepare('DELETE FROM attendance_records WHERE id = ? AND tenant_id = ?').run(id, tid);
+  logAudit(req, 'DELETE', 'Attendance', `Deleted attendance record #${id}`, tid);
   res.json({ ok: true });
+});
+
+// ============================================================================
+// SHIFTS, DEPARTMENTS, STAFF SCHEDULING, HOLIDAYS & WORKFORCE RULES
+// ============================================================================
+app.get('/api/shifts', (req, res) => {
+  const tid = getTenantId(req);
+  res.json(db.prepare('SELECT * FROM shifts WHERE tenant_id = ? ORDER BY id ASC').all(tid));
+});
+
+app.post('/api/shifts', (req, res) => {
+  if (!requireRole(req, res, SHIFT_DEPT_ADMIN_ROLES, 'creating shifts')) return;
+  const tid = getTenantId(req);
+  const b = req.body || {};
+  const now = new Date().toISOString();
+  const code = b.shift_code || `SHF-${Date.now().toString().slice(-4)}`;
+  const info = db
+    .prepare(
+      `
+    INSERT INTO shifts (
+      tenant_id, shift_code, shift_name, shift_category, scheduling_system, start_time, end_time,
+      break_minutes, working_days, rest_days, min_rest_hours, is_rotating, rotation_pattern,
+      color_hex, ot_multiplier, grace_late_minutes, status, notes, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `
+    )
+    .run(
+      tid,
+      code,
+      b.shift_name || b.shift_category || 'New Shift',
+      b.shift_category || 'Day Shift',
+      b.scheduling_system || '3-Shift',
+      b.start_time || '08:00',
+      b.end_time || '17:00',
+      Number(b.break_minutes ?? 30),
+      typeof b.working_days === 'string' ? b.working_days : JSON.stringify(b.working_days || ['Mon', 'Tue', 'Wed', 'Thu', 'Fri']),
+      typeof b.rest_days === 'string' ? b.rest_days : JSON.stringify(b.rest_days || ['Sat', 'Sun']),
+      Number(b.min_rest_hours ?? 11),
+      b.is_rotating ? 1 : 0,
+      b.rotation_pattern || 'Fixed',
+      b.color_hex || '#2563eb',
+      Number(b.ot_multiplier ?? 1.5),
+      Number(b.grace_late_minutes ?? 15),
+      b.status || 'Active',
+      b.notes || '',
+      now,
+      now
+    );
+  logAudit(req, 'CREATE', 'Shifts', `Created shift ${b.shift_name} (${b.start_time}–${b.end_time})`, tid);
+  res.status(201).json(db.prepare('SELECT * FROM shifts WHERE id = ?').get(info.lastInsertRowid));
+});
+
+app.put('/api/shifts/:id', (req, res) => {
+  if (!requireRole(req, res, SHIFT_DEPT_ADMIN_ROLES, 'updating shifts')) return;
+  const tid = getTenantId(req);
+  const id = Number(req.params.id);
+  const b = req.body || {};
+  const now = new Date().toISOString();
+  db.prepare(
+    `
+    UPDATE shifts SET
+      shift_code=?, shift_name=?, shift_category=?, scheduling_system=?, start_time=?, end_time=?,
+      break_minutes=?, working_days=?, rest_days=?, min_rest_hours=?, is_rotating=?, rotation_pattern=?,
+      color_hex=?, ot_multiplier=?, grace_late_minutes=?, status=?, notes=?, updated_at=?
+    WHERE id = ? AND tenant_id = ?
+  `
+  ).run(
+    b.shift_code,
+    b.shift_name,
+    b.shift_category,
+    b.scheduling_system || '3-Shift',
+    b.start_time,
+    b.end_time,
+    Number(b.break_minutes ?? 30),
+    typeof b.working_days === 'string' ? b.working_days : JSON.stringify(b.working_days || []),
+    typeof b.rest_days === 'string' ? b.rest_days : JSON.stringify(b.rest_days || []),
+    Number(b.min_rest_hours ?? 11),
+    b.is_rotating ? 1 : 0,
+    b.rotation_pattern || 'Fixed',
+    b.color_hex || '#2563eb',
+    Number(b.ot_multiplier ?? 1.5),
+    Number(b.grace_late_minutes ?? 15),
+    b.status || 'Active',
+    b.notes || '',
+    now,
+    id,
+    tid
+  );
+  logAudit(req, 'UPDATE', 'Shifts', `Updated shift ${b.shift_name} (${b.start_time}–${b.end_time})`, tid);
+  res.json(db.prepare('SELECT * FROM shifts WHERE id = ? AND tenant_id = ?').get(id, tid));
+});
+
+app.delete('/api/shifts/:id', (req, res) => {
+  if (!requireRole(req, res, SHIFT_DEPT_ADMIN_ROLES, 'deleting shifts')) return;
+  const tid = getTenantId(req);
+  const id = Number(req.params.id);
+  db.prepare('DELETE FROM shifts WHERE id = ? AND tenant_id = ?').run(id, tid);
+  logAudit(req, 'DELETE', 'Shifts', `Deleted shift #${id}`, tid);
+  res.json({ ok: true });
+});
+
+app.get('/api/departments', (req, res) => {
+  const tid = getTenantId(req);
+  res.json(db.prepare('SELECT * FROM departments WHERE tenant_id = ? ORDER BY id ASC').all(tid));
+});
+
+app.post('/api/departments', (req, res) => {
+  if (!requireRole(req, res, SHIFT_DEPT_ADMIN_ROLES, 'creating departments')) return;
+  const tid = getTenantId(req);
+  const b = req.body || {};
+  const now = new Date().toISOString();
+  const code = b.dept_code || `DEPT-${Date.now().toString().slice(-3)}`;
+  const mgrEmp = b.manager_employee_id
+    ? (db.prepare('SELECT employee_id, full_name FROM employees WHERE tenant_id = ? AND employee_id = ?').get(tid, b.manager_employee_id) as
+        | { employee_id: string; full_name: string }
+        | undefined)
+    : undefined;
+  const info = db
+    .prepare(
+      `
+    INSERT INTO departments (
+      tenant_id, dept_code, name, manager_employee_id, manager_name, scheduling_system, default_shift_id,
+      working_days, rest_days, weekend_schedule_enabled, holiday_schedule_enabled, security_guard_coverage,
+      monthly_timetable_notes, status, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `
+    )
+    .run(
+      tid,
+      code,
+      b.name || 'New Department',
+      mgrEmp?.employee_id || b.manager_employee_id || '',
+      mgrEmp?.full_name || b.manager_name || 'Department Manager',
+      b.scheduling_system || 'Standard',
+      b.default_shift_id ? Number(b.default_shift_id) : null,
+      typeof b.working_days === 'string' ? b.working_days : JSON.stringify(b.working_days || ['Mon', 'Tue', 'Wed', 'Thu', 'Fri']),
+      typeof b.rest_days === 'string' ? b.rest_days : JSON.stringify(b.rest_days || ['Sat', 'Sun']),
+      b.weekend_schedule_enabled ? 1 : 0,
+      b.holiday_schedule_enabled ? 1 : 0,
+      b.security_guard_coverage || 'Standard Business Hours',
+      b.monthly_timetable_notes || '',
+      b.status || 'Active',
+      now,
+      now
+    );
+  syncTenantDepartmentStrings(tid);
+  logAudit(req, 'CREATE', 'Departments', `Created department ${b.name} (${b.scheduling_system || 'Standard'})`, tid);
+  res.status(201).json(db.prepare('SELECT * FROM departments WHERE id = ?').get(info.lastInsertRowid));
+});
+
+app.put('/api/departments/:id', (req, res) => {
+  if (!requireRole(req, res, SHIFT_DEPT_ADMIN_ROLES, 'updating departments & timetables')) return;
+  const tid = getTenantId(req);
+  const id = Number(req.params.id);
+  const b = req.body || {};
+  const now = new Date().toISOString();
+  const prev = db.prepare('SELECT name FROM departments WHERE id = ? AND tenant_id = ?').get(id, tid) as { name: string } | undefined;
+  const mgrEmp = b.manager_employee_id
+    ? (db.prepare('SELECT employee_id, full_name FROM employees WHERE tenant_id = ? AND employee_id = ?').get(tid, b.manager_employee_id) as
+        | { employee_id: string; full_name: string }
+        | undefined)
+    : undefined;
+  db.prepare(
+    `
+    UPDATE departments SET
+      dept_code=?, name=?, manager_employee_id=?, manager_name=?, scheduling_system=?, default_shift_id=?,
+      working_days=?, rest_days=?, weekend_schedule_enabled=?, holiday_schedule_enabled=?, security_guard_coverage=?,
+      monthly_timetable_notes=?, status=?, updated_at=?
+    WHERE id = ? AND tenant_id = ?
+  `
+  ).run(
+    b.dept_code,
+    b.name,
+    mgrEmp?.employee_id || b.manager_employee_id || '',
+    mgrEmp?.full_name || b.manager_name || '',
+    b.scheduling_system || 'Standard',
+    b.default_shift_id ? Number(b.default_shift_id) : null,
+    typeof b.working_days === 'string' ? b.working_days : JSON.stringify(b.working_days || []),
+    typeof b.rest_days === 'string' ? b.rest_days : JSON.stringify(b.rest_days || []),
+    b.weekend_schedule_enabled ? 1 : 0,
+    b.holiday_schedule_enabled ? 1 : 0,
+    b.security_guard_coverage || 'Standard Business Hours',
+    b.monthly_timetable_notes || '',
+    b.status || 'Active',
+    now,
+    id,
+    tid
+  );
+  if (prev?.name && b.name && prev.name !== b.name) {
+    db.prepare('UPDATE employees SET department = ? WHERE tenant_id = ? AND department = ?').run(b.name, tid, prev.name);
+    db.prepare('UPDATE staff_schedules SET department = ? WHERE tenant_id = ? AND department = ?').run(b.name, tid, prev.name);
+    db.prepare('UPDATE attendance_records SET department = ? WHERE tenant_id = ? AND department = ?').run(b.name, tid, prev.name);
+  }
+  syncTenantDepartmentStrings(tid);
+  logAudit(req, 'UPDATE', 'Departments', `Updated department timetable for ${b.name}`, tid);
+  res.json(db.prepare('SELECT * FROM departments WHERE id = ? AND tenant_id = ?').get(id, tid));
+});
+
+app.delete('/api/departments/:id', (req, res) => {
+  if (!requireRole(req, res, SHIFT_DEPT_ADMIN_ROLES, 'deleting departments')) return;
+  const tid = getTenantId(req);
+  const id = Number(req.params.id);
+  db.prepare('DELETE FROM departments WHERE id = ? AND tenant_id = ?').run(id, tid);
+  syncTenantDepartmentStrings(tid);
+  logAudit(req, 'DELETE', 'Departments', `Removed department #${id}`, tid);
+  res.json({ ok: true });
+});
+
+app.get('/api/scheduling', (req, res) => {
+  const tid = getTenantId(req);
+  const { from, to, department, shift_category, employee_id } = req.query;
+  const where: string[] = ['tenant_id = ?'];
+  const params: unknown[] = [tid];
+  if (from) {
+    where.push('schedule_date >= ?');
+    params.push(String(from));
+  }
+  if (to) {
+    where.push('schedule_date <= ?');
+    params.push(String(to));
+  }
+  if (department && department !== 'All') {
+    where.push('department = ?');
+    params.push(String(department));
+  }
+  if (shift_category && shift_category !== 'All') {
+    where.push('shift_category = ?');
+    params.push(String(shift_category));
+  }
+  if (employee_id && employee_id !== 'All') {
+    where.push('employee_id = ?');
+    params.push(String(employee_id));
+  }
+  res.json(db.prepare(`SELECT * FROM staff_schedules WHERE ${where.join(' AND ')} ORDER BY schedule_date ASC, start_time ASC, id DESC`).all(...params));
+});
+
+app.post('/api/scheduling/check-conflicts', (req, res) => {
+  const tid = getTenantId(req);
+  const b = req.body || {};
+  const report = detectScheduleConflicts(
+    tid,
+    String(b.employee_id || ''),
+    String(b.schedule_date || new Date().toISOString().slice(0, 10)),
+    String(b.start_time || '08:00'),
+    String(b.end_time || '17:00'),
+    b.exclude_id ? Number(b.exclude_id) : undefined
+  );
+  res.json(report);
+});
+
+app.post('/api/scheduling', (req, res) => {
+  if (!requireRole(req, res, ATTENDANCE_MANAGER_ROLES, 'creating staff schedules')) return;
+  const tid = getTenantId(req);
+  const b = req.body || {};
+  const now = new Date().toISOString();
+  const actor = getActorName(req);
+
+  const emp = db.prepare('SELECT employee_id, full_name, department FROM employees WHERE tenant_id = ? AND employee_id = ?').get(tid, String(b.employee_id || '')) as
+    | { employee_id: string; full_name: string; department: string }
+    | undefined;
+  if (!emp) {
+    res.status(400).json({ error: 'Selected employee was not found in central HR database.' });
+    return;
+  }
+  const shift = b.shift_id
+    ? (db.prepare('SELECT * FROM shifts WHERE id = ? AND tenant_id = ?').get(Number(b.shift_id), tid) as Record<string, unknown> | undefined)
+    : undefined;
+
+  const schedDate = String(b.schedule_date || now.slice(0, 10));
+  const startTime = String(b.start_time || shift?.start_time || '08:00');
+  const endTime = String(b.end_time || shift?.end_time || '17:00');
+  const conflicts = detectScheduleConflicts(tid, emp.employee_id, schedDate, startTime, endTime);
+
+  if (conflicts.hasConflict && !b.force_override) {
+    res.status(409).json({
+      error: 'Scheduling conflict detected (overlapping shift, insufficient rest period, or approved leave).',
+      conflicts,
+    });
+    return;
+  }
+
+  const count = (db.prepare('SELECT COUNT(*) as c FROM staff_schedules WHERE tenant_id = ?').get(tid) as { c: number }).c + 1;
+  const code = b.schedule_code || `SCH-${tid}-${String(count).padStart(4, '0')}`;
+  const shiftName = String(b.shift_name || shift?.shift_name || 'Day Shift');
+  const shiftCat = String(b.shift_category || shift?.shift_category || 'Day Shift');
+
+  const info = db
+    .prepare(
+      `
+    INSERT INTO staff_schedules (
+      tenant_id, schedule_code, employee_id, employee_name, department, shift_id, shift_name, shift_category,
+      schedule_date, end_date, start_time, end_time, break_minutes, schedule_type, rotation_group,
+      availability_status, replacement_employee_id, replacement_employee_name, change_reason,
+      approval_status, approved_by, created_by, updated_by, notes, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', '', ?, ?, ?, ?, ?, ?, ?)
+  `
+    )
+    .run(
+      tid,
+      code,
+      emp.employee_id,
+      emp.full_name,
+      String(b.department || emp.department),
+      shift ? Number(shift.id) : b.shift_id ? Number(b.shift_id) : null,
+      shiftName,
+      shiftCat,
+      schedDate,
+      String(b.end_date || schedDate),
+      startTime,
+      endTime,
+      Number(b.break_minutes ?? shift?.break_minutes ?? 30),
+      String(b.schedule_type || 'Regular'),
+      String(b.rotation_group || 'Standard'),
+      String(b.availability_status || 'Assigned'),
+      String(b.approval_status || 'Approved'),
+      b.approval_status === 'Pending' ? '' : actor,
+      actor,
+      actor,
+      String(b.notes || ''),
+      now,
+      now
+    );
+
+  logAudit(req, 'CREATE', 'Scheduling', `Scheduled ${emp.full_name} (${emp.employee_id}) for ${shiftName} on ${schedDate}`, tid);
+  res.status(201).json(db.prepare('SELECT * FROM staff_schedules WHERE id = ?').get(info.lastInsertRowid));
+});
+
+app.post('/api/scheduling/generate', (req, res) => {
+  if (!requireRole(req, res, ATTENDANCE_MANAGER_ROLES, 'generating rotating timetables')) return;
+  const tid = getTenantId(req);
+  const b = req.body || {};
+  const now = new Date().toISOString();
+  const actor = getActorName(req);
+
+  const startDate = String(b.start_date || now.slice(0, 10));
+  const days = Math.min(31, Math.max(1, Number(b.days) || 7));
+  const systemMode = String(b.scheduling_system || '3-Shift');
+  const rotateShifts = Boolean(b.rotate_weekly ?? true);
+  const deptFilter = String(b.department || 'All');
+
+  const employees = (
+    deptFilter && deptFilter !== 'All'
+      ? db.prepare("SELECT employee_id, full_name, department FROM employees WHERE tenant_id = ? AND status = 'Active' AND department = ? ORDER BY id ASC").all(tid, deptFilter)
+      : db.prepare("SELECT employee_id, full_name, department FROM employees WHERE tenant_id = ? AND status = 'Active' ORDER BY id ASC").all(tid)
+  ) as Array<{ employee_id: string; full_name: string; department: string }>;
+
+  if (employees.length === 0) {
+    res.status(400).json({ error: 'No active employees found for the selected department.' });
+    return;
+  }
+
+  const allShifts = db.prepare("SELECT * FROM shifts WHERE tenant_id = ? AND status = 'Active' ORDER BY id ASC").all(tid) as Array<Record<string, unknown>>;
+  const byCat = (cat: string) => allShifts.find((s) => s.shift_category === cat) || allShifts[0];
+  const pool =
+    systemMode === '4-Shift'
+      ? [byCat('Morning Shift'), byCat('Afternoon Shift'), byCat('Night Shift'), byCat('Weekend Shift')].filter(Boolean)
+      : systemMode === 'Security 24/7'
+      ? [byCat('Security Guard Shift'), byCat('Morning Shift'), byCat('Night Shift')].filter(Boolean)
+      : [byCat('Morning Shift'), byCat('Afternoon Shift'), byCat('Night Shift')].filter(Boolean);
+
+  if (pool.length === 0) {
+    res.status(400).json({ error: 'No active shifts configured for roster generation.' });
+    return;
+  }
+
+  const existingCount = (db.prepare('SELECT COUNT(*) as c FROM staff_schedules WHERE tenant_id = ?').get(tid) as { c: number }).c;
+  let seq = existingCount + 1;
+  let created = 0;
+  let skippedConflicts = 0;
+
+  const ins = db.prepare(`
+    INSERT INTO staff_schedules (
+      tenant_id, schedule_code, employee_id, employee_name, department, shift_id, shift_name, shift_category,
+      schedule_date, end_date, start_time, end_time, break_minutes, schedule_type, rotation_group,
+      availability_status, approval_status, approved_by, created_by, updated_by, notes, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Assigned', 'Approved', ?, ?, ?, ?, ?, ?)
+  `);
+
+  const tx = db.transaction(() => {
+    for (let empIdx = 0; empIdx < employees.length; empIdx++) {
+      const emp = employees[empIdx];
+      for (let d = 0; d < days; d++) {
+        const dtObj = new Date(`${startDate}T00:00:00Z`);
+        dtObj.setUTCDate(dtObj.getUTCDate() + d);
+        const dtIso = dtObj.toISOString().slice(0, 10);
+        const weekIdx = Math.floor(d / 7);
+        const shiftIdx = rotateShifts ? (empIdx + weekIdx) % pool.length : empIdx % pool.length;
+        const sh = pool[shiftIdx];
+        const conflicts = detectScheduleConflicts(tid, emp.employee_id, dtIso, String(sh.start_time), String(sh.end_time));
+        if (conflicts.hasConflict) {
+          skippedConflicts++;
+          continue;
+        }
+        const schedType = systemMode === 'Security 24/7' ? 'Security Guard' : rotateShifts ? 'Rotating' : 'Regular';
+        ins.run(
+          tid,
+          `SCH-${tid}-${String(seq++).padStart(4, '0')}`,
+          emp.employee_id,
+          emp.full_name,
+          emp.department,
+          Number(sh.id),
+          String(sh.shift_name),
+          String(sh.shift_category),
+          dtIso,
+          dtIso,
+          String(sh.start_time),
+          String(sh.end_time),
+          Number(sh.break_minutes) || 30,
+          schedType,
+          `${systemMode}-Team-${(empIdx % pool.length) + 1}`,
+          actor,
+          actor,
+          actor,
+          `Generated ${systemMode} roster`,
+          now,
+          now
+        );
+        created++;
+      }
+    }
+  });
+  tx();
+
+  logAudit(req, 'GENERATE', 'Scheduling', `Generated ${created} ${systemMode} schedules (${skippedConflicts} conflict/leave skips)`, tid);
+  res.json({ ok: true, created, skippedConflicts });
+});
+
+app.put('/api/scheduling/:id', (req, res) => {
+  if (!requireRole(req, res, ATTENDANCE_MANAGER_ROLES, 'editing staff schedules')) return;
+  const tid = getTenantId(req);
+  const id = Number(req.params.id);
+  const b = req.body || {};
+  const now = new Date().toISOString();
+  const actor = getActorName(req);
+
+  const emp = db.prepare('SELECT employee_id, full_name, department FROM employees WHERE tenant_id = ? AND employee_id = ?').get(tid, String(b.employee_id || '')) as
+    | { employee_id: string; full_name: string; department: string }
+    | undefined;
+  const schedDate = String(b.schedule_date || now.slice(0, 10));
+  const startTime = String(b.start_time || '08:00');
+  const endTime = String(b.end_time || '17:00');
+  const empId = emp?.employee_id || String(b.employee_id || '');
+  const conflicts = detectScheduleConflicts(tid, empId, schedDate, startTime, endTime, id);
+  if (conflicts.hasConflict && !b.force_override) {
+    res.status(409).json({
+      error: 'Scheduling conflict detected on updated slot.',
+      conflicts,
+    });
+    return;
+  }
+
+  db.prepare(
+    `
+    UPDATE staff_schedules SET
+      employee_id=?, employee_name=?, department=?, shift_id=?, shift_name=?, shift_category=?,
+      schedule_date=?, end_date=?, start_time=?, end_time=?, break_minutes=?, schedule_type=?,
+      rotation_group=?, availability_status=?, notes=?, updated_by=?, updated_at=?
+    WHERE id = ? AND tenant_id = ?
+  `
+  ).run(
+    empId,
+    emp?.full_name || String(b.employee_name || ''),
+    String(b.department || emp?.department || 'Operations'),
+    b.shift_id ? Number(b.shift_id) : null,
+    String(b.shift_name || 'Day Shift'),
+    String(b.shift_category || 'Day Shift'),
+    schedDate,
+    String(b.end_date || schedDate),
+    startTime,
+    endTime,
+    Number(b.break_minutes ?? 30),
+    String(b.schedule_type || 'Regular'),
+    String(b.rotation_group || 'Standard'),
+    String(b.availability_status || 'Assigned'),
+    String(b.notes || ''),
+    actor,
+    now,
+    id,
+    tid
+  );
+
+  logAudit(req, 'UPDATE', 'Scheduling', `Updated schedule #${id} for ${emp?.full_name || b.employee_name} on ${schedDate}`, tid);
+  res.json(db.prepare('SELECT * FROM staff_schedules WHERE id = ? AND tenant_id = ?').get(id, tid));
+});
+
+app.post('/api/scheduling/:id/replace', (req, res) => {
+  if (!requireRole(req, res, ATTENDANCE_MANAGER_ROLES, 'replacing shift staff')) return;
+  const tid = getTenantId(req);
+  const id = Number(req.params.id);
+  const { replacement_employee_id, reason, force_override } = req.body || {};
+  const orig = db.prepare('SELECT * FROM staff_schedules WHERE id = ? AND tenant_id = ?').get(id, tid) as Record<string, unknown> | undefined;
+  if (!orig) {
+    res.status(404).json({ error: 'Schedule entry not found.' });
+    return;
+  }
+  const rep = db
+    .prepare('SELECT employee_id, full_name, department FROM employees WHERE tenant_id = ? AND employee_id = ?')
+    .get(tid, String(replacement_employee_id || '')) as { employee_id: string; full_name: string; department: string } | undefined;
+  if (!rep) {
+    res.status(400).json({ error: 'Replacement employee not found in central directory.' });
+    return;
+  }
+  const conflicts = detectScheduleConflicts(
+    tid,
+    rep.employee_id,
+    String(orig.schedule_date),
+    String(orig.start_time),
+    String(orig.end_time)
+  );
+  if (conflicts.hasConflict && !force_override) {
+    res.status(409).json({
+      error: `Replacement employee ${rep.full_name} has a scheduling, rest-period, or leave conflict.`,
+      conflicts,
+    });
+    return;
+  }
+
+  const now = new Date().toISOString();
+  const actor = getActorName(req);
+  const tx = db.transaction(() => {
+    db.prepare(
+      `
+      UPDATE staff_schedules SET
+        availability_status = 'Replaced',
+        replacement_employee_id = ?,
+        replacement_employee_name = ?,
+        change_reason = ?,
+        updated_by = ?,
+        updated_at = ?
+      WHERE id = ? AND tenant_id = ?
+    `
+    ).run(rep.employee_id, rep.full_name, String(reason || 'Shift replacement'), actor, now, id, tid);
+
+    const cnt = (db.prepare('SELECT COUNT(*) as c FROM staff_schedules WHERE tenant_id = ?').get(tid) as { c: number }).c + 1;
+    db.prepare(
+      `
+      INSERT INTO staff_schedules (
+        tenant_id, schedule_code, employee_id, employee_name, department, shift_id, shift_name, shift_category,
+        schedule_date, end_date, start_time, end_time, break_minutes, schedule_type, rotation_group,
+        availability_status, replacement_employee_id, replacement_employee_name, change_reason,
+        approval_status, approved_by, created_by, updated_by, notes, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Assigned', ?, ?, ?, 'Approved', ?, ?, ?, ?, ?, ?)
+    `
+    ).run(
+      tid,
+      `SCH-${tid}-${String(cnt).padStart(4, '0')}`,
+      rep.employee_id,
+      rep.full_name,
+      rep.department,
+      orig.shift_id || null,
+      String(orig.shift_name),
+      String(orig.shift_category),
+      String(orig.schedule_date),
+      String(orig.end_date),
+      String(orig.start_time),
+      String(orig.end_time),
+      Number(orig.break_minutes) || 30,
+      String(orig.schedule_type),
+      String(orig.rotation_group || ''),
+      String(orig.employee_id),
+      String(orig.employee_name),
+      String(reason || `Covering for ${orig.employee_name}`),
+      actor,
+      actor,
+      actor,
+      `Replacement coverage for ${orig.schedule_code}`,
+      now,
+      now
+    );
+  });
+  tx();
+
+  logAudit(req, 'REPLACE', 'Scheduling', `Replaced ${orig.employee_name} with ${rep.full_name} on ${orig.schedule_date} (${reason || 'Shift swap'})`, tid);
+  res.json({ ok: true });
+});
+
+app.patch('/api/scheduling/:id/approve', (req, res) => {
+  if (!requireRole(req, res, ATTENDANCE_MANAGER_ROLES, 'approving staff schedules')) return;
+  const tid = getTenantId(req);
+  const id = Number(req.params.id);
+  const status = String(req.body?.approval_status || 'Approved');
+  const now = new Date().toISOString();
+  const actor = getActorName(req);
+  db.prepare('UPDATE staff_schedules SET approval_status = ?, approved_by = ?, updated_by = ?, updated_at = ? WHERE id = ? AND tenant_id = ?').run(
+    status,
+    actor,
+    actor,
+    now,
+    id,
+    tid
+  );
+  logAudit(req, 'APPROVE', 'Scheduling', `Marked schedule #${id} as ${status}`, tid);
+  res.json(db.prepare('SELECT * FROM staff_schedules WHERE id = ? AND tenant_id = ?').get(id, tid));
+});
+
+app.delete('/api/scheduling/:id', (req, res) => {
+  if (!requireRole(req, res, ATTENDANCE_MANAGER_ROLES, 'deleting staff schedules')) return;
+  const tid = getTenantId(req);
+  const id = Number(req.params.id);
+  db.prepare('DELETE FROM staff_schedules WHERE id = ? AND tenant_id = ?').run(id, tid);
+  logAudit(req, 'DELETE', 'Scheduling', `Deleted schedule #${id}`, tid);
+  res.json({ ok: true });
+});
+
+app.get('/api/holidays', (req, res) => {
+  const tid = getTenantId(req);
+  res.json(db.prepare('SELECT * FROM holidays_calendar WHERE tenant_id = ? ORDER BY holiday_date ASC').all(tid));
+});
+
+app.post('/api/holidays', (req, res) => {
+  if (!requireRole(req, res, SHIFT_DEPT_ADMIN_ROLES, 'managing holidays')) return;
+  const tid = getTenantId(req);
+  const b = req.body || {};
+  const now = new Date().toISOString();
+  const info = db
+    .prepare('INSERT INTO holidays_calendar (tenant_id, holiday_date, name, is_paid, ot_multiplier, notes, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+    .run(tid, String(b.holiday_date || now.slice(0, 10)), String(b.name || 'Company Holiday'), b.is_paid === false ? 0 : 1, Number(b.ot_multiplier ?? 2.5), String(b.notes || ''), now);
+  logAudit(req, 'CREATE', 'Holidays', `Added holiday ${b.name} (${b.holiday_date})`, tid);
+  res.status(201).json(db.prepare('SELECT * FROM holidays_calendar WHERE id = ?').get(info.lastInsertRowid));
+});
+
+app.delete('/api/holidays/:id', (req, res) => {
+  if (!requireRole(req, res, SHIFT_DEPT_ADMIN_ROLES, 'deleting holidays')) return;
+  const tid = getTenantId(req);
+  const id = Number(req.params.id);
+  db.prepare('DELETE FROM holidays_calendar WHERE id = ? AND tenant_id = ?').run(id, tid);
+  logAudit(req, 'DELETE', 'Holidays', `Removed holiday #${id}`, tid);
+  res.json({ ok: true });
+});
+
+app.get('/api/workforce-rules', (req, res) => {
+  const tid = getTenantId(req);
+  let row = db.prepare('SELECT * FROM workforce_rules WHERE tenant_id = ?').get(tid);
+  if (!row) {
+    seedWorkforceDefaultsForTenant(tid);
+    row = db.prepare('SELECT * FROM workforce_rules WHERE tenant_id = ?').get(tid);
+  }
+  res.json(row);
+});
+
+app.put('/api/workforce-rules', (req, res) => {
+  if (!requireRole(req, res, SHIFT_DEPT_ADMIN_ROLES, 'updating attendance & shift rules')) return;
+  const tid = getTenantId(req);
+  const b = req.body || {};
+  const now = new Date().toISOString();
+  db.prepare(
+    `
+    UPDATE workforce_rules SET
+      late_grace_minutes=?, early_departure_grace_minutes=?, default_break_minutes=?,
+      min_rest_hours_between_shifts=?, auto_detect_conflicts=?, require_manager_approval=?,
+      default_shift_system=?, updated_at=?
+    WHERE tenant_id = ?
+  `
+  ).run(
+    Number(b.late_grace_minutes ?? 15),
+    Number(b.early_departure_grace_minutes ?? 10),
+    Number(b.default_break_minutes ?? 60),
+    Number(b.min_rest_hours_between_shifts ?? 11),
+    b.auto_detect_conflicts ? 1 : 0,
+    b.require_manager_approval ? 1 : 0,
+    String(b.default_shift_system || '3-Shift'),
+    now,
+    tid
+  );
+  logAudit(req, 'UPDATE', 'Workforce Rules', 'Updated attendance grace period, break, and rest-period rules', tid);
+  res.json(db.prepare('SELECT * FROM workforce_rules WHERE tenant_id = ?').get(tid));
 });
 
 // Leaves
@@ -4877,6 +6324,16 @@ app.get('/api/search', (req, res) => {
     .all(tid, q, q, q) as Array<Record<string, string>>) {
     results.push({ id: `file-${f.id}`, category: 'Imported File', title: f.title, subtitle: `${f.file_code} · ${f.file_name} · ${f.category}`, module: 'secretary' });
   }
+  for (const sh of db
+    .prepare('SELECT id, shift_code, shift_name, shift_category, start_time, end_time FROM shifts WHERE tenant_id = ? AND (shift_name LIKE ? OR shift_category LIKE ? OR shift_code LIKE ?) LIMIT 5')
+    .all(tid, q, q, q) as Array<Record<string, string>>) {
+    results.push({ id: `shf-${sh.id}`, category: 'Shift', title: sh.shift_name, subtitle: `${sh.shift_code} · ${sh.shift_category} · ${sh.start_time}–${sh.end_time}`, module: 'scheduling' });
+  }
+  for (const sc of db
+    .prepare('SELECT id, schedule_code, employee_name, department, shift_name, schedule_date FROM staff_schedules WHERE tenant_id = ? AND (employee_name LIKE ? OR department LIKE ? OR shift_name LIKE ? OR schedule_code LIKE ?) LIMIT 5')
+    .all(tid, q, q, q, q) as Array<Record<string, string>>) {
+    results.push({ id: `sch-${sc.id}`, category: 'Staff Schedule', title: `${sc.employee_name} — ${sc.shift_name}`, subtitle: `${sc.schedule_code} · ${sc.department} · ${sc.schedule_date}`, module: 'scheduling' });
+  }
   for (const deal of db
     .prepare('SELECT id, company_name, contact_person, stage FROM crm_deals WHERE tenant_id = ? AND (company_name LIKE ? OR contact_person LIKE ?) LIMIT 5')
     .all(tid, q, q) as Array<Record<string, string>>) {
@@ -5084,6 +6541,8 @@ app.get('/api/dashboard', (req, res) => {
     salesStageBreakdown,
     recentAuditLogs,
     totalImportedFiles: (db.prepare('SELECT COUNT(*) as c FROM imported_files WHERE tenant_id = ?').get(tid) as { c: number }).c,
+    scheduledShiftsToday: (db.prepare("SELECT COUNT(*) as c FROM staff_schedules WHERE tenant_id = ? AND schedule_date = ? AND approval_status != 'Rejected'").get(tid, new Date().toISOString().slice(0, 10)) as { c: number }).c,
+    lateArrivalsCount: (db.prepare("SELECT COUNT(*) as c FROM attendance_records WHERE tenant_id = ? AND (late_minutes > 0 OR status IN ('Late', 'Late & Early'))").get(tid) as { c: number }).c,
   });
 });
 
@@ -5120,7 +6579,8 @@ app.post('/api/admin/clear-demo', (req, res) => {
 
 app.get('/api/backup/export', (_req, res) => {
   const tables = [
-    'tenants', 'company_settings', 'users', 'employees', 'ot_settings', 'payroll_rules',
+    'tenants', 'company_settings', 'users', 'employees', 'shifts', 'departments', 'staff_schedules',
+    'holidays_calendar', 'workforce_rules', 'ot_settings', 'payroll_rules',
     'payroll_records', 'payroll_runs', 'devices', 'attendance_records', 'leaves',
     'company_documents', 'imported_files', 'company_form_templates', 'company_form_submissions',
     'gate_passes', 'department_approvals', 'materials', 'material_requests',

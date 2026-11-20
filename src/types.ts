@@ -14,6 +14,8 @@ export type UserRole =
   | 'Procurement Officer'
   | 'Sales Manager'
   | 'Security Supervisor'
+  | 'Attendance Officer'
+  | 'Security Guard'
   | 'Employee'
   | 'Auditor'
   | 'Viewer';
@@ -25,6 +27,7 @@ export type ModuleKey =
   | 'hr'
   | 'devices'
   | 'attendance'
+  | 'scheduling'
   | 'leave'
   | 'payroll'
   | 'secretary'
@@ -299,22 +302,39 @@ export interface DeviceScanResult {
 
 export interface AttendanceRecord {
   id: number;
+  tenant_id?: number;
   employee_code: string;
   employee_name: string;
   department: string;
   attendance_date: string;
+  shift_id?: number | null;
   shift_name: string;
+  shift_period?: 'Morning' | 'Afternoon' | 'Night' | 'Day' | 'Weekend' | 'Holiday' | 'Security' | 'Special' | 'Overtime';
   check_in: string;
   check_out: string;
+  morning_check_in?: string;
+  morning_check_out?: string;
+  afternoon_check_in?: string;
+  afternoon_check_out?: string;
+  night_check_in?: string;
+  night_check_out?: string;
+  scheduled_start?: string;
+  scheduled_end?: string;
   hourly_rate: number;
   regular_hours: number;
+  late_minutes?: number;
+  early_departure_minutes?: number;
+  break_minutes?: number;
+  absence_hours?: number;
   ot_type: 'None' | 'Regular' | 'Night' | 'Sunday' | 'Holiday';
   ot_hours: number;
   ot_multiplier: number;
   ot_pay: number;
-  status: 'Present' | 'Late' | 'Absent' | 'Half-Day';
+  status: 'Present' | 'Late' | 'Early Exit' | 'Late & Early' | 'Half-Day' | 'Absent' | 'On Leave';
   register_state: 'Open' | 'Closed';
   notes: string;
+  updated_by?: string;
+  updated_at?: string;
   created_at: string;
 }
 
@@ -719,6 +739,8 @@ export interface DashboardSummary {
   salesStageBreakdown: DashboardSalesStagePoint[];
   recentAuditLogs: AuditLogRecord[];
   totalImportedFiles?: number;
+  scheduledShiftsToday?: number;
+  lateArrivalsCount?: number;
 }
 
 export interface GatePassRecord {
@@ -777,4 +799,120 @@ export interface ImportedFileRecord {
   uploaded_by: string;
   notes: string;
   created_at: string;
+}
+
+export type ShiftCategory =
+  | 'Day Shift'
+  | 'Morning Shift'
+  | 'Afternoon Shift'
+  | 'Night Shift'
+  | 'Weekend Shift'
+  | 'Holiday Shift'
+  | 'Security Guard Shift'
+  | 'Special Duty Shift'
+  | 'Overtime Shift';
+
+export interface ShiftDefinition {
+  id: number;
+  tenant_id?: number;
+  shift_code: string;
+  shift_name: string;
+  shift_category: ShiftCategory;
+  scheduling_system: '3-Shift' | '4-Shift' | 'Standard' | 'Security 24/7';
+  start_time: string;
+  end_time: string;
+  break_minutes: number;
+  working_days: string; // JSON array string e.g. ["Mon","Tue","Wed","Thu","Fri"]
+  rest_days: string; // JSON array string
+  min_rest_hours: number;
+  is_rotating: number | boolean;
+  rotation_pattern: string;
+  color_hex: string;
+  ot_multiplier: number;
+  grace_late_minutes: number;
+  status: 'Active' | 'Inactive';
+  notes: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface DepartmentRecord {
+  id: number;
+  tenant_id?: number;
+  dept_code: string;
+  name: string;
+  manager_employee_id: string;
+  manager_name: string;
+  scheduling_system: '3-Shift' | '4-Shift' | 'Standard' | 'Security 24/7';
+  default_shift_id: number | null;
+  working_days: string; // JSON array string
+  rest_days: string; // JSON array string
+  weekend_schedule_enabled: number | boolean;
+  holiday_schedule_enabled: number | boolean;
+  security_guard_coverage: string;
+  monthly_timetable_notes: string;
+  status: 'Active' | 'Inactive';
+  created_at: string;
+  updated_at: string;
+}
+
+export interface StaffScheduleRecord {
+  id: number;
+  tenant_id?: number;
+  schedule_code: string;
+  employee_id: string;
+  employee_name: string;
+  department: string;
+  shift_id: number | null;
+  shift_name: string;
+  shift_category: ShiftCategory | string;
+  schedule_date: string;
+  end_date: string;
+  start_time: string;
+  end_time: string;
+  break_minutes: number;
+  schedule_type: 'Regular' | 'Weekend' | 'Holiday' | 'Security Guard' | 'Special Duty' | 'Overtime' | 'Rotating';
+  rotation_group: string;
+  availability_status: 'Available' | 'Assigned' | 'On Leave' | 'Rest Day' | 'Replaced';
+  replacement_employee_id: string;
+  replacement_employee_name: string;
+  change_reason: string;
+  approval_status: 'Draft' | 'Pending' | 'Approved' | 'Rejected';
+  approved_by: string;
+  created_by: string;
+  updated_by: string;
+  notes: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface HolidayRecord {
+  id: number;
+  tenant_id?: number;
+  holiday_date: string;
+  name: string;
+  is_paid: number | boolean;
+  ot_multiplier: number;
+  notes: string;
+  created_at: string;
+}
+
+export interface WorkforceRules {
+  id?: number;
+  tenant_id?: number;
+  late_grace_minutes: number;
+  early_departure_grace_minutes: number;
+  default_break_minutes: number;
+  min_rest_hours_between_shifts: number;
+  auto_detect_conflicts: number | boolean;
+  require_manager_approval: number | boolean;
+  default_shift_system: '3-Shift' | '4-Shift';
+  updated_at?: string;
+}
+
+export interface ScheduleConflictReport {
+  hasConflict: boolean;
+  overlaps: Array<{ id: number; schedule_code: string; schedule_date: string; shift_name: string; start_time: string; end_time: string }>;
+  restViolations: Array<{ id: number; schedule_code: string; schedule_date: string; shift_name: string; restHours: number; requiredHours: number }>;
+  leaveConflicts: Array<{ id: number; leave_type: string; start_date: string; end_date: string; status: string }>;
 }
