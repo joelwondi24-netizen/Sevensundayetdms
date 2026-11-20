@@ -14,6 +14,7 @@ import { toEthiopianDateString } from '../utils/ethiopianCalendar';
 import { RealQrCode } from './RealQrCode';
 import { SendToApproveButton } from './SendToApproveButton';
 import { ShareButton } from './ShareButton';
+import { printWithAutoFit } from '../utils/printFit';
 
 interface GatePassModuleProps {
   company?: CompanySettings | null;
@@ -333,7 +334,7 @@ export const GatePassModule: React.FC<GatePassModuleProps> = ({
       </div>
 
       {/* Gate Pass Register + Printable Single-Use Pass Card */}
-      <div className="grid grid-cols-1 xl:grid-cols-12 gap-6 items-start">
+      <div className="print-grid-reset grid grid-cols-1 xl:grid-cols-12 gap-6 items-start">
         <div className="no-print xl:col-span-6 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden">
           <div className="p-4 border-b border-slate-200 dark:border-slate-800 flex flex-wrap items-center justify-between gap-2">
             <div className="flex items-center gap-1 p-1 bg-[#F8FAFC] dark:bg-slate-800 rounded-lg text-xs">
@@ -436,7 +437,11 @@ export const GatePassModule: React.FC<GatePassModuleProps> = ({
         </div>
 
         {/* Printable Single-Use Gate Pass Voucher & Guard Verification */}
-        <div className="xl:col-span-6 print-only-container space-y-4">
+        <div
+          data-print-active="true"
+          data-print-orientation="portrait"
+          className="xl:col-span-6 print-only-container space-y-4"
+        >
           {selectedPass ? (
             <>
               <div className="no-print bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-4 flex flex-wrap items-center justify-between gap-2">
@@ -485,7 +490,7 @@ export const GatePassModule: React.FC<GatePassModuleProps> = ({
                   />
                   <button
                     type="button"
-                    onClick={() => window.print()}
+                    onClick={() => printWithAutoFit({ orientation: 'portrait' })}
                     className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold text-white bg-[#087CEB] hover:bg-[#0265C4] rounded-lg whitespace-nowrap"
                   >
                     <Printer className="w-3.5 h-3.5" />

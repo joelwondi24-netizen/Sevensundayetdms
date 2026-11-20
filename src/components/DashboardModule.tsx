@@ -24,6 +24,7 @@ import {
 } from 'lucide-react';
 import type { CompanySettings, DashboardSummary, ModuleKey } from '../types';
 import { formatMoney } from '../utils/ethiopianCalendar';
+import { printWithAutoFit } from '../utils/printFit';
 import { ImportFilesButton } from './ImportFilesModal';
 import { ShareButton } from './ShareButton';
 
@@ -350,7 +351,11 @@ export const DashboardModule: React.FC<DashboardModuleProps> = ({
         : null;
 
   return (
-    <div className="space-y-6">
+    <div
+      data-print-active="true"
+      data-print-orientation="landscape"
+      className="print-only-container print-grid-reset space-y-6"
+    >
       {/* Corporate Identity & Action Header Card (Matching Seven Sunday Dashboard Banner Style) */}
       <div className="relative overflow-hidden bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-5 sm:p-6 shadow-xs">
         <span
@@ -507,7 +512,12 @@ export const DashboardModule: React.FC<DashboardModuleProps> = ({
             />
             <button
               type="button"
-              onClick={() => window.print()}
+              onClick={() =>
+                printWithAutoFit({
+                  orientation: 'landscape',
+                  targetSelector: '.print-only-container[data-print-active="true"]',
+                })
+              }
               className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-[#172033] dark:text-slate-200 bg-[#F8FAFC] dark:bg-slate-800 border border-slate-200 dark:border-slate-700 hover:border-[#087CEB] rounded-lg transition-colors whitespace-nowrap shrink-0"
             >
               <Printer className="w-3.5 h-3.5 text-[#087CEB]" />

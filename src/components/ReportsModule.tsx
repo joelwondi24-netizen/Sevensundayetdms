@@ -30,6 +30,7 @@ import type {
   StaffScheduleRecord,
 } from '../types';
 import { formatMoney } from '../utils/ethiopianCalendar';
+import { printWithAutoFit } from '../utils/printFit';
 import { ImportFilesButton } from './ImportFilesModal';
 import { RealQrCode } from './RealQrCode';
 
@@ -511,7 +512,14 @@ export const ReportsModule: React.FC<ReportsModuleProps> = ({ company, currency 
                     type="button"
                     onClick={() => {
                       setActiveReport(card.key);
-                      setTimeout(() => window.print(), 80);
+                      window.setTimeout(
+                        () =>
+                          printWithAutoFit({
+                            orientation: 'landscape',
+                            targetSelector: '.print-only-container[data-print-active="true"]',
+                          }),
+                        80
+                      );
                     }}
                     className="inline-flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-[#18243A] hover:bg-[#172033] rounded-lg whitespace-nowrap"
                   >
@@ -526,7 +534,11 @@ export const ReportsModule: React.FC<ReportsModuleProps> = ({ company, currency 
       </div>
 
       {/* Printable Report Preview */}
-      <div className="print-only-container bg-white border border-slate-200 rounded-xl p-6 text-[#172033]">
+      <div
+        data-print-active="true"
+        data-print-orientation="landscape"
+        className="print-only-container bg-white border border-slate-200 rounded-xl p-4 sm:p-6 text-[#172033]"
+      >
         <div className="flex items-center justify-between pb-4 border-b-2 border-[#18243A] mb-4">
           <div className="flex items-center gap-3">
             <img src={logoSrc} alt="Seven Sunday" className="h-10 w-auto object-contain" />

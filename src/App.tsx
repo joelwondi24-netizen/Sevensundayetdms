@@ -81,6 +81,7 @@ import {
   parsePlatformConfig,
   setCustomApprovingDepartmentsGlobal,
 } from './utils/platformConfig';
+import { installGlobalBeforePrintFit } from './utils/printFit';
 
 const ALL_MODULE_KEYS: ModuleKey[] = [
   'dashboard',
@@ -437,6 +438,7 @@ export default function App() {
   );
 
   useEffect(() => {
+    const cleanupPrint = installGlobalBeforePrintFit();
     refreshCompanyAndSummary();
     refreshQueueCount();
     const handler = () => {
@@ -445,6 +447,7 @@ export default function App() {
     window.addEventListener('sevensunday-sync-queue-updated', handler);
     window.addEventListener('seven-sunday-sync-updated', handler);
     return () => {
+      cleanupPrint();
       window.removeEventListener('sevensunday-sync-queue-updated', handler);
       window.removeEventListener('seven-sunday-sync-updated', handler);
     };
@@ -640,7 +643,7 @@ export default function App() {
   return (
     <div
       dir={isRtl ? 'rtl' : 'ltr'}
-      className="min-h-screen flex bg-[#F8FAFC] dark:bg-slate-950 text-[#172033] dark:text-slate-100"
+      className="app-root-shell min-h-screen flex bg-[#F8FAFC] dark:bg-slate-950 text-[#172033] dark:text-slate-100"
     >
       {/* Mobile Sidebar Backdrop */}
       {sidebarOpen && (
@@ -737,7 +740,7 @@ export default function App() {
       </aside>
 
       {/* Main Content Shell */}
-      <div className="flex-1 min-w-0 flex flex-col">
+      <div className="app-content-shell flex-1 min-w-0 flex flex-col">
         <OfflineIndicator pendingCount={pendingQueueCount} />
 
         <header className="no-print h-16 bg-[#FFFFFF] dark:bg-slate-900 border-b border-slate-200 dark:border-slate-800 px-3 sm:px-6 flex items-center justify-between gap-3 sticky top-0 z-20">
@@ -879,7 +882,7 @@ export default function App() {
         </header>
 
         {/* Keyed by activeTenantId + tenantRefreshKey so switching tenant cleanly reloads all module data */}
-        <main key={`${activeTenantId}-${tenantRefreshKey}`} className="flex-1 p-4 sm:p-6 max-w-[1440px] w-full mx-auto">
+        <main key={`${activeTenantId}-${tenantRefreshKey}`} className="app-main-shell flex-1 p-3 sm:p-6 max-w-[1440px] w-full mx-auto">
           {activeModule === 'dashboard' && (
             <DashboardModule
               summary={summary}

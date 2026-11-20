@@ -65,61 +65,22 @@
 .a4-sheet {
   width: 210mm;
   min-height: 297mm;
-  padding: 18mm 16mm;
+  padding: 16mm 14mm;
   background: #FFFFFF;
   color: #172033;
   box-sizing: border-box;
+  overflow-wrap: anywhere;
 }
 
-/* True A4 Landscape Payroll Sheet */
+/* True A4 Landscape Payroll & Wide Form Sheet */
 .a4-landscape-sheet {
   width: 297mm;
   min-height: 210mm;
-  padding: 12mm 14mm;
+  padding: 10mm 11mm;
   background: #FFFFFF;
   color: #172033;
   box-sizing: border-box;
-}
-
-@media print {
-  @page {
-    size: A4 portrait;
-    margin: 10mm;
-  }
-
-  body {
-    background: #ffffff !important;
-    color: #172033 !important;
-  }
-
-  .no-print {
-    display: none !important;
-  }
-
-  .print-only-container {
-    display: block !important;
-    width: 100% !important;
-    margin: 0 !important;
-    padding: 0 !important;
-    border: none !important;
-    box-shadow: none !important;
-    background: #ffffff !important;
-    color: #172033 !important;
-  }
-
-  .a4-sheet,
-  .a4-landscape-sheet {
-    width: 100% !important;
-    min-height: auto !important;
-    padding: 0 !important;
-    margin: 0 !important;
-    box-shadow: none !important;
-    border: none !important;
-  }
-
-  .print-break-avoid {
-    break-inside: avoid;
-  }
+  overflow-wrap: anywhere;
 }
 
 /* Standard ISO/IEC 7810 ID-1 (CR80) Staff ID Card Dimensions */
@@ -129,3 +90,191 @@
   box-sizing: border-box;
 }
 
+/* Safe Horizontal Scroll Stage (centers when smaller than viewport, starts at left: 0 when wider — zero left-edge clipping) */
+.sheet-scroll-stage {
+  width: 100%;
+  overflow-x: auto;
+  overflow-y: visible;
+  -webkit-overflow-scrolling: touch;
+}
+
+.sheet-scroll-inner {
+  width: fit-content;
+  margin-left: auto;
+  margin-right: auto;
+}
+
+.print-only-inline {
+  display: none;
+}
+
+.print-only-block {
+  display: none;
+}
+
+@media print {
+  @page {
+    size: A4 portrait;
+    margin: 8mm;
+  }
+
+  html,
+  body {
+    width: 100% !important;
+    height: auto !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    background: #ffffff !important;
+    color: #172033 !important;
+    overflow: visible !important;
+    -webkit-print-color-adjust: exact !important;
+    print-color-adjust: exact !important;
+  }
+
+  html.dark body,
+  .dark body {
+    background: #ffffff !important;
+    color: #172033 !important;
+  }
+
+  .no-print {
+    display: none !important;
+  }
+
+  .print-only-inline {
+    display: inline !important;
+  }
+
+  .print-only-block {
+    display: block !important;
+  }
+
+  /* Unwrap outer app shell, grids, flex rows, and scroll wrappers so wide documents never clip or squeeze */
+  .app-root-shell,
+  .app-content-shell,
+  .app-main-shell {
+    display: block !important;
+    width: 100% !important;
+    max-width: none !important;
+    min-height: auto !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    overflow: visible !important;
+    background: #ffffff !important;
+  }
+
+  .print-grid-reset {
+    display: block !important;
+    width: 100% !important;
+    max-width: none !important;
+    margin: 0 !important;
+    padding: 0 !important;
+  }
+
+  .print-only-container {
+    display: block !important;
+    width: 100% !important;
+    max-width: none !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    border: none !important;
+    border-radius: 0 !important;
+    box-shadow: none !important;
+    background: #ffffff !important;
+    color: #172033 !important;
+    overflow: visible !important;
+  }
+
+  .print-only-container .overflow-x-auto,
+  .print-only-container .overflow-y-auto,
+  .print-only-container .sheet-scroll-stage,
+  .print-only-container .sheet-scroll-inner {
+    overflow: visible !important;
+    width: 100% !important;
+    max-width: none !important;
+    margin: 0 !important;
+    padding: 0 !important;
+  }
+
+  /* Reset responsive screen transform before applying print-fit scaling */
+  .ss-screen-scale-box {
+    width: 100% !important;
+    height: auto !important;
+    overflow: visible !important;
+    margin: 0 !important;
+  }
+
+  .ss-screen-scale-inner {
+    transform: none !important;
+    width: 100% !important;
+    min-width: 0 !important;
+  }
+
+  .a4-sheet,
+  .a4-landscape-sheet {
+    width: 100% !important;
+    max-width: 100% !important;
+    min-height: auto !important;
+    padding: 2mm 1mm !important;
+    margin: 0 !important;
+    box-shadow: none !important;
+    border: none !important;
+    background: #ffffff !important;
+    color: #172033 !important;
+  }
+
+  /* Guarantee tables inside printable areas fit paper width cleanly without cutoff */
+  .print-only-container table {
+    width: 100% !important;
+    min-width: 0 !important;
+    max-width: 100% !important;
+    border-collapse: collapse !important;
+  }
+
+  .print-only-container thead {
+    display: table-header-group;
+  }
+
+  .print-only-container tr {
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+
+  .print-only-container th,
+  .print-only-container td {
+    overflow-wrap: break-word;
+    word-break: normal;
+  }
+
+  /* Compact official Payroll & Ethiopian Tax register table styling on paper */
+  .ss-payroll-table {
+    font-size: 8.2px !important;
+    line-height: 1.2 !important;
+  }
+
+  .ss-payroll-table th,
+  .ss-payroll-table td {
+    padding: 2.5px 3px !important;
+    white-space: normal !important;
+  }
+
+  .ss-payroll-table td.ss-payroll-name {
+    max-width: 90px;
+  }
+
+  .ss-payroll-table td.ss-payroll-acct {
+    max-width: 82px;
+    word-break: break-all;
+  }
+
+  .print-break-avoid {
+    break-inside: avoid !important;
+    page-break-inside: avoid !important;
+  }
+
+  /* Ensure dark-mode styled printable text becomes crisp ink on white paper */
+  .print-only-container [class*="dark:text-"],
+  .print-only-container [class*="dark:bg-"] {
+    color: #172033;
+  }
+}

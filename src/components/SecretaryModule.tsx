@@ -13,6 +13,8 @@ import { ImportFilesButton } from './ImportFilesModal';
 import { RealQrCode } from './RealQrCode';
 import { SendToApproveButton } from './SendToApproveButton';
 import { ShareButton } from './ShareButton';
+import { PrintableSheetFrame } from './PrintableSheetFrame';
+import { printWithAutoFit, type PaperOrientation } from '../utils/printFit';
 
 const CATEGORIES = [
   'Official Memo',
@@ -48,6 +50,7 @@ export const SecretaryModule: React.FC<SecretaryModuleProps> = ({ company, onRef
   const [search, setSearch] = useState('');
   const [targetLang, setTargetLang] = useState<AppLang>('am');
   const [bilingualLayout, setBilingualLayout] = useState<'side-by-side' | 'stacked'>('side-by-side');
+  const [letterOrientation, setLetterOrientation] = useState<PaperOrientation>('portrait');
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -168,7 +171,7 @@ export const SecretaryModule: React.FC<SecretaryModuleProps> = ({ company, onRef
 
   const handlePrintDoc = (doc: CompanyDocument) => {
     setSelectedDoc(doc);
-    setTimeout(() => window.print(), 80);
+    setTimeout(() => printWithAutoFit({ orientation: letterOrientation }), 90);
   };
 
   const filteredDocs = docs.filter(
@@ -378,7 +381,7 @@ export const SecretaryModule: React.FC<SecretaryModuleProps> = ({ company, onRef
       </div>
 
       {/* Repository + True A4 Paper Letterhead Sheet */}
-      <div className="grid grid-cols-1 xl:grid-cols-12 gap-6 items-start">
+      <div className="print-grid-reset grid grid-cols-1 xl:grid-cols-12 gap-6 items-start">
         <div className="no-print xl:col-span-4 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden">
           <div className="p-4 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between gap-2">
             <h3 className="text-sm font-bold text-[#172033] dark:text-white">Documents Register ({filteredDocs.length})</h3>
@@ -457,12 +460,18 @@ export const SecretaryModule: React.FC<SecretaryModuleProps> = ({ company, onRef
         </div>
 
         {/* True A4 Size Sheet Preview (210mm x 297mm) */}
-        <div className="xl:col-span-8 print-only-container flex flex-col items-center">
+        <div
+          data-print-active="true"
+          data-print-orientation={letterOrientation}
+          className="xl:col-span-8 print-only-container flex flex-col items-stretch"
+        >
           <div className="no-print w-full flex flex-wrap items-center justify-between gap-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl px-4 py-3 mb-4">
             <div className="text-xs text-slate-600 dark:text-slate-300">
-              <span className="font-bold text-[#172033] dark:text-white">A4 Print Sheet Preview (210mm × 297mm)</span>
+              <span className="font-bold text-[#172033] dark:text-white">
+                A4 Print Sheet Preview ({letterOrientation === 'landscape' ? '297mm × 210mm' : '210mm × 297mm'})
+              </span>
               <span className="ml-2 font-mono text-[11px] text-slate-500">
-                {selectedDoc ? `${selectedDoc.doc_number} · ISO 216 Portrait` : 'Preview Closed'}
+                {selectedDoc ? `${selectedDoc.doc_number} · ISO 216 ${letterOrientation}` : 'Preview Closed'}
               </span>
             </div>
             {selectedDoc && (
@@ -519,7 +528,7 @@ export const SecretaryModule: React.FC<SecretaryModuleProps> = ({ company, onRef
                 />
                 <button
                   type="button"
-                  onClick={() => window.print()}
+                  onClick={() => printWithAutoFit({ orientation: letterOrientation })}
                   className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-[#087CEB] hover:bg-[#0265C4] rounded-lg whitespace-nowrap"
                 >
                   <Printer className="w-3.5 h-3.5" />
@@ -553,9 +562,17 @@ export const SecretaryModule: React.FC<SecretaryModuleProps> = ({ company, onRef
             )}
           </div>
 
-          <div className="w-full overflow-x-auto pb-4 flex justify-center">
-            {selectedDoc ? (
-              <div className="a4-sheet border border-slate-300 shadow-sm flex flex-col justify-between">
+          {selectedDoc ? (
+            <PrintableSheetFrame
+              orientation={letterOrientation}
+              onOrientationChange={setLetterOrientation}
+              documentLabel={`Secretary ${selectedDoc.doc_number}`}
+            >
+              <div
+                className={`${
+                  letterOrientation === 'landscape' ? 'a4-landscape-sheet' : 'a4-sheet'
+                } border border-slate-300 shadow-sm flex flex-col justify-between`}
+              >
                 {/* Top A4 Letterhead */}
                 <div>
                   <div className="flex items-start justify-between pb-4 border-b-2 border-[#18243A]">
@@ -609,19 +626,19 @@ export const SecretaryModule: React.FC<SecretaryModuleProps> = ({ company, onRef
                     </h4>
                     {bilingualLayout === 'side-by-side' && selectedDoc.translated_content ? (
                       <div className="grid grid-cols-2 gap-6 items-start">
-                        <div className="pr-4 border-r border-slate-200">
+                        <div className="pr-4 border-r border-slate-200 min-w-0">
                           <div className="text-[10px] font-bold text-[#18243A] uppercase tracking-wider mb-2 pb-1 border-b border-slate-200">
                             Original Text ({selectedDoc.language.toUpperCase()})
                           </div>
-                          <div className="text-[13px] text-[#172033] leading-7 whitespace-pre-wrap">
+                          <div className="text-[13px] text-[#172033] leading-7 whitespace-pre-wrap break-words">
                             {selectedDoc.content}
                           </div>
                         </div>
-                        <div>
+                        <div className="min-w-0">
                           <div className="text-[10px] font-bold text-[#087CEB] uppercase tracking-wider mb-2 pb-1 border-b border-slate-200">
                             Translated Text
                           </div>
-                          <div className="text-[13px] text-[#172033] leading-7 whitespace-pre-wrap">
+                          <div className="text-[13px] text-[#172033] leading-7 whitespace-pre-wrap break-words">
                             {selectedDoc.translated_content}
                           </div>
                         </div>
@@ -689,23 +706,23 @@ export const SecretaryModule: React.FC<SecretaryModuleProps> = ({ company, onRef
                   </div>
                 </div>
               </div>
-            ) : (
-              <div className="py-16 px-6 text-center text-xs text-slate-500 flex flex-col items-center gap-3 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl w-full">
-                <FileText className="w-7 h-7 text-[#087CEB]" />
-                <span>Document preview closed. Select an official document from the register to view or print in A4 format.</span>
-                {docs.length > 0 && (
-                  <button
-                    type="button"
-                    onClick={() => setSelectedDoc(docs[0])}
-                    className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-[#087CEB] hover:bg-[#0265C4] rounded-lg"
-                  >
-                    <Eye className="w-3.5 h-3.5" />
-                    Re-open Latest Document
-                  </button>
-                )}
-              </div>
-            )}
-          </div>
+            </PrintableSheetFrame>
+          ) : (
+            <div className="py-16 px-6 text-center text-xs text-slate-500 flex flex-col items-center gap-3 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl w-full">
+              <FileText className="w-7 h-7 text-[#087CEB]" />
+              <span>Document preview closed. Select an official document from the register to view or print in A4 format.</span>
+              {docs.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => setSelectedDoc(docs[0])}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-[#087CEB] hover:bg-[#0265C4] rounded-lg"
+                >
+                  <Eye className="w-3.5 h-3.5" />
+                  Re-open Latest Document
+                </button>
+              )}
+            </div>
+          )}
         </div>
       </div>
     </div>

@@ -15,6 +15,7 @@ import {
 import { api } from '../api';
 import type { AssetUniformRecord, EquipmentMaintenanceRecord, VehicleRecord } from '../types';
 import { formatMoney } from '../utils/ethiopianCalendar';
+import { printWithAutoFit } from '../utils/printFit';
 
 interface AssetsVehiclesModuleProps {
   mode: 'assets' | 'vehicles';
@@ -142,7 +143,7 @@ export const AssetsVehiclesModule: React.FC<AssetsVehiclesModuleProps> = ({
 
     return (
       <div className="space-y-6">
-        <div className="bg-[#FFFFFF] dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-6">
+        <div className="no-print bg-[#FFFFFF] dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-6">
           <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
             <div>
               <h2 className="text-lg font-bold text-[#172033] dark:text-white flex items-center gap-2">
@@ -325,7 +326,11 @@ export const AssetsVehiclesModule: React.FC<AssetsVehiclesModuleProps> = ({
           </form>
         </div>
 
-        <div className="bg-[#FFFFFF] dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden">
+        <div
+          data-print-active="true"
+          data-print-orientation="landscape"
+          className="print-only-container bg-[#FFFFFF] dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden"
+        >
           <div className="overflow-x-auto">
             <table className="w-full text-left border-collapse text-sm">
               <thead>
@@ -335,7 +340,7 @@ export const AssetsVehiclesModule: React.FC<AssetsVehiclesModuleProps> = ({
                   <th className="py-3 px-4">Employee</th>
                   <th className="py-3 px-4">Condition / Issued</th>
                   <th className="py-3 px-4">Status</th>
-                  <th className="py-3 px-4 text-right">Return / Damage / Save Actions</th>
+                  <th className="no-print py-3 px-4 text-right">Return / Damage / Save Actions</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-200 dark:divide-slate-800">
@@ -367,7 +372,7 @@ export const AssetsVehiclesModule: React.FC<AssetsVehiclesModuleProps> = ({
                         {a.status}
                       </span>
                     </td>
-                    <td className="py-3 px-4 text-right">
+                    <td className="no-print py-3 px-4 text-right">
                       <div className="flex flex-wrap items-center justify-end gap-1.5">
                         {a.status !== 'Returned' && (
                           <button
@@ -630,7 +635,11 @@ export const AssetsVehiclesModule: React.FC<AssetsVehiclesModuleProps> = ({
             </form>
           </div>
 
-          <div className="bg-[#FFFFFF] dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden">
+          <div
+            data-print-active="true"
+            data-print-orientation="landscape"
+            className="print-only-container bg-[#FFFFFF] dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden"
+          >
             <div className="overflow-x-auto">
               <table className="w-full text-left border-collapse text-sm">
                 <thead>
@@ -641,7 +650,7 @@ export const AssetsVehiclesModule: React.FC<AssetsVehiclesModuleProps> = ({
                     <th className="py-3 px-4 text-right">Fuel + Maint.</th>
                     <th className="py-3 px-4">Insurance / Insp.</th>
                     <th className="py-3 px-4">Status</th>
-                    <th className="py-3 px-4 text-right">Actions</th>
+                    <th className="no-print py-3 px-4 text-right">Actions</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-200 dark:divide-slate-800">
@@ -668,7 +677,7 @@ export const AssetsVehiclesModule: React.FC<AssetsVehiclesModuleProps> = ({
                       <td className="py-3 px-4 text-xs font-semibold">
                         <span className={v.status === 'Active' ? 'text-emerald-700' : 'text-[#087CEB]'}>{v.status}</span>
                       </td>
-                      <td className="py-3 px-4 text-right">
+                      <td className="no-print py-3 px-4 text-right">
                         <div className="flex items-center justify-end gap-1.5">
                           <button
                             type="button"
@@ -730,7 +739,12 @@ export const AssetsVehiclesModule: React.FC<AssetsVehiclesModuleProps> = ({
               </div>
               <button
                 type="button"
-                onClick={() => window.print()}
+                onClick={() =>
+                  printWithAutoFit({
+                    orientation: 'landscape',
+                    targetSelector: '.print-only-container[data-print-active="true"]',
+                  })
+                }
                 className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-[#18243A] hover:bg-[#243656] rounded-lg whitespace-nowrap"
               >
                 <Printer className="w-3.5 h-3.5 text-[#38BDF8]" />
@@ -920,7 +934,11 @@ export const AssetsVehiclesModule: React.FC<AssetsVehiclesModuleProps> = ({
             </form>
           </div>
 
-          <div className="print-only-container bg-[#FFFFFF] dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden">
+          <div
+            data-print-active="true"
+            data-print-orientation="landscape"
+            className="print-only-container bg-[#FFFFFF] dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden"
+          >
             <div className="px-5 py-3.5 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between">
               <div>
                 <h4 className="text-sm font-bold text-[#172033] dark:text-white">

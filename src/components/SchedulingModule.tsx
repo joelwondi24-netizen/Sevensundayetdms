@@ -36,6 +36,7 @@ import type {
   WorkforceRules,
 } from '../types';
 import { toEthiopianDateString } from '../utils/ethiopianCalendar';
+import { printWithAutoFit } from '../utils/printFit';
 import { SendToApproveButton } from './SendToApproveButton';
 import { ShareButton } from './ShareButton';
 
@@ -611,7 +612,7 @@ export const SchedulingModule: React.FC<SchedulingModuleProps> = ({
   return (
     <div className="space-y-4">
       {/* Header & Top Action Bar */}
-      <div className="flex flex-col gap-3 rounded-xl border border-slate-200 bg-white p-4 shadow-xs dark:border-slate-800 dark:bg-slate-900 sm:flex-row sm:items-center sm:justify-between">
+      <div className="no-print flex flex-col gap-3 rounded-xl border border-slate-200 bg-white p-4 shadow-xs dark:border-slate-800 dark:bg-slate-900 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <h2 className="text-lg font-bold text-slate-900 dark:text-slate-100">
             Staff Scheduling, Shifts & Department Timetables
@@ -639,7 +640,12 @@ export const SchedulingModule: React.FC<SchedulingModuleProps> = ({
           />
           <button
             type="button"
-            onClick={() => window.print()}
+            onClick={() =>
+              printWithAutoFit({
+                orientation: 'landscape',
+                targetSelector: '.print-only-container[data-print-active="true"]',
+              })
+            }
             className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200 dark:hover:bg-slate-700"
           >
             <Printer className="h-3.5 w-3.5" />
@@ -657,7 +663,7 @@ export const SchedulingModule: React.FC<SchedulingModuleProps> = ({
       </div>
 
       {/* KPI Summary Strip */}
-      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+      <div className="no-print grid grid-cols-2 gap-3 lg:grid-cols-4">
         <div className="rounded-xl border border-slate-200 bg-white p-3.5 dark:border-slate-800 dark:bg-slate-900">
           <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
             <span>Scheduled on {formatDateLabel(anchorDate)}</span>
@@ -735,7 +741,7 @@ export const SchedulingModule: React.FC<SchedulingModuleProps> = ({
       )}
 
       {/* Navigation Tabs */}
-      <div className="flex flex-wrap gap-1.5 border-b border-slate-200 pb-2 dark:border-slate-800">
+      <div className="no-print flex flex-wrap gap-1.5 border-b border-slate-200 pb-2 dark:border-slate-800">
         {[
           { id: 'timetable' as const, label: 'Timetable & Calendar', icon: Calendar },
           ...(canManageSchedules ? [{ id: 'assign' as const, label: 'Assign & 3/4-Shift Roster', icon: Plus }] : []),
@@ -765,9 +771,29 @@ export const SchedulingModule: React.FC<SchedulingModuleProps> = ({
 
       {/* TAB 1: TIMETABLE & CALENDAR (DAILY / WEEKLY / MONTHLY) */}
       {tab === 'timetable' && (
-        <div className="space-y-4">
+        <div
+          data-print-active="true"
+          data-print-orientation="landscape"
+          className="print-only-container space-y-4"
+        >
+          <div className="print-only-block pb-2 border-b-2 border-[#18243A]">
+            <div className="flex items-center justify-between gap-4">
+              <div>
+                <h3 className="text-base font-bold text-[#18243A]">
+                  {company?.company_name || 'Seven Sunday Manufacturing & Trading PLC'} — {calView} Workforce Shift Timetable
+                </h3>
+                <p className="text-xs text-slate-600">
+                  Date Anchor: {formatDateLabel(anchorDate)} · Dept: {filterDept} · Category: {filterCategory}
+                </p>
+              </div>
+              <div className="text-right text-xs font-mono text-slate-600">
+                {todayCount} shifts scheduled · {departments.length} departments
+              </div>
+            </div>
+          </div>
+
           {/* Controls */}
-          <div className="flex flex-col gap-3 rounded-xl border border-slate-200 bg-white p-3.5 dark:border-slate-800 dark:bg-slate-900 lg:flex-row lg:items-center lg:justify-between">
+          <div className="no-print flex flex-col gap-3 rounded-xl border border-slate-200 bg-white p-3.5 dark:border-slate-800 dark:bg-slate-900 lg:flex-row lg:items-center lg:justify-between">
             <div className="flex flex-wrap items-center gap-2">
               {(['Daily', 'Weekly', 'Monthly'] as CalViewMode[]).map((mode) => (
                 <button
@@ -910,7 +936,7 @@ export const SchedulingModule: React.FC<SchedulingModuleProps> = ({
                                           </div>
                                         )}
                                         {canManageSchedules && (
-                                          <div className="mt-1 flex flex-wrap items-center gap-1 border-t border-slate-200/70 pt-1 dark:border-slate-700">
+                                          <div className="no-print mt-1 flex flex-wrap items-center gap-1 border-t border-slate-200/70 pt-1 dark:border-slate-700">
                                             <button
                                               type="button"
                                               title="Edit Schedule"
@@ -984,7 +1010,7 @@ export const SchedulingModule: React.FC<SchedulingModuleProps> = ({
                         <th className="px-3 py-2 font-semibold">Shift & Category</th>
                         <th className="px-3 py-2 font-semibold">Hours · Break</th>
                         <th className="px-3 py-2 font-semibold">Status</th>
-                        {canManageSchedules && <th className="px-3 py-2 font-semibold text-right">Actions</th>}
+                        {canManageSchedules && <th className="no-print px-3 py-2 font-semibold text-right">Actions</th>}
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
@@ -1015,7 +1041,7 @@ export const SchedulingModule: React.FC<SchedulingModuleProps> = ({
                                 {item.availability_status} · {item.approval_status}
                               </td>
                               {canManageSchedules && (
-                                <td className="px-3 py-2 text-right">
+                                <td className="no-print px-3 py-2 text-right">
                                   <div className="inline-flex items-center gap-1.5">
                                     <button
                                       type="button"
@@ -1374,8 +1400,12 @@ export const SchedulingModule: React.FC<SchedulingModuleProps> = ({
 
       {/* TAB 3: DEPARTMENT TIMETABLES */}
       {tab === 'departments' && (
-        <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
-          <div className="space-y-3 lg:col-span-2">
+        <div className="print-grid-reset grid grid-cols-1 gap-4 lg:grid-cols-3">
+          <div
+            data-print-active="true"
+            data-print-orientation="landscape"
+            className="print-only-container space-y-3 lg:col-span-2"
+          >
             {departments.map((dept) => {
               const workDays = parseDayList(dept.working_days);
               const restDays = parseDayList(dept.rest_days);
@@ -1461,7 +1491,7 @@ export const SchedulingModule: React.FC<SchedulingModuleProps> = ({
           {canManageShiftsDepts && (
             <form
               onSubmit={handleSaveDepartment}
-              className="h-fit space-y-3 rounded-xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900"
+              className="no-print h-fit space-y-3 rounded-xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900"
             >
               <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100">
                 {editingDeptId ? 'Edit Department Timetable' : 'Add Department Timetable'}
@@ -1599,8 +1629,12 @@ export const SchedulingModule: React.FC<SchedulingModuleProps> = ({
 
       {/* TAB 4: SHIFTS & 3-SHIFT / 4-SHIFT MANAGEMENT */}
       {tab === 'shifts' && (
-        <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
-          <div className="overflow-x-auto rounded-xl border border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900 lg:col-span-2">
+        <div className="print-grid-reset grid grid-cols-1 gap-4 lg:grid-cols-3">
+          <div
+            data-print-active="true"
+            data-print-orientation="landscape"
+            className="print-only-container overflow-x-auto rounded-xl border border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900 lg:col-span-2"
+          >
             <table className="min-w-full text-left text-xs">
               <thead className="border-b border-slate-200 bg-slate-50 dark:border-slate-800 dark:bg-slate-800/50">
                 <tr>
@@ -1691,7 +1725,7 @@ export const SchedulingModule: React.FC<SchedulingModuleProps> = ({
           {canManageShiftsDepts && (
             <form
               onSubmit={handleSaveShift}
-              className="h-fit space-y-3 rounded-xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900"
+              className="no-print h-fit space-y-3 rounded-xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900"
             >
               <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100">
                 {editingShiftId ? 'Edit Shift Definition' : 'Create Shift Definition'}

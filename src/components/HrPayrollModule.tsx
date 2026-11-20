@@ -33,6 +33,8 @@ import { formatMoney } from '../utils/ethiopianCalendar';
 import { RealQrCode } from './RealQrCode';
 import { SendToApproveButton } from './SendToApproveButton';
 import { ShareButton } from './ShareButton';
+import { PrintableSheetFrame } from './PrintableSheetFrame';
+import { printWithAutoFit } from '../utils/printFit';
 
 interface HrPayrollModuleProps {
   mode: 'hr' | 'payroll';
@@ -126,6 +128,7 @@ export const HrPayrollModule: React.FC<HrPayrollModuleProps> = ({
   const [editingIdentityId, setEditingIdentityId] = useState<number | null>(null);
   const [savingRowId, setSavingRowId] = useState<number | null>(null);
   const [savingAll, setSavingAll] = useState(false);
+  const [mobileCardEditOpen, setMobileCardEditOpen] = useState(false);
 
   const [showAddSheetRow, setShowAddSheetRow] = useState(false);
   const [newSheetRow, setNewSheetRow] = useState({
@@ -948,7 +951,7 @@ export const HrPayrollModule: React.FC<HrPayrollModuleProps> = ({
         </div>
 
         {/* Employee Directory + Printable ID Badge & Registration Sheet */}
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+        <div className="print-grid-reset grid grid-cols-1 lg:grid-cols-12 gap-6">
           <div className="no-print lg:col-span-7 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden">
             <div className="px-4 py-3 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between">
               <h3 className="text-sm font-bold text-[#172033] dark:text-white">
@@ -1074,7 +1077,11 @@ export const HrPayrollModule: React.FC<HrPayrollModuleProps> = ({
             </div>
           </div>
 
-          <div className="lg:col-span-5 print-only-container bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-5 space-y-4">
+          <div
+            data-print-active="true"
+            data-print-orientation="portrait"
+            className="lg:col-span-5 print-only-container bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-4 sm:p-5 space-y-4"
+          >
             <div className="no-print flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-slate-200 dark:border-slate-800">
               <div className="flex flex-wrap items-center gap-1 p-1 bg-[#F8FAFC] dark:bg-slate-800 rounded-lg">
                 <button
@@ -1122,7 +1129,7 @@ export const HrPayrollModule: React.FC<HrPayrollModuleProps> = ({
                 )}
                 <button
                   type="button"
-                  onClick={() => window.print()}
+                  onClick={() => printWithAutoFit({ orientation: 'portrait' })}
                   className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-[#18243A] hover:bg-[#172033] rounded-lg whitespace-nowrap"
                 >
                   <Printer className="w-3.5 h-3.5 text-[#087CEB]" />
@@ -1154,7 +1161,8 @@ export const HrPayrollModule: React.FC<HrPayrollModuleProps> = ({
                     </div>
                   </div>
 
-                  <div className="flex flex-col items-center gap-4 overflow-x-auto py-1">
+                  <div className="sheet-scroll-stage py-1">
+                    <div className="sheet-scroll-inner flex flex-col items-center gap-4">
                     {/* FRONT SIDE (85.6mm x 53.98mm) */}
                     {(idCardSide === 'both' || idCardSide === 'front') && (
                       <div className="space-y-1">
@@ -1274,10 +1282,11 @@ export const HrPayrollModule: React.FC<HrPayrollModuleProps> = ({
                         </div>
                       </div>
                     )}
+                    </div>
                   </div>
                 </div>
               ) : (
-                <div className="border border-slate-300 rounded-xl p-5 bg-white text-[#172033] space-y-4 text-xs">
+                <div className="border border-slate-300 rounded-xl p-4 sm:p-5 bg-white text-[#172033] space-y-4 text-xs">
                   <div className="flex items-center justify-between pb-3 border-b-2 border-[#18243A]">
                     <div className="flex items-center gap-3">
                       <img src={logoSrc} alt="Seven Sunday" className="h-9 w-auto object-contain" />
@@ -1343,24 +1352,15 @@ export const HrPayrollModule: React.FC<HrPayrollModuleProps> = ({
 
   // ==================== PAYROLL MODE ====================
   return (
-    <div className="space-y-6">
-      {payrollTab === 'sheet' && (
-        <style media="print">{`
-          @page {
-            size: A4 ${sheetOrientation};
-            margin: ${sheetOrientation === 'landscape' ? '8mm' : '10mm'};
-          }
-        `}</style>
-      )}
-
+    <div className="space-y-4 sm:space-y-6">
       {/* Header & Sub-Navigation */}
-      <div className="no-print bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-5 flex flex-wrap items-center justify-between gap-4">
+      <div className="no-print bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-4 sm:p-5 flex flex-col xl:flex-row xl:items-center justify-between gap-4">
         <div>
-          <h2 className="text-lg font-bold text-[#172033] dark:text-white">
+          <h2 className="text-base sm:text-lg font-bold text-[#172033] dark:text-white">
             Ethiopian Payroll Sheet, Absence & Categorized Overtime
           </h2>
           <p className="text-xs text-slate-500 dark:text-slate-400">
-            Interactive Absence (-/+ hours, editable Birr/hr rate & Total Absence Birr) and Categorized OT (Nor 1.5x · Night 1.75x · Sun 2.0x · Holly 2.5x) with separate Birr totals.
+            Interactive Absence (-/+ hours, editable Birr/hr rate & Total Absence Birr) and Categorized OT (Nor {multNormal}x · Night {multNight}x · Sun {multSun}x · Holly {multHol}x) — responsive across all devices & auto-fitted for paper.
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -1707,8 +1707,8 @@ export const HrPayrollModule: React.FC<HrPayrollModuleProps> = ({
       {payrollTab === 'sheet' && (
         <div className="space-y-4">
           {/* Control Toolbar + OT Multiplier Controls + Live Category Totals */}
-          <div className="no-print bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl px-4 py-3.5 space-y-3">
-            <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="no-print bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl px-3.5 sm:px-4 py-3.5 space-y-3">
+            <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
               <div className="flex flex-wrap items-center gap-2">
                 <select
                   value={sheetMonth}
@@ -1827,7 +1827,25 @@ export const HrPayrollModule: React.FC<HrPayrollModuleProps> = ({
                 />
                 <button
                   type="button"
-                  onClick={() => window.print()}
+                  onClick={() => setMobileCardEditOpen((v) => !v)}
+                  className={`inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold rounded-lg whitespace-nowrap border ${
+                    mobileCardEditOpen
+                      ? 'bg-[#18243A] text-white border-[#18243A]'
+                      : 'bg-[#F8FAFC] dark:bg-slate-800 text-[#172033] dark:text-slate-200 border-slate-200 dark:border-slate-700'
+                  }`}
+                  title="Edit Absence & Overtime using touch-friendly mobile cards"
+                >
+                  <Calculator className="w-3.5 h-3.5 text-[#087CEB]" />
+                  {mobileCardEditOpen ? 'Hide Card Editor' : 'Mobile / Touch Editor'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    printWithAutoFit({
+                      orientation: sheetOrientation,
+                      targetSelector: '.print-only-container[data-print-active="true"]',
+                    })
+                  }
                   className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-bold text-white bg-[#087CEB] hover:bg-[#0265C4] rounded-lg whitespace-nowrap"
                 >
                   <Printer className="w-3.5 h-3.5" />
@@ -1913,7 +1931,7 @@ export const HrPayrollModule: React.FC<HrPayrollModuleProps> = ({
                 </button>
               </div>
 
-              <div className="grid grid-cols-2 sm:grid-cols-6 gap-2 text-[11px]">
+              <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2 text-[11px]">
                 <div className="px-2.5 py-1.5 bg-rose-50 dark:bg-rose-950/30 border border-rose-200 dark:border-rose-900 rounded-lg">
                   <div className="text-rose-700 dark:text-rose-300 font-semibold">Absence (-)</div>
                   <div className="font-mono font-bold text-rose-700 dark:text-rose-300 tabular-nums">
@@ -2105,50 +2123,191 @@ export const HrPayrollModule: React.FC<HrPayrollModuleProps> = ({
                 </div>
               </form>
             )}
+            {mobileCardEditOpen && (
+              <div className="pt-3 border-t border-slate-200 dark:border-slate-800 space-y-2.5">
+                <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                  <span className="font-bold text-[#172033] dark:text-white">
+                    Touch Payroll Editor ({sheetPayrolls.length} Staff) — Live Absence &amp; Categorized OT Calculator
+                  </span>
+                  <span className="text-[11px] text-slate-500">
+                    Edits sync live with the A4 print sheet below
+                  </span>
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-2.5">
+                  {sheetPayrolls.map((p) => {
+                    const live = computeRowLive(p);
+                    return (
+                      <div
+                        key={`card-${p.id}`}
+                        className={`p-3 rounded-xl border text-xs space-y-2 ${
+                          live.isDirty
+                            ? 'bg-amber-50/60 dark:bg-amber-950/20 border-amber-300 dark:border-amber-800'
+                            : 'bg-[#F8FAFC] dark:bg-slate-800/60 border-slate-200 dark:border-slate-700'
+                        }`}
+                      >
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="min-w-0">
+                            <div className="font-bold text-[#172033] dark:text-white truncate">{live.name}</div>
+                            <div className="text-[11px] font-mono text-slate-500">
+                              ID {live.id_no || p.employee_code} · Basic {fmtNum(live.basic)} · Rate {fmtNum(live.rate)}
+                            </div>
+                          </div>
+                          <div className="text-right shrink-0">
+                            <div className="text-[10px] text-slate-500">NET PAY</div>
+                            <div className="font-mono font-bold text-[#087CEB] tabular-nums">{fmtNum(live.net)}</div>
+                          </div>
+                        </div>
+
+                        <div className="grid grid-cols-2 gap-2">
+                          <div className="p-2 rounded-lg bg-rose-50/70 dark:bg-rose-950/20 border border-rose-200 dark:border-rose-900 space-y-1">
+                            <div className="flex justify-between text-[10px] font-bold text-rose-700 dark:text-rose-300">
+                              <span>ABSENCE HRS</span>
+                              <span>-{fmtNum(live.absAmt)} Br</span>
+                            </div>
+                            <div className="flex items-center gap-1">
+                              <button
+                                type="button"
+                                onClick={() => updateRowDraft(p, { absence_hours: Math.max(0, round2(live.absHrs - 1)) })}
+                                className="w-6 h-6 inline-flex items-center justify-center rounded border border-slate-300 bg-white dark:bg-slate-800"
+                              >
+                                <Minus className="w-3 h-3" />
+                              </button>
+                              <input
+                                type="number"
+                                step="0.5"
+                                min="0"
+                                value={live.absHrs}
+                                onChange={(e) => updateRowDraft(p, { absence_hours: Math.max(0, Number(e.target.value) || 0) })}
+                                className="flex-1 min-w-0 px-1.5 py-1 text-center font-mono text-xs border border-slate-300 dark:border-slate-700 rounded bg-white dark:bg-slate-900"
+                              />
+                              <button
+                                type="button"
+                                onClick={() => updateRowDraft(p, { absence_hours: round2(live.absHrs + 1) })}
+                                className="w-6 h-6 inline-flex items-center justify-center rounded border border-slate-300 bg-white dark:bg-slate-800"
+                              >
+                                <Plus className="w-3 h-3" />
+                              </button>
+                            </div>
+                          </div>
+
+                          <div className="p-2 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 space-y-1">
+                            <div className="flex justify-between text-[10px] font-bold text-slate-600 dark:text-slate-300">
+                              <span>ABS RATE/HR</span>
+                              <span>Tax {fmtNum(live.tax)}</span>
+                            </div>
+                            <input
+                              type="number"
+                              step="0.01"
+                              min="0"
+                              value={live.absRate}
+                              onChange={(e) =>
+                                updateRowDraft(p, {
+                                  absence_rate: Math.max(0, Number(e.target.value) || 0),
+                                  absence_rate_custom: true,
+                                })
+                              }
+                              className="w-full px-2 py-1 text-right font-mono text-xs border border-slate-300 dark:border-slate-700 rounded bg-[#F8FAFC] dark:bg-slate-800"
+                            />
+                          </div>
+                        </div>
+
+                        <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5 text-[10px]">
+                          {(
+                            [
+                              ['Nor', multNormal, live.otNor, live.otNorBirr, 'ot_normal_hours'],
+                              ['Night', multNight, live.otNight, live.otNightBirr, 'ot_night_hours'],
+                              ['Sun', multSun, live.otSun, live.otSunBirr, 'ot_sunday_hours'],
+                              ['Holly', multHol, live.otHol, live.otHolBirr, 'ot_holiday_hours'],
+                            ] as const
+                          ).map(([label, mult, hrs, birr, field]) => (
+                            <div key={field} className="p-1.5 rounded bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700">
+                              <div className="flex justify-between font-semibold text-slate-600 dark:text-slate-300 mb-1">
+                                <span>{label} ({mult}x)</span>
+                                <span className="text-[#087CEB] font-mono">{fmtNum(birr)}</span>
+                              </div>
+                              <input
+                                type="number"
+                                step="0.5"
+                                min="0"
+                                value={hrs}
+                                onChange={(e) => updateRowDraft(p, { [field]: Math.max(0, Number(e.target.value) || 0) })}
+                                className="w-full px-1.5 py-0.5 text-center font-mono text-xs border border-slate-300 dark:border-slate-700 rounded bg-[#F8FAFC] dark:bg-slate-800"
+                              />
+                            </div>
+                          ))}
+                        </div>
+
+                        {live.isDirty && (
+                          <button
+                            type="button"
+                            disabled={savingRowId === p.id}
+                            onClick={() => saveSingleRow(p)}
+                            className="w-full inline-flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs font-bold text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg"
+                          >
+                            <Save className="w-3.5 h-3.5" />
+                            {savingRowId === p.id ? 'Saving...' : 'Save Row'}
+                          </button>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
           </div>
 
-          {/* Interactive Landscape/Portrait A4 Payroll Sheet */}
-          <div className="print-only-container w-full overflow-x-auto pb-4 flex justify-center">
-            <div
-              className={`${
-                sheetOrientation === 'landscape' ? 'a4-landscape-sheet' : 'a4-sheet'
-              } border border-slate-300 shadow-sm flex flex-col justify-between`}
+          {/* Interactive Landscape/Portrait A4 Payroll Sheet (Device-Responsive & Zero-Cutoff Print) */}
+          <div
+            data-print-active="true"
+            data-print-orientation={sheetOrientation}
+            className="print-only-container w-full"
+          >
+            <PrintableSheetFrame
+              orientation={sheetOrientation}
+              onOrientationChange={setSheetOrientation}
+              documentLabel="Payroll & Ethiopian Tax Sheet"
+              targetSelector='.print-only-container[data-print-active="true"]'
             >
-              <div>
-                {/* Institutional Header */}
-                <div className="flex items-start justify-between pb-2.5 border-b-2 border-[#18243A]">
-                  <div className="flex items-start gap-3">
-                    <img src={logoSrc} alt="Seven Sunday Ethiopia" className="h-11 w-auto object-contain mt-0.5" />
-                    <div className="space-y-0.5">
-                      <div className="text-sm font-bold text-[#172033] tracking-tight uppercase">
-                        {company?.company_name || 'SEVEN SUNDAY MANUFACTURING & TRADING INDUSTRIES PLC'}
-                      </div>
-                      <div className="flex flex-wrap items-center gap-6 text-xs font-bold text-[#172033]">
-                        <span>PAYROLL FOR THE MONTH OF</span>
-                        <span className="text-[#18243A] underline underline-offset-4">{activeHeaderMonth}</span>
-                      </div>
-                      <div className="flex flex-wrap items-center gap-10 text-xs font-bold text-[#172033]">
-                        <span>{activeHeaderCategory}</span>
-                        <span className="font-mono tabular-nums">{stdHrsDivisor.toFixed(2)} hrs</span>
+              <div
+                className={`${
+                  sheetOrientation === 'landscape' ? 'a4-landscape-sheet' : 'a4-sheet'
+                } border border-slate-300 shadow-sm flex flex-col justify-between`}
+              >
+                <div>
+                  {/* Institutional Header */}
+                  <div className="flex items-start justify-between gap-3 pb-2.5 border-b-2 border-[#18243A]">
+                    <div className="flex items-start gap-3 min-w-0">
+                      <img src={logoSrc} alt="Seven Sunday Ethiopia" className="h-11 w-auto object-contain mt-0.5 shrink-0" />
+                      <div className="space-y-0.5 min-w-0">
+                        <div className="text-sm font-bold text-[#172033] tracking-tight uppercase">
+                          {company?.company_name || 'SEVEN SUNDAY MANUFACTURING & TRADING INDUSTRIES PLC'}
+                        </div>
+                        <div className="flex flex-wrap items-center gap-6 text-xs font-bold text-[#172033]">
+                          <span>PAYROLL FOR THE MONTH OF</span>
+                          <span className="text-[#18243A] underline underline-offset-4">{activeHeaderMonth}</span>
+                        </div>
+                        <div className="flex flex-wrap items-center gap-10 text-xs font-bold text-[#172033]">
+                          <span>{activeHeaderCategory}</span>
+                          <span className="font-mono tabular-nums">{stdHrsDivisor.toFixed(2)} hrs</span>
+                        </div>
                       </div>
                     </div>
-                  </div>
-                  <div className="flex items-center gap-3 shrink-0">
-                    <div className="text-right font-mono text-[10px] text-[#172033]">
-                      <div>Staff: {sheetPayrolls.length}</div>
-                      <div>Net Total: {formatMoney(sheetTotals.net, currency)}</div>
-                      <div>OT Rates: {multNormal}x / {multNight}x / {multSun}x / {multHol}x</div>
+                    <div className="flex items-center gap-3 shrink-0">
+                      <div className="text-right font-mono text-[10px] text-[#172033]">
+                        <div>Staff: {sheetPayrolls.length}</div>
+                        <div>Net Total: {formatMoney(sheetTotals.net, currency)}</div>
+                        <div>OT Rates: {multNormal}x / {multNight}x / {multSun}x / {multHol}x</div>
+                      </div>
+                      <RealQrCode
+                        value={`SS-PAYROLL|${activeHeaderMonth}|${activeHeaderCategory}|STAFF:${sheetPayrolls.length}|NET:${sheetTotals.net.toFixed(2)}`}
+                        size={56}
+                      />
                     </div>
-                    <RealQrCode
-                      value={`SS-PAYROLL|${activeHeaderMonth}|${activeHeaderCategory}|STAFF:${sheetPayrolls.length}|NET:${sheetTotals.net.toFixed(2)}`}
-                      size={56}
-                    />
                   </div>
-                </div>
 
-                {/* Grouped Spreadsheet Table */}
-                <div className="mt-3 overflow-x-auto">
-                  <table className="w-full text-left border-collapse text-[10px]">
+                  {/* Grouped Spreadsheet Table */}
+                  <div className="mt-3">
+                    <table className="w-full text-left border-collapse text-[10px] ss-payroll-table">
                     <thead>
                       <tr className="bg-[#F8FAFC] text-[#172033] font-bold">
                         <th colSpan={5} className="py-1 px-1.5 border border-slate-400"></th>
@@ -2211,7 +2370,7 @@ export const HrPayrollModule: React.FC<HrPayrollModuleProps> = ({
                                   : 'bg-white'
                             }
                           >
-                            <td className="py-1.5 px-1.5 border border-slate-400 font-medium whitespace-nowrap">
+                            <td className="ss-payroll-name py-1.5 px-1.5 border border-slate-400 font-medium whitespace-nowrap">
                               {isEditingId ? (
                                 <input
                                   type="text"
@@ -2223,7 +2382,7 @@ export const HrPayrollModule: React.FC<HrPayrollModuleProps> = ({
                                 live.name
                               )}
                             </td>
-                            <td className="py-1.5 px-1.5 border border-slate-400 font-mono whitespace-nowrap">
+                            <td className="ss-payroll-acct py-1.5 px-1.5 border border-slate-400 font-mono whitespace-nowrap">
                               {isEditingId ? (
                                 <input
                                   type="text"
@@ -2298,7 +2457,7 @@ export const HrPayrollModule: React.FC<HrPayrollModuleProps> = ({
                                   <Plus className="w-2.5 h-2.5" />
                                 </button>
                               </div>
-                              <span className="hidden print:inline">
+                              <span className="print-only-inline">
                                 {live.absHrs > 0 ? live.absHrs.toFixed(2) : '-'}
                               </span>
                             </td>
@@ -2361,7 +2520,7 @@ export const HrPayrollModule: React.FC<HrPayrollModuleProps> = ({
                                   </button>
                                 )}
                               </div>
-                              <span className="hidden print:inline">{fmtNum(live.absRate)}</span>
+                              <span className="print-only-inline">{fmtNum(live.absRate)}</span>
                             </td>
 
                             {/* TOTAL ABSENCE BIRR */}
@@ -2403,7 +2562,7 @@ export const HrPayrollModule: React.FC<HrPayrollModuleProps> = ({
                                   <Plus className="w-2.5 h-2.5" />
                                 </button>
                               </div>
-                              <div className="hidden print:block">{live.otNor > 0 ? `${live.otNor.toFixed(1)}h` : '-'}</div>
+                              <div className="print-only-block">{live.otNor > 0 ? `${live.otNor.toFixed(1)}h` : '-'}</div>
                               <div className={`text-[9px] font-bold tabular-nums mt-0.5 ${live.otNorBirr > 0 ? 'text-[#087CEB]' : 'text-slate-400'}`}>
                                 {live.otNorBirr > 0 ? `${fmtNum(live.otNorBirr)} Br` : '0.00 Br'}
                               </div>
@@ -2443,7 +2602,7 @@ export const HrPayrollModule: React.FC<HrPayrollModuleProps> = ({
                                   <Plus className="w-2.5 h-2.5" />
                                 </button>
                               </div>
-                              <div className="hidden print:block">{live.otNight > 0 ? `${live.otNight.toFixed(1)}h` : '-'}</div>
+                              <div className="print-only-block">{live.otNight > 0 ? `${live.otNight.toFixed(1)}h` : '-'}</div>
                               <div className={`text-[9px] font-bold tabular-nums mt-0.5 ${live.otNightBirr > 0 ? 'text-[#18243A]' : 'text-slate-400'}`}>
                                 {live.otNightBirr > 0 ? `${fmtNum(live.otNightBirr)} Br` : '0.00 Br'}
                               </div>
@@ -2483,7 +2642,7 @@ export const HrPayrollModule: React.FC<HrPayrollModuleProps> = ({
                                   <Plus className="w-2.5 h-2.5" />
                                 </button>
                               </div>
-                              <div className="hidden print:block">{live.otSun > 0 ? `${live.otSun.toFixed(1)}h` : '-'}</div>
+                              <div className="print-only-block">{live.otSun > 0 ? `${live.otSun.toFixed(1)}h` : '-'}</div>
                               <div className={`text-[9px] font-bold tabular-nums mt-0.5 ${live.otSunBirr > 0 ? 'text-sky-700' : 'text-slate-400'}`}>
                                 {live.otSunBirr > 0 ? `${fmtNum(live.otSunBirr)} Br` : '0.00 Br'}
                               </div>
@@ -2523,7 +2682,7 @@ export const HrPayrollModule: React.FC<HrPayrollModuleProps> = ({
                                   <Plus className="w-2.5 h-2.5" />
                                 </button>
                               </div>
-                              <div className="hidden print:block">{live.otHol > 0 ? `${live.otHol.toFixed(1)}h` : '-'}</div>
+                              <div className="print-only-block">{live.otHol > 0 ? `${live.otHol.toFixed(1)}h` : '-'}</div>
                               <div className={`text-[9px] font-bold tabular-nums mt-0.5 ${live.otHolBirr > 0 ? 'text-emerald-700' : 'text-slate-400'}`}>
                                 {live.otHolBirr > 0 ? `${fmtNum(live.otHolBirr)} Br` : '0.00 Br'}
                               </div>
@@ -2635,21 +2794,22 @@ export const HrPayrollModule: React.FC<HrPayrollModuleProps> = ({
                 </div>
               </div>
 
-              <div className="mt-6 pt-4 border-t border-slate-300 flex items-end justify-between gap-6 text-[11px] text-[#172033] print-break-avoid">
-                <div className="flex flex-wrap items-end gap-12 flex-1">
-                  <div>Prepared By ____________________________</div>
-                  <div>Approved by ____________________________</div>
-                </div>
-                <div className="flex items-center gap-4 shrink-0">
-                  {company?.stamp_data && (
-                    <img src={company.stamp_data} alt="Official Stamp" className="h-12 w-12 object-contain" />
-                  )}
-                  {company?.signature_data && (
-                    <img src={company.signature_data} alt="Authorized Signature" className="h-10 w-20 object-contain" />
-                  )}
+                <div className="mt-6 pt-4 border-t border-slate-300 flex items-end justify-between gap-6 text-[11px] text-[#172033] print-break-avoid">
+                  <div className="flex flex-wrap items-end gap-12 flex-1">
+                    <div>Prepared By ____________________________</div>
+                    <div>Approved by ____________________________</div>
+                  </div>
+                  <div className="flex items-center gap-4 shrink-0">
+                    {company?.stamp_data && (
+                      <img src={company.stamp_data} alt="Official Stamp" className="h-12 w-12 object-contain" />
+                    )}
+                    {company?.signature_data && (
+                      <img src={company.signature_data} alt="Authorized Signature" className="h-10 w-20 object-contain" />
+                    )}
+                  </div>
                 </div>
               </div>
-            </div>
+            </PrintableSheetFrame>
           </div>
         </div>
       )}
@@ -2816,7 +2976,7 @@ export const HrPayrollModule: React.FC<HrPayrollModuleProps> = ({
 
       {/* LEDGER + QR PAYSLIP PREVIEW FOR NON-SHEET TABS */}
       {payrollTab !== 'sheet' && (
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+        <div className="print-grid-reset grid grid-cols-1 lg:grid-cols-12 gap-6">
           <div className="no-print lg:col-span-8 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden">
             <div className="px-4 py-3 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between">
               <h3 className="text-sm font-bold text-[#172033] dark:text-white">Payroll Register ({payrolls.length})</h3>
@@ -2898,7 +3058,11 @@ export const HrPayrollModule: React.FC<HrPayrollModuleProps> = ({
             </div>
           </div>
 
-          <div className="lg:col-span-4 print-only-container bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-6 text-[#172033]">
+          <div
+            data-print-active="true"
+            data-print-orientation="portrait"
+            className="lg:col-span-4 print-only-container bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-4 sm:p-6 text-[#172033]"
+          >
             <div className="flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-slate-200 dark:border-slate-800">
               <img src={logoSrc} alt="Seven Sunday" className="h-8 w-auto object-contain bg-white rounded px-1" />
               <div className="no-print flex flex-wrap items-center gap-1.5">
@@ -2928,7 +3092,7 @@ export const HrPayrollModule: React.FC<HrPayrollModuleProps> = ({
                 )}
                 <button
                   type="button"
-                  onClick={() => window.print()}
+                  onClick={() => printWithAutoFit({ orientation: 'portrait' })}
                   className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-[#18243A] rounded-lg whitespace-nowrap"
                 >
                   <Printer className="w-3.5 h-3.5 text-[#087CEB]" />

@@ -10,6 +10,7 @@ import type {
 } from '../types';
 import { formatMoney } from '../utils/ethiopianCalendar';
 import { RealQrCode } from './RealQrCode';
+import { printWithAutoFit } from '../utils/printFit';
 
 interface FinanceModuleProps {
   company?: CompanySettings | null;
@@ -177,7 +178,7 @@ export const FinanceModule: React.FC<FinanceModuleProps> = ({
             <span>Cr {formatMoney(trialTotals.credit, currency)}</span>
             <button
               type="button"
-              onClick={() => window.print()}
+              onClick={() => printWithAutoFit({ orientation: 'portrait' })}
               className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-[#18243A] hover:bg-[#172033] rounded-lg whitespace-nowrap"
             >
               <Printer className="w-3.5 h-3.5 text-[#087CEB]" />
@@ -319,7 +320,7 @@ export const FinanceModule: React.FC<FinanceModuleProps> = ({
             </form>
           </div>
 
-          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+          <div className="print-grid-reset grid grid-cols-1 lg:grid-cols-12 gap-6">
             <div className="no-print lg:col-span-7 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden">
               <div className="overflow-x-auto">
                 <table className="w-full text-left border-collapse text-sm">
@@ -372,7 +373,11 @@ export const FinanceModule: React.FC<FinanceModuleProps> = ({
             </div>
 
             {/* Printable QR Voucher */}
-            <div className="lg:col-span-5 print-only-container bg-white border border-slate-300 rounded-xl p-6 text-[#172033]">
+            <div
+              data-print-active="true"
+              data-print-orientation="portrait"
+              className="lg:col-span-5 print-only-container bg-white border border-slate-300 rounded-xl p-6 text-[#172033]"
+            >
               {selectedVoucher ? (
                 <div className="space-y-4 text-xs">
                   <div className="flex items-center justify-between pb-3 border-b-2 border-[#18243A]">
@@ -654,7 +659,11 @@ export const FinanceModule: React.FC<FinanceModuleProps> = ({
 
       {/* TAB 3: FINANCIAL STATEMENTS (TRIAL BALANCE, P&L, BALANCE SHEET IN ETB) */}
       {tab === 'statements' && (
-        <div className="space-y-6 print-only-container">
+        <div
+          data-print-active="true"
+          data-print-orientation="portrait"
+          className="space-y-6 print-only-container"
+        >
           <div className="no-print bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-3 flex flex-wrap items-center gap-2">
             {(
               [

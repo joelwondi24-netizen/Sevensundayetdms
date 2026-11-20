@@ -11,6 +11,7 @@ import {
   X,
 } from 'lucide-react';
 import { api } from '../api';
+import { printWithAutoFit } from '../utils/printFit';
 
 interface ShareButtonProps {
   title: string;
@@ -281,7 +282,17 @@ export const ShareButton: React.FC<ShareButtonProps> = ({
                       type="button"
                       onClick={() => {
                         setOpen(false);
-                        window.setTimeout(() => window.print(), 80);
+                        window.setTimeout(() => {
+                          const isLandscape = Boolean(
+                            document.querySelector(
+                              '.print-only-container .a4-landscape-sheet, .print-only-container[data-print-orientation="landscape"]'
+                            )
+                          );
+                          printWithAutoFit({
+                            orientation: isLandscape ? 'landscape' : 'portrait',
+                            targetSelector: '.print-only-container[data-print-active="true"]',
+                          });
+                        }, 80);
                       }}
                       className="text-[#18243A] dark:text-[#38BDF8] font-semibold hover:underline inline-flex items-center gap-1"
                     >
