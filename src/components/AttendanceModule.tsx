@@ -1,7 +1,8 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   CheckCircle2,
   Clock,
+  Fingerprint,
   Lock,
   Pencil,
   Printer,
@@ -11,7 +12,8 @@ import {
   Upload,
   X,
 } from 'lucide-react';
-import { api } from '../api';
+import { api, getApiTenantId } from '../api';
+import type { WsEventPayload } from '../hooks/useRealtimeWS';
 import type {
   AttendanceRecord,
   EmployeeProfile,
@@ -29,6 +31,7 @@ interface AttendanceModuleProps {
   currency: string;
   calendarMode: 'Gregorian' | 'Ethiopian';
   currentUserRole?: UserRole;
+  lastWsEvent?: WsEventPayload | null;
   onRefreshDashboard: () => void;
 }
 
@@ -73,6 +76,7 @@ export const AttendanceModule: React.FC<AttendanceModuleProps> = ({
   currency,
   calendarMode,
   currentUserRole = 'Super Administrator',
+  lastWsEvent,
   onRefreshDashboard,
 }) => {
   const canEditRecords = ATTENDANCE_MANAGER_ROLES.has(currentUserRole);
@@ -224,6 +228,32 @@ export const AttendanceModule: React.FC<AttendanceModuleProps> = ({
   useEffect(() => {
     loadData();
   }, []);
+
+  const lastHandledWsRef = useRef<WsEventPayload | null>(null);
+  useEffect(() => {
+    if (!lastWsEvent || lastWsEvent === lastHandledWsRef.current) return;
+    lastHandledWsRef.current = lastWsEvent;
+    const evtName = lastWsEvent.event;
+    if (evtName !== 'attendance:updated' && evtName !== 'device:punch' && evtName !== 'biometric:auth_log') {
+      return;
+    }
+    const payload = (lastWsEvent.payload || {}) as Record<string, unknown>;
+    const activeTenant = getApiTenantId();
+    if (payload.tenant_id !== undefined && Number(payload.tenant_id) !== activeTenant) {
+      return;
+    }
+    if (evtName === 'biometric:auth_log' && payload.status !== 'Success') {
+      return;
+    }
+    loadData();
+    if (evtName === 'biometric:auth_log' && payload.attendance_marked) {
+      setNotice(
+        `Live biometric scan verified for ${String(payload.employee_name || payload.employee_code || 'staff')} — Attendance Register synced.`
+      );
+    } else if (evtName === 'attendance:updated' && payload.source === 'biometric') {
+      setNotice('Live biometric update received — Attendance Register synced.');
+    }
+  }, [lastWsEvent]);
 
   const currentMultiplier = useMemo(() => {
     switch (form.ot_type) {
@@ -1073,6 +1103,12 @@ export const AttendanceModule: React.FC<AttendanceModuleProps> = ({
                       </div>
                       {rec.updated_by && (
                         <div className="text-[10px] text-slate-400 truncate max-w-[140px]">By {rec.updated_by}</div>
+                      )}
+                      {rec.notes && /biometric|adms|passkey|auto-marked/i.test(rec.notes) && (
+                        <div className="mt-1 inline-flex items-center gap-1 px-1.5 py-0.5 text-[10px] font-semibold bg-[#EAF4FF] text-[#087CEB] dark:bg-sky-950/60 dark:text-sky-300 rounded">
+                          <Fingerprint className="w-3 h-3" />
+                          Biometric Auto-Marked
+                        </div>
                       )}
                     </td>
                     {canEditRecords && (

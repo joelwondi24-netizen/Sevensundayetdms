@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import {
+  Bell,
   Building2,
   CheckCircle2,
   Cpu,
@@ -9,6 +10,7 @@ import {
   Globe2,
   ImagePlus,
   Layers,
+  Lock,
   Mail,
   Pencil,
   Plus,
@@ -18,6 +20,7 @@ import {
   Shield,
   Sliders,
   Trash2,
+  Unlock,
   UserCheck,
   UserX,
   Users,
@@ -29,7 +32,9 @@ import type {
   CompanySettings,
   DeviceRecord,
   ModuleKey,
+  NotificationChannelConfig,
   PlatformConfig,
+  RbacActionPermissions,
   TenantRecord,
   UserAccount,
   UserRole,
@@ -331,6 +336,28 @@ export const AdminModule: React.FC<AdminModuleProps> = ({
   });
   const [smtpTesting, setSmtpTesting] = useState(false);
   const [smtpResult, setSmtpResult] = useState<string | null>(null);
+  const [actionPerms, setActionPerms] = useState<Record<string, RbacActionPermissions>>({});
+  const [savingActionRole, setSavingActionRole] = useState<string | null>(null);
+  const [channelsCfg, setChannelsCfg] = useState<NotificationChannelConfig>({
+    tenant_id: activeTenantId,
+    email_enabled: 1,
+    telegram_enabled: 0,
+    telegram_bot_token: '',
+    telegram_chat_id: '',
+    whatsapp_webhook_url: '',
+    webhook_enabled: 0,
+    notify_on_events_json: JSON.stringify([
+      'APPROVAL_REQUEST',
+      'LOW_STOCK',
+      'LEAVE_STATUS',
+      'PAYROLL_RUN',
+      'ATTENDANCE_ALERT',
+      'SECURITY_LOCKOUT',
+      'EMPLOYEE_CREATED',
+    ]),
+    updated_at: '',
+  });
+  const [savingChannels, setSavingChannels] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -349,16 +376,24 @@ export const AdminModule: React.FC<AdminModuleProps> = ({
 
   const loadAdminData = async () => {
     try {
-      const [uData, dData, aData, tData] = await Promise.all([
+      const [uData, dData, aData, tData, pData, cData] = await Promise.all([
         api.get<UserAccount[]>('/api/users'),
         api.get<DeviceRecord[]>('/api/devices'),
         api.get<AuditLogRecord[]>('/api/audit-logs'),
         api.get<TenantRecord[]>('/api/tenants'),
+        api.get<Record<string, RbacActionPermissions>>('/api/rbac/permissions').catch(() => null),
+        api.get<NotificationChannelConfig>('/api/notifications/channels').catch(() => null),
       ]);
       setUsers(uData);
       setDevices(dData);
       setAuditLogs(aData);
       setLocalTenants(tData);
+      if (pData) {
+        setActionPerms(pData);
+      }
+      if (cData) {
+        setChannelsCfg(cData);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load administration records');
     }
@@ -464,8 +499,9 @@ export const AdminModule: React.FC<AdminModuleProps> = ({
   const handleCreateUser = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
-    if (userForm.password.trim().length < 6) {
-      setError('Password must be at least 6 characters.');
+    const pw = userForm.password.trim();
+    if (pw.length < 8 || !/[a-zA-Z]/.test(pw) || !/[0-9]/.test(pw)) {
+      setError('Password must be at least 8 characters and include both a letter and a number.');
       return;
     }
     try {
@@ -482,6 +518,88 @@ export const AdminModule: React.FC<AdminModuleProps> = ({
       setNotice(`Created account for ${created.full_name} (${created.role}).`);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to create user');
+    }
+  };
+
+  const handleUnlockUser = async (id: number, email: string) => {
+    setError(null);
+    setNotice(null);
+    try {
+      const updated = await api.post<UserAccount>(`/api/users/${id}/unlock`);
+      setUsers((prev) => prev.map((u) => (u.id === id ? updated : u)));
+      setNotice(`Unlocked corporate account for ${email}.`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to unlock user account');
+    }
+  };
+
+  const handleToggleActionPerm = (role: string, key: keyof RbacActionPermissions) => {
+    if (role === 'System Administrator' || role === 'Super Administrator') return;
+    setActionPerms((prev) => {
+      const current: RbacActionPermissions = prev[role] || {
+        view: true,
+        create: false,
+        edit: false,
+        delete: false,
+        approve: false,
+        export: false,
+        manage: false,
+      };
+      return {
+        ...prev,
+        [role]: { ...current, [key]: !current[key] },
+      };
+    });
+  };
+
+  const handleSaveActionPerms = async (role: string) => {
+    setSavingActionRole(role);
+    setError(null);
+    setNotice(null);
+    try {
+      const perms = actionPerms[role] || {
+        view: true,
+        create: false,
+        edit: false,
+        delete: false,
+        approve: false,
+        export: false,
+        manage: false,
+      };
+      const res = await api.put<{ role: string; permissions: RbacActionPermissions }>(
+        `/api/rbac/permissions/${encodeURIComponent(role)}`,
+        perms
+      );
+      setActionPerms((prev) => ({ ...prev, [role]: res.permissions }));
+      setNotice(`Saved granular action permissions for "${role}".`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to save granular action permissions');
+    } finally {
+      setSavingActionRole(null);
+    }
+  };
+
+  const handleSaveChannels = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setSavingChannels(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const updated = await api.put<NotificationChannelConfig>('/api/notifications/channels', {
+        email_enabled: Boolean(channelsCfg.email_enabled),
+        telegram_enabled: Boolean(channelsCfg.telegram_enabled),
+        telegram_bot_token: channelsCfg.telegram_bot_token,
+        telegram_chat_id: channelsCfg.telegram_chat_id,
+        webhook_enabled: Boolean(channelsCfg.webhook_enabled),
+        whatsapp_webhook_url: channelsCfg.whatsapp_webhook_url,
+        notify_on_events_json: channelsCfg.notify_on_events_json,
+      });
+      setChannelsCfg(updated);
+      setNotice('Saved multi-channel Email, Telegram & Webhook notification settings.');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to update notification channels');
+    } finally {
+      setSavingChannels(false);
     }
   };
 
@@ -1634,8 +1752,8 @@ export const AdminModule: React.FC<AdminModuleProps> = ({
             <input
               type="password"
               required
-              minLength={6}
-              placeholder="Initial Password (min 6)"
+              minLength={8}
+              placeholder="Password (min 8, A-z + 0-9)"
               value={userForm.password}
               onChange={(e) => setUserForm({ ...userForm, password: e.target.value })}
               className="px-3 py-2 text-sm bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg"
@@ -1681,76 +1799,103 @@ export const AdminModule: React.FC<AdminModuleProps> = ({
                   <th className="py-2.5 px-4">User / Email</th>
                   <th className="py-2.5 px-4">Department & Title</th>
                   <th className="py-2.5 px-4">Role</th>
-                  <th className="py-2.5 px-4">Status</th>
+                  <th className="py-2.5 px-4">Status & Security</th>
                   <th className="py-2.5 px-4 text-right">Actions</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-200 dark:divide-slate-800">
-                {users.map((u) => (
-                  <tr key={u.id}>
-                    <td className="py-2.5 px-4">
-                      <div className="font-semibold text-[#172033] dark:text-white">{u.full_name}</div>
-                      <div className="text-xs font-mono text-slate-500">
-                        {u.email} · {u.employee_code}
-                      </div>
-                    </td>
-                    <td className="py-2.5 px-4 text-xs text-slate-600 dark:text-slate-300">
-                      {u.department} · {u.job_title}
-                    </td>
-                    <td className="py-2.5 px-4 text-xs">
-                      <select
-                        value={u.role}
-                        onChange={async (e) => {
-                          const updated = await api.patch<UserAccount>(`/api/users/${u.id}/status`, {
-                            role: e.target.value,
-                          });
-                          setUsers((prev) => prev.map((x) => (x.id === u.id ? updated : x)));
-                        }}
-                        className="px-2 py-1 text-xs border border-slate-300 dark:border-slate-700 rounded bg-white dark:bg-slate-800"
-                      >
-                        {ALL_ROLES.map((r) => (
-                          <option key={r} value={r}>
-                            {r}
-                          </option>
-                        ))}
-                      </select>
-                    </td>
-                    <td className="py-2.5 px-4 text-xs font-semibold">
-                      <span className={u.status === 'Active' ? 'text-emerald-700 dark:text-emerald-400' : 'text-red-700 dark:text-red-400'}>
-                        {u.status}
-                      </span>
-                    </td>
-                    <td className="py-2.5 px-4 text-right">
-                      <div className="flex items-center justify-end gap-2">
-                        <button
-                          type="button"
-                          onClick={async () => {
-                            const nextStatus = u.status === 'Active' ? 'Suspended' : 'Active';
+                {users.map((u) => {
+                  const isLocked = Boolean(u.locked_until && new Date(u.locked_until).getTime() > Date.now());
+                  return (
+                    <tr key={u.id}>
+                      <td className="py-2.5 px-4">
+                        <div className="font-semibold text-[#172033] dark:text-white">{u.full_name}</div>
+                        <div className="text-xs font-mono text-slate-500">
+                          {u.email} · {u.employee_code}
+                        </div>
+                      </td>
+                      <td className="py-2.5 px-4 text-xs text-slate-600 dark:text-slate-300">
+                        {u.department} · {u.job_title}
+                      </td>
+                      <td className="py-2.5 px-4 text-xs">
+                        <select
+                          value={u.role}
+                          onChange={async (e) => {
                             const updated = await api.patch<UserAccount>(`/api/users/${u.id}/status`, {
-                              status: nextStatus,
+                              role: e.target.value,
                             });
                             setUsers((prev) => prev.map((x) => (x.id === u.id ? updated : x)));
                           }}
-                          className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-slate-700 dark:text-slate-200 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 rounded-lg whitespace-nowrap"
+                          className="px-2 py-1 text-xs border border-slate-300 dark:border-slate-700 rounded bg-white dark:bg-slate-800"
                         >
-                          {u.status === 'Active' ? <UserX className="w-3.5 h-3.5" /> : <UserCheck className="w-3.5 h-3.5" />}
-                          {u.status === 'Active' ? 'Suspend' : 'Activate'}
-                        </button>
-                        <button
-                          type="button"
-                          onClick={async () => {
-                            await api.del(`/api/users/${u.id}`);
-                            setUsers((prev) => prev.filter((x) => x.id !== u.id));
-                          }}
-                          className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-red-700 bg-red-50 hover:bg-red-100 rounded-lg whitespace-nowrap"
-                        >
-                          <Trash2 className="w-3.5 h-3.5" />
-                          Delete
-                        </button>
-                      </div>
-                    </td>
-                  </tr>
-                ))}
+                          {ALL_ROLES.map((r) => (
+                            <option key={r} value={r}>
+                              {r}
+                            </option>
+                          ))}
+                        </select>
+                      </td>
+                      <td className="py-2.5 px-4 text-xs font-semibold">
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <span className={u.status === 'Active' ? 'text-emerald-700 dark:text-emerald-400' : 'text-red-700 dark:text-red-400'}>
+                            {u.status}
+                          </span>
+                          {Boolean(u.mfa_enabled) && (
+                            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 text-[10px] font-bold bg-sky-50 text-sky-700 border border-sky-200 rounded">
+                              <Shield className="w-2.5 h-2.5" />
+                              2FA Active
+                            </span>
+                          )}
+                          {isLocked && (
+                            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 text-[10px] font-bold bg-rose-50 text-rose-700 border border-rose-200 rounded">
+                              <Lock className="w-2.5 h-2.5" />
+                              Locked
+                            </span>
+                          )}
+                        </div>
+                      </td>
+                      <td className="py-2.5 px-4 text-right">
+                        <div className="flex items-center justify-end gap-2">
+                          {isLocked && (
+                            <button
+                              type="button"
+                              onClick={() => handleUnlockUser(u.id, u.email)}
+                              className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-semibold text-amber-800 bg-amber-50 hover:bg-amber-100 border border-amber-200 rounded-lg whitespace-nowrap"
+                            >
+                              <Unlock className="w-3.5 h-3.5" />
+                              Unlock
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            onClick={async () => {
+                              const nextStatus = u.status === 'Active' ? 'Suspended' : 'Active';
+                              const updated = await api.patch<UserAccount>(`/api/users/${u.id}/status`, {
+                                status: nextStatus,
+                              });
+                              setUsers((prev) => prev.map((x) => (x.id === u.id ? updated : x)));
+                            }}
+                            className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-slate-700 dark:text-slate-200 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 rounded-lg whitespace-nowrap"
+                          >
+                            {u.status === 'Active' ? <UserX className="w-3.5 h-3.5" /> : <UserCheck className="w-3.5 h-3.5" />}
+                            {u.status === 'Active' ? 'Suspend' : 'Activate'}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={async () => {
+                              await api.del(`/api/users/${u.id}`);
+                              setUsers((prev) => prev.filter((x) => x.id !== u.id));
+                            }}
+                            className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-red-700 bg-red-50 hover:bg-red-100 rounded-lg whitespace-nowrap"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                            Delete
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
@@ -1819,6 +1964,80 @@ export const AdminModule: React.FC<AdminModuleProps> = ({
                 })}
               </tbody>
             </table>
+          </div>
+
+          {/* Granular Action Permissions Matrix (Enforced Server-Side) */}
+          <div className="pt-4 border-t border-slate-200 dark:border-slate-800 space-y-3">
+            <div>
+              <h4 className="text-sm font-bold text-[#172033] dark:text-white">
+                Granular Action Permissions (View, Create, Edit, Delete, Approve, Export, Manage)
+              </h4>
+              <p className="text-xs text-slate-500 dark:text-slate-400">
+                Server-enforced per-role operation privileges across Tenant #{activeTenantId}. Save individual roles below.
+              </p>
+            </div>
+            <div className="overflow-x-auto border border-slate-200 dark:border-slate-800 rounded-lg">
+              <table className="w-full text-left border-collapse text-xs">
+                <thead>
+                  <tr className="border-b border-slate-200 dark:border-slate-800 bg-[#F8FAFC] dark:bg-slate-800/60 font-semibold text-slate-600 dark:text-slate-300">
+                    <th className="py-2.5 px-3 min-w-[180px]">Role</th>
+                    {(['view', 'create', 'edit', 'delete', 'approve', 'export', 'manage'] as const).map((k) => (
+                      <th key={k} className="py-2.5 px-3 text-center uppercase">
+                        {k}
+                      </th>
+                    ))}
+                    <th className="py-2.5 px-3 text-right">Action</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-200 dark:divide-slate-800">
+                  {ALL_ROLES.map((role) => {
+                    const locked = role === 'System Administrator' || role === 'Super Administrator';
+                    const p: RbacActionPermissions = actionPerms[role] || {
+                      view: true,
+                      create: locked,
+                      edit: locked,
+                      delete: locked,
+                      approve: locked,
+                      export: locked,
+                      manage: locked,
+                    };
+                    return (
+                      <tr key={`act-${role}`} className="hover:bg-[#F8FAFC] dark:hover:bg-slate-800/40">
+                        <td className="py-2 px-3 font-semibold text-[#172033] dark:text-white whitespace-nowrap">
+                          {role}
+                        </td>
+                        {(['view', 'create', 'edit', 'delete', 'approve', 'export', 'manage'] as const).map((k) => (
+                          <td key={`${role}-${k}`} className="py-2 px-3 text-center">
+                            <input
+                              type="checkbox"
+                              checked={locked ? true : Boolean(p[k])}
+                              disabled={locked}
+                              onChange={() => handleToggleActionPerm(role, k)}
+                              className="w-3.5 h-3.5 accent-[#087CEB] cursor-pointer"
+                            />
+                          </td>
+                        ))}
+                        <td className="py-2 px-3 text-right">
+                          {locked ? (
+                            <span className="text-[11px] font-mono text-slate-400">Locked</span>
+                          ) : (
+                            <button
+                              type="button"
+                              disabled={savingActionRole === role}
+                              onClick={() => handleSaveActionPerms(role)}
+                              className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-semibold text-[#18243A] bg-[#DBEAFE] hover:bg-[#BFDBFE] border border-[#087CEB]/30 rounded disabled:opacity-60"
+                            >
+                              <Save className="w-3 h-3" />
+                              {savingActionRole === role ? 'Saving...' : 'Save Actions'}
+                            </button>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
           </div>
         </div>
       )}
@@ -2028,6 +2247,141 @@ export const AdminModule: React.FC<AdminModuleProps> = ({
               </button>
             </div>
           </div>
+
+          {/* Multi-Channel Notifications (Telegram Bot & Webhook) */}
+          <form
+            onSubmit={handleSaveChannels}
+            className="lg:col-span-12 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-6 space-y-4"
+          >
+            <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-slate-200 dark:border-slate-800">
+              <div className="flex items-center gap-2">
+                <Bell className="w-4 h-4 text-[#087CEB]" />
+                <div>
+                  <h3 className="text-base font-bold text-[#172033] dark:text-white">
+                    Multi-Channel Real-Time Notification Dispatch (Email, Telegram Bot & Webhook)
+                  </h3>
+                  <p className="text-xs text-slate-500 dark:text-slate-400">
+                    Configure live external alerts for approvals, payroll runs, low stock, attendance events, and account lockouts.
+                  </p>
+                </div>
+              </div>
+              <button
+                type="submit"
+                disabled={savingChannels}
+                className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-[#18243A] hover:bg-[#172033] disabled:opacity-60 rounded-lg whitespace-nowrap"
+              >
+                <Save className="w-3.5 h-3.5 text-[#087CEB]" />
+                {savingChannels ? 'Saving Channels...' : 'Save Notification Channels'}
+              </button>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              <div className="p-4 rounded-lg bg-[#F8FAFC] dark:bg-slate-800/50 border border-slate-200 dark:border-slate-700 space-y-2">
+                <label className="inline-flex items-center gap-2 text-xs font-bold text-[#172033] dark:text-white cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={Boolean(channelsCfg.email_enabled)}
+                    onChange={(e) => setChannelsCfg({ ...channelsCfg, email_enabled: e.target.checked ? 1 : 0 })}
+                    className="w-4 h-4 accent-[#087CEB]"
+                  />
+                  Enable SMTP Email Alerts
+                </label>
+                <p className="text-[11px] text-slate-500">
+                  Dispatches real emails using the SMTP server configured above when recipients are present.
+                </p>
+              </div>
+
+              <div className="p-4 rounded-lg bg-[#F8FAFC] dark:bg-slate-800/50 border border-slate-200 dark:border-slate-700 space-y-2">
+                <label className="inline-flex items-center gap-2 text-xs font-bold text-[#172033] dark:text-white cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={Boolean(channelsCfg.telegram_enabled)}
+                    onChange={(e) => setChannelsCfg({ ...channelsCfg, telegram_enabled: e.target.checked ? 1 : 0 })}
+                    className="w-4 h-4 accent-[#087CEB]"
+                  />
+                  Enable Telegram Bot Alerts
+                </label>
+                <input
+                  type="password"
+                  placeholder="Bot Token (123456:ABC...)"
+                  value={channelsCfg.telegram_bot_token}
+                  onChange={(e) => setChannelsCfg({ ...channelsCfg, telegram_bot_token: e.target.value })}
+                  className="w-full px-3 py-1.5 text-xs font-mono bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-lg"
+                />
+                <input
+                  type="text"
+                  placeholder="Telegram Chat / Channel ID (-100...)"
+                  value={channelsCfg.telegram_chat_id}
+                  onChange={(e) => setChannelsCfg({ ...channelsCfg, telegram_chat_id: e.target.value })}
+                  className="w-full px-3 py-1.5 text-xs font-mono bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-lg"
+                />
+              </div>
+
+              <div className="p-4 rounded-lg bg-[#F8FAFC] dark:bg-slate-800/50 border border-slate-200 dark:border-slate-700 space-y-2">
+                <label className="inline-flex items-center gap-2 text-xs font-bold text-[#172033] dark:text-white cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={Boolean(channelsCfg.webhook_enabled)}
+                    onChange={(e) => setChannelsCfg({ ...channelsCfg, webhook_enabled: e.target.checked ? 1 : 0 })}
+                    className="w-4 h-4 accent-[#087CEB]"
+                  />
+                  Enable HTTPS Webhook Alerts
+                </label>
+                <input
+                  type="url"
+                  placeholder="https://hooks.example.com/sevensunday"
+                  value={channelsCfg.whatsapp_webhook_url}
+                  onChange={(e) => setChannelsCfg({ ...channelsCfg, whatsapp_webhook_url: e.target.value })}
+                  className="w-full px-3 py-1.5 text-xs font-mono bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-lg"
+                />
+                <p className="text-[11px] text-slate-500">
+                  Sends signed JSON alert payloads to Slack, Microsoft Teams, or WhatsApp Gateway bridges.
+                </p>
+              </div>
+            </div>
+
+            <div className="pt-2">
+              <div className="text-xs font-semibold text-slate-600 dark:text-slate-300 mb-2">
+                Trigger External Channels For Events:
+              </div>
+              <div className="flex flex-wrap gap-2">
+                {[
+                  'APPROVAL_REQUEST',
+                  'LOW_STOCK',
+                  'LEAVE_STATUS',
+                  'PAYROLL_RUN',
+                  'ATTENDANCE_ALERT',
+                  'SECURITY_LOCKOUT',
+                  'EMPLOYEE_CREATED',
+                ].map((ev) => {
+                  let selected: string[] = [];
+                  try {
+                    selected = JSON.parse(channelsCfg.notify_on_events_json || '[]');
+                  } catch {
+                    selected = [];
+                  }
+                  const checked = selected.includes(ev);
+                  return (
+                    <label
+                      key={ev}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-mono bg-[#F8FAFC] dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg cursor-pointer"
+                    >
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        onChange={() => {
+                          const next = checked ? selected.filter((x) => x !== ev) : [...selected, ev];
+                          setChannelsCfg({ ...channelsCfg, notify_on_events_json: JSON.stringify(next) });
+                        }}
+                        className="accent-[#087CEB]"
+                      />
+                      {ev}
+                    </label>
+                  );
+                })}
+              </div>
+            </div>
+          </form>
         </div>
       )}
     </div>

@@ -136,6 +136,30 @@ async function request<T>(
   }
 }
 
+export async function downloadFile(url: string, filename: string): Promise<void> {
+  const res = await fetch(url, {
+    method: 'GET',
+    headers: {
+      ...getApiActorHeaders(),
+    },
+  });
+  if (!res.ok) {
+    if (res.status === 401 && !url.startsWith('/api/auth/')) {
+      window.dispatchEvent(new CustomEvent('sevensunday:unauthorized'));
+    }
+    throw new Error(await parseErrorMessage(res));
+  }
+  const blob = await res.blob();
+  const objectUrl = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = objectUrl;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(objectUrl);
+}
+
 export const api = {
   get: <T>(url: string) => request<T>('GET', url),
   post: <T>(url: string, body?: unknown) => request<T>('POST', url, body),

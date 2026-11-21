@@ -4,6 +4,7 @@ import fs from 'fs';
 import path from 'path';
 import net from 'net';
 import crypto from 'crypto';
+import nodemailer from 'nodemailer';
 import Database from 'better-sqlite3';
 import { WebSocketServer, WebSocket } from 'ws';
 import { createServer as createViteServer } from 'vite';
@@ -15,6 +16,66 @@ const DATA_DIR = path.resolve(process.cwd(), 'data');
 if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 }
+const BACKUP_DIR = path.join(DATA_DIR, 'backups');
+if (!fs.existsSync(BACKUP_DIR)) {
+  fs.mkdirSync(BACKUP_DIR, { recursive: true });
+}
+
+function loadOrCreateMasterKey(): Buffer {
+  const envKey = String(process.env.APP_ENCRYPTION_KEY || '').trim();
+  if (envKey) {
+    return crypto.createHash('sha256').update(envKey).digest();
+  }
+  const keyFile = path.join(DATA_DIR, '.master.key');
+  try {
+    if (fs.existsSync(keyFile)) {
+      const hex = fs.readFileSync(keyFile, 'utf8').trim();
+      if (hex.length >= 64) {
+        return Buffer.from(hex.slice(0, 64), 'hex');
+      }
+    }
+    const generated = crypto.randomBytes(32);
+    fs.writeFileSync(keyFile, generated.toString('hex'), { mode: 0o600 });
+    return generated;
+  } catch {
+    return crypto.randomBytes(32);
+  }
+}
+
+const MASTER_ENCRYPTION_KEY = loadOrCreateMasterKey();
+
+function encryptField(plain: string): string {
+  const value = String(plain || '');
+  if (!value) return '';
+  if (value.startsWith('enc:v1:')) return value;
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', MASTER_ENCRYPTION_KEY, iv);
+  const encrypted = Buffer.concat([cipher.update(value, 'utf8'), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return `enc:v1:${iv.toString('base64')}:${tag.toString('base64')}:${encrypted.toString('base64')}`;
+}
+
+function decryptField(stored: string): string {
+  const value = String(stored || '');
+  if (!value) return '';
+  if (!value.startsWith('enc:v1:')) return value;
+  try {
+    const parts = value.slice(7).split(':');
+    if (parts.length !== 3) return '';
+    const [ivB64, tagB64, dataB64] = parts;
+    const decipher = crypto.createDecipheriv(
+      'aes-256-gcm',
+      MASTER_ENCRYPTION_KEY,
+      Buffer.from(ivB64, 'base64')
+    );
+    decipher.setAuthTag(Buffer.from(tagB64, 'base64'));
+    const dec = Buffer.concat([decipher.update(Buffer.from(dataB64, 'base64')), decipher.final()]);
+    return dec.toString('utf8');
+  } catch {
+    return '';
+  }
+}
+
 const DB_PATH = path.join(DATA_DIR, 'sevensunday.db');
 const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
@@ -789,6 +850,26 @@ CREATE TABLE IF NOT EXISTS workforce_rules (
   default_shift_system TEXT NOT NULL DEFAULT '3-Shift',
   updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS biometric_auth_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id INTEGER NOT NULL DEFAULT 1,
+  device_id INTEGER,
+  device_identifier TEXT NOT NULL,
+  device_name TEXT NOT NULL DEFAULT '',
+  auth_source TEXT NOT NULL DEFAULT 'Hardware Terminal',
+  auth_method TEXT NOT NULL DEFAULT 'Fingerprint',
+  employee_code TEXT NOT NULL DEFAULT '',
+  employee_name TEXT NOT NULL DEFAULT '',
+  department TEXT NOT NULL DEFAULT '',
+  punch_type TEXT NOT NULL DEFAULT 'Check-In',
+  status TEXT NOT NULL DEFAULT 'Success',
+  failure_reason TEXT NOT NULL DEFAULT '',
+  attendance_record_id INTEGER,
+  attendance_marked INTEGER NOT NULL DEFAULT 0,
+  verified_at TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
 `);
 
 // Ensure new columns exist on older DBs safely
@@ -838,6 +919,7 @@ const TENANT_SCOPED_TABLES = [
   'payroll_records',
   'payroll_runs',
   'devices',
+  'biometric_auth_logs',
   'attendance_records',
   'shifts',
   'departments',
@@ -874,6 +956,93 @@ const TENANT_SCOPED_TABLES = [
 for (const tbl of TENANT_SCOPED_TABLES) {
   ensureColumn(tbl, 'tenant_id', 'INTEGER NOT NULL DEFAULT 1');
 }
+
+// Production Security & Notification Tables + Columns
+ensureColumn('users', 'mfa_enabled', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('users', 'mfa_secret', "TEXT NOT NULL DEFAULT ''");
+ensureColumn('users', 'failed_login_attempts', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('users', 'locked_until', 'TEXT');
+ensureColumn('users', 'password_changed_at', 'TEXT');
+ensureColumn('users', 'must_change_password', 'INTEGER NOT NULL DEFAULT 0');
+
+ensureColumn('auth_sessions', 'last_active_at', "TEXT NOT NULL DEFAULT ''");
+ensureColumn('auth_sessions', 'user_agent', "TEXT NOT NULL DEFAULT ''");
+ensureColumn('auth_sessions', 'ip_address', "TEXT NOT NULL DEFAULT ''");
+
+db.exec(`
+CREATE TABLE IF NOT EXISTS login_attempts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  email TEXT NOT NULL,
+  ip_address TEXT NOT NULL DEFAULT '',
+  user_agent TEXT NOT NULL DEFAULT '',
+  success INTEGER NOT NULL DEFAULT 0,
+  reason TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS password_reset_tokens (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  token_hash TEXT NOT NULL UNIQUE,
+  expires_at TEXT NOT NULL,
+  used_at TEXT,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS notification_channels (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id INTEGER NOT NULL UNIQUE,
+  email_enabled INTEGER NOT NULL DEFAULT 1,
+  telegram_enabled INTEGER NOT NULL DEFAULT 0,
+  telegram_bot_token TEXT NOT NULL DEFAULT '',
+  telegram_chat_id TEXT NOT NULL DEFAULT '',
+  whatsapp_webhook_url TEXT NOT NULL DEFAULT '',
+  webhook_enabled INTEGER NOT NULL DEFAULT 0,
+  notify_on_events_json TEXT NOT NULL DEFAULT '["SECURITY_LOCKOUT","USER_REGISTER","LEAVE_STATUS","PAYROLL_RUN","LOW_STOCK","APPROVAL_REQUEST","ATTENDANCE_ALERT","SALE_ORDER"]',
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS notification_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id INTEGER NOT NULL DEFAULT 1,
+  event_type TEXT NOT NULL,
+  channel TEXT NOT NULL,
+  recipient TEXT NOT NULL DEFAULT '',
+  title TEXT NOT NULL,
+  message TEXT NOT NULL,
+  severity TEXT NOT NULL DEFAULT 'info',
+  module TEXT NOT NULL DEFAULT 'approvals',
+  status TEXT NOT NULL DEFAULT 'Pending',
+  error_message TEXT NOT NULL DEFAULT '',
+  retry_count INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  delivered_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS rbac_action_permissions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id INTEGER NOT NULL DEFAULT 1,
+  role_name TEXT NOT NULL,
+  permissions_json TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(tenant_id, role_name)
+);
+CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+CREATE INDEX IF NOT EXISTS idx_users_tenant ON users(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_auth_sessions_token ON auth_sessions(token_hash);
+CREATE INDEX IF NOT EXISTS idx_auth_sessions_user ON auth_sessions(user_id);
+CREATE INDEX IF NOT EXISTS idx_employees_tenant_empid ON employees(tenant_id, employee_id);
+CREATE INDEX IF NOT EXISTS idx_attendance_tenant_date ON attendance_records(tenant_id, attendance_date);
+CREATE INDEX IF NOT EXISTS idx_biometric_logs_tenant_time ON biometric_auth_logs(tenant_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_schedules_tenant_date ON staff_schedules(tenant_id, schedule_date);
+CREATE INDEX IF NOT EXISTS idx_payroll_tenant_month ON payroll_records(tenant_id, payroll_month);
+CREATE INDEX IF NOT EXISTS idx_salary_tenant_emp ON salary_records(tenant_id, employee_id);
+CREATE INDEX IF NOT EXISTS idx_audit_tenant_id ON audit_logs(tenant_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_notif_logs_tenant ON notification_logs(tenant_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_approvals_tenant_status ON department_approvals(tenant_id, status);
+CREATE INDEX IF NOT EXISTS idx_gate_passes_tenant_status ON gate_passes(tenant_id, status);
+CREATE INDEX IF NOT EXISTS idx_materials_tenant_sku ON materials(tenant_id, sku);
+`);
 
 // ============================================================================
 // PAYROLL MATH HELPERS (ETHIOPIAN 2025 PROGRESSIVE TAX + 7% / 11% PENSION)
@@ -1045,11 +1214,11 @@ function computePayrollBreakdown(
 }
 
 // ============================================================================
-// CRYPTO & SESSION AUTH HELPERS
+// CRYPTO, PASSWORD POLICY, TOTP MFA & SESSION AUTH HELPERS
 // ============================================================================
 function hashPassword(password: string): string {
   const salt = crypto.randomBytes(16).toString('hex');
-  const hash = crypto.scryptSync(password, salt, 64).toString('hex');
+  const hash = crypto.scryptSync(password, salt, 64, { N: 16384, r: 8, p: 1 }).toString('hex');
   return `scrypt:${salt}:${hash}`;
 }
 
@@ -1059,7 +1228,7 @@ function verifyPassword(password: string, stored: string): boolean {
     const parts = stored.split(':');
     if (parts.length !== 3) return false;
     const [, salt, hashHex] = parts;
-    const derived = crypto.scryptSync(password, salt, 64);
+    const derived = crypto.scryptSync(password, salt, 64, { N: 16384, r: 8, p: 1 });
     const storedBuf = Buffer.from(hashHex, 'hex');
     if (derived.length !== storedBuf.length) return false;
     return crypto.timingSafeEqual(derived, storedBuf);
@@ -1067,20 +1236,450 @@ function verifyPassword(password: string, stored: string): boolean {
   return false;
 }
 
+function validatePasswordStrength(password: string): string | null {
+  if (!password || password.length < 8) {
+    return 'Password must be at least 8 characters long.';
+  }
+  if (!/[A-Za-z]/.test(password) || !/[0-9]/.test(password)) {
+    return 'Password must contain at least one letter and one number.';
+  }
+  return null;
+}
+
 function sha256Hex(val: string): string {
   return crypto.createHash('sha256').update(val).digest('hex');
 }
 
-function createSessionToken(userId: number, tenantId: number, authMethod: string) {
+const BASE32_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+
+function generateBase32Secret(byteLen = 20): string {
+  const bytes = crypto.randomBytes(byteLen);
+  let bits = 0;
+  let value = 0;
+  let out = '';
+  for (const byte of bytes) {
+    value = (value << 8) | byte;
+    bits += 8;
+    while (bits >= 5) {
+      out += BASE32_ALPHABET[(value >>> (bits - 5)) & 31];
+      bits -= 5;
+    }
+  }
+  if (bits > 0) {
+    out += BASE32_ALPHABET[(value << (5 - bits)) & 31];
+  }
+  return out;
+}
+
+function base32ToBuffer(base32: string): Buffer {
+  const clean = base32.toUpperCase().replace(/[^A-Z2-7]/g, '');
+  let bits = 0;
+  let value = 0;
+  const bytes: number[] = [];
+  for (const ch of clean) {
+    const idx = BASE32_ALPHABET.indexOf(ch);
+    if (idx === -1) continue;
+    value = (value << 5) | idx;
+    bits += 5;
+    if (bits >= 8) {
+      bytes.push((value >>> (bits - 8)) & 255);
+      bits -= 8;
+    }
+  }
+  return Buffer.from(bytes);
+}
+
+function computeTotpCode(secretBase32: string, stepCounter: number): string {
+  const key = base32ToBuffer(secretBase32);
+  const msg = Buffer.alloc(8);
+  const high = Math.floor(stepCounter / 0x100000000);
+  const low = stepCounter >>> 0;
+  msg.writeUInt32BE(high, 0);
+  msg.writeUInt32BE(low, 4);
+  const hmac = crypto.createHmac('sha1', key).update(msg).digest();
+  const offset = hmac[hmac.length - 1] & 0x0f;
+  const code =
+    ((hmac[offset] & 0x7f) << 24) |
+    ((hmac[offset + 1] & 0xff) << 16) |
+    ((hmac[offset + 2] & 0xff) << 8) |
+    (hmac[offset + 3] & 0xff);
+  return String(code % 1000000).padStart(6, '0');
+}
+
+function verifyTotpCode(secretBase32: string, inputCode: string): boolean {
+  const cleanCode = String(inputCode || '').replace(/\s+/g, '');
+  if (!/^\d{6}$/.test(cleanCode) || !secretBase32) return false;
+  const nowStep = Math.floor(Date.now() / 1000 / 30);
+  for (let delta = -1; delta <= 1; delta += 1) {
+    const expected = computeTotpCode(secretBase32, nowStep + delta);
+    if (crypto.timingSafeEqual(Buffer.from(cleanCode), Buffer.from(expected))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function getClientIp(req: express.Request): string {
+  const fwd = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+  return fwd || req.ip || req.socket?.remoteAddress || 'unknown';
+}
+
+function createSessionToken(
+  userId: number,
+  tenantId: number,
+  authMethod: string,
+  req?: express.Request,
+  ttlMs = 7 * 24 * 60 * 60 * 1000
+) {
   const rawToken = crypto.randomBytes(32).toString('base64url');
   const tokenHash = sha256Hex(rawToken);
   const now = new Date();
-  const expires = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000).toISOString();
+  const nowIso = now.toISOString();
+  const expires = new Date(now.getTime() + ttlMs).toISOString();
+  const ua = req ? String(req.headers['user-agent'] || '').slice(0, 240) : '';
+  const ip = req ? getClientIp(req).slice(0, 80) : '';
   db.prepare(
-    'INSERT INTO auth_sessions (token_hash, user_id, tenant_id, auth_method, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)'
-  ).run(tokenHash, userId, tenantId, authMethod, expires, now.toISOString());
+    `INSERT INTO auth_sessions (token_hash, user_id, tenant_id, auth_method, expires_at, last_active_at, user_agent, ip_address, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(tokenHash, userId, tenantId, authMethod, expires, nowIso, ua, ip, nowIso);
   const encryptedSyncKey = sha256Hex(`${tokenHash}:${userId}:${tenantId}`).slice(0, 32);
   return { token: rawToken, encryptedSyncKey };
+}
+
+function isSafeExternalHttpsUrl(rawUrl: string): boolean {
+  try {
+    const parsed = new URL(rawUrl);
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return false;
+    const host = parsed.hostname.toLowerCase();
+    if (
+      host === 'localhost' ||
+      host === '127.0.0.1' ||
+      host === '0.0.0.0' ||
+      host === '::1' ||
+      host.startsWith('10.') ||
+      host.startsWith('192.168.') ||
+      host === '169.254.169.254' ||
+      /^172\.(1[6-9]|2\d|3[0-1])\./.test(host)
+    ) {
+      return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function sendRealEmail(opts: {
+  tid: number;
+  to: string;
+  subject: string;
+  text: string;
+  html?: string;
+}): Promise<{ ok: boolean; host: string; messageId?: string; error?: string }> {
+  const settings = buildCompanySettingsForTenant(opts.tid, true) as {
+    smtp_host?: string;
+    smtp_port?: number;
+    smtp_user?: string;
+    smtp_pass?: string;
+    smtp_from?: string;
+    smtp_secure?: number;
+  };
+  const host = String(process.env.SMTP_HOST || settings?.smtp_host || '').trim();
+  const port = Number(process.env.SMTP_PORT || settings?.smtp_port || 587) || 587;
+  const user = String(process.env.SMTP_USER || settings?.smtp_user || '').trim();
+  const pass = String(process.env.SMTP_PASS || settings?.smtp_pass || '').trim();
+  const from = String(process.env.SMTP_FROM || settings?.smtp_from || user || 'noreply@sevensundayethiopia.com').trim();
+  const secure = process.env.SMTP_SECURE ? process.env.SMTP_SECURE === 'true' : Boolean(settings?.smtp_secure);
+
+  if (!host || !user || !pass) {
+    return {
+      ok: false,
+      host: host || 'unconfigured',
+      error:
+        'SMTP credentials are not configured (host, username, and password required in Admin → SMTP or server environment).',
+    };
+  }
+
+  try {
+    const transporter = nodemailer.createTransport({
+      host,
+      port,
+      secure: secure || port === 465,
+      auth: { user, pass },
+      connectionTimeout: 8000,
+      greetingTimeout: 8000,
+      socketTimeout: 10000,
+    });
+    const info = await transporter.sendMail({
+      from,
+      to: opts.to,
+      subject: opts.subject,
+      text: opts.text,
+      html: opts.html,
+    });
+    return { ok: true, host, messageId: info.messageId };
+  } catch (err) {
+    return {
+      ok: false,
+      host,
+      error: err instanceof Error ? err.message : 'SMTP delivery failed',
+    };
+  }
+}
+
+async function sendTelegramBotMessage(botToken: string, chatId: string, text: string): Promise<{ ok: boolean; error?: string }> {
+  const token = String(botToken || process.env.TELEGRAM_BOT_TOKEN || '').trim();
+  const chat = String(chatId || process.env.TELEGRAM_CHAT_ID || '').trim();
+  if (!token || !chat) {
+    return { ok: false, error: 'Telegram Bot Token or Chat ID is not configured.' };
+  }
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${encodeURIComponent(token)}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chat, text }),
+      signal: AbortSignal.timeout(8000),
+    });
+    const body = (await res.json().catch(() => ({}))) as { ok?: boolean; description?: string };
+    if (!res.ok || !body.ok) {
+      return { ok: false, error: body.description || `Telegram API HTTP ${res.status}` };
+    }
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Telegram request failed' };
+  }
+}
+
+async function sendWebhookAlert(webhookUrl: string, payload: Record<string, unknown>): Promise<{ ok: boolean; error?: string }> {
+  if (!isSafeExternalHttpsUrl(webhookUrl)) {
+    return { ok: false, error: 'Webhook URL must be a valid public HTTPS/HTTP endpoint.' };
+  }
+  try {
+    const res = await fetch(webhookUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok) {
+      return { ok: false, error: `Webhook returned HTTP ${res.status}` };
+    }
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Webhook delivery failed' };
+  }
+}
+
+function getNotificationChannelConfig(tid: number) {
+  let row = db.prepare('SELECT * FROM notification_channels WHERE tenant_id = ?').get(tid) as
+    | Record<string, unknown>
+    | undefined;
+  if (!row) {
+    const now = new Date().toISOString();
+    db.prepare(
+      `INSERT OR IGNORE INTO notification_channels (tenant_id, email_enabled, telegram_enabled, webhook_enabled, updated_at)
+       VALUES (?, 1, 0, 0, ?)`
+    ).run(tid, now);
+    row = db.prepare('SELECT * FROM notification_channels WHERE tenant_id = ?').get(tid) as Record<string, unknown>;
+  }
+  return row;
+}
+
+async function dispatchNotification(
+  tid: number,
+  opts: {
+    event_type: string;
+    title: string;
+    message: string;
+    severity?: 'info' | 'warning' | 'critical';
+    module?: string;
+    recipientEmail?: string;
+  }
+) {
+  const now = new Date().toISOString();
+  const severity = opts.severity || 'info';
+  const moduleName = opts.module || 'approvals';
+
+  // 1. In-App persistent notification log (always delivered immediately)
+  const ins = db.prepare(`
+    INSERT INTO notification_logs (
+      tenant_id, event_type, channel, recipient, title, message, severity, module, status, error_message, retry_count, created_at, delivered_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+  `);
+  const inAppInfo = ins.run(
+    tid,
+    opts.event_type,
+    'In-App',
+    opts.recipientEmail || 'Workspace Feed',
+    opts.title,
+    opts.message,
+    severity,
+    moduleName,
+    'Delivered',
+    '',
+    now,
+    now
+  );
+  broadcastWs('notification:new', {
+    id: Number(inAppInfo.lastInsertRowid),
+    tenant_id: tid,
+    title: opts.title,
+    message: opts.message,
+    severity,
+    module: moduleName,
+    created_at: now,
+  });
+
+  const cfg = getNotificationChannelConfig(tid);
+  let enabledEvents: string[] = [];
+  try {
+    const parsed = JSON.parse(String(cfg.notify_on_events_json || '[]'));
+    if (Array.isArray(parsed)) enabledEvents = parsed;
+  } catch {
+    enabledEvents = [];
+  }
+  if (enabledEvents.length > 0 && !enabledEvents.includes(opts.event_type)) {
+    return;
+  }
+
+  // 2. Email delivery if enabled and recipient present
+  if (Number(cfg.email_enabled) === 1 && opts.recipientEmail) {
+    const logInfo = ins.run(
+      tid,
+      opts.event_type,
+      'Email',
+      opts.recipientEmail,
+      opts.title,
+      opts.message,
+      severity,
+      moduleName,
+      'Pending',
+      '',
+      now,
+      null
+    );
+    const logId = Number(logInfo.lastInsertRowid);
+    const emailRes = await sendRealEmail({
+      tid,
+      to: opts.recipientEmail,
+      subject: `[Seven Sunday ETMS] ${opts.title}`,
+      text: `${opts.title}\n\n${opts.message}\n\nEvent: ${opts.event_type}\nTimestamp: ${now}`,
+    });
+    if (emailRes.ok) {
+      db.prepare("UPDATE notification_logs SET status = 'Delivered', delivered_at = ? WHERE id = ?").run(
+        new Date().toISOString(),
+        logId
+      );
+    } else {
+      db.prepare("UPDATE notification_logs SET status = 'Failed', error_message = ? WHERE id = ?").run(
+        emailRes.error || 'SMTP delivery failed',
+        logId
+      );
+    }
+  }
+
+  // 3. Telegram channel if enabled
+  const tgToken = decryptField(String(cfg.telegram_bot_token || ''));
+  const tgChat = String(cfg.telegram_chat_id || '').trim();
+  if (Number(cfg.telegram_enabled) === 1 && (tgToken || process.env.TELEGRAM_BOT_TOKEN)) {
+    const logInfo = ins.run(
+      tid,
+      opts.event_type,
+      'Telegram',
+      tgChat || 'env:TELEGRAM_CHAT_ID',
+      opts.title,
+      opts.message,
+      severity,
+      moduleName,
+      'Pending',
+      '',
+      now,
+      null
+    );
+    const logId = Number(logInfo.lastInsertRowid);
+    const tgRes = await sendTelegramBotMessage(tgToken, tgChat, `[${severity.toUpperCase()}] ${opts.title}\n${opts.message}`);
+    if (tgRes.ok) {
+      db.prepare("UPDATE notification_logs SET status = 'Delivered', delivered_at = ? WHERE id = ?").run(
+        new Date().toISOString(),
+        logId
+      );
+    } else {
+      db.prepare("UPDATE notification_logs SET status = 'Failed', error_message = ? WHERE id = ?").run(
+        tgRes.error || 'Telegram send failed',
+        logId
+      );
+    }
+  }
+
+  // 4. WhatsApp / Webhook channel if enabled
+  const whUrl = String(cfg.whatsapp_webhook_url || '').trim();
+  if (Number(cfg.webhook_enabled) === 1 && whUrl) {
+    const logInfo = ins.run(
+      tid,
+      opts.event_type,
+      'Webhook',
+      whUrl,
+      opts.title,
+      opts.message,
+      severity,
+      moduleName,
+      'Pending',
+      '',
+      now,
+      null
+    );
+    const logId = Number(logInfo.lastInsertRowid);
+    const whRes = await sendWebhookAlert(whUrl, {
+      tenant_id: tid,
+      event_type: opts.event_type,
+      title: opts.title,
+      message: opts.message,
+      severity,
+      module: moduleName,
+      created_at: now,
+    });
+    if (whRes.ok) {
+      db.prepare("UPDATE notification_logs SET status = 'Delivered', delivered_at = ? WHERE id = ?").run(
+        new Date().toISOString(),
+        logId
+      );
+    } else {
+      db.prepare("UPDATE notification_logs SET status = 'Failed', error_message = ? WHERE id = ?").run(
+        whRes.error || 'Webhook failed',
+        logId
+      );
+    }
+  }
+}
+
+async function createDatabaseBackup(kind: 'auto' | 'manual' = 'manual') {
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const filename = `sevensunday-${kind}-${stamp}.db`;
+  const targetPath = path.join(BACKUP_DIR, filename);
+  await db.backup(targetPath);
+
+  // Retain latest 15 backups
+  const files = fs
+    .readdirSync(BACKUP_DIR)
+    .filter((f) => f.endsWith('.db'))
+    .map((f) => ({ f, mtime: fs.statSync(path.join(BACKUP_DIR, f)).mtimeMs }))
+    .sort((a, b) => b.mtime - a.mtime);
+  if (files.length > 15) {
+    for (const old of files.slice(15)) {
+      try {
+        fs.unlinkSync(path.join(BACKUP_DIR, old.f));
+      } catch {
+        // ignore prune error
+      }
+    }
+  }
+  const stat = fs.statSync(targetPath);
+  return {
+    filename,
+    size_bytes: stat.size,
+    created_at: new Date(stat.mtimeMs).toISOString(),
+    kind,
+  };
 }
 
 // ============================================================================
@@ -1387,7 +1986,36 @@ seedIfEmpty();
 // EXPRESS + WEBSOCKET SERVER
 // ============================================================================
 const app = express();
+app.set('trust proxy', 1);
+app.disable('x-powered-by');
 app.use(express.json({ limit: '25mb' }));
+
+// Global Security Headers
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  res.setHeader('Permissions-Policy', 'geolocation=(), microphone=(), camera=(self)');
+  if (IS_PROD && (req.secure || req.headers['x-forwarded-proto'] === 'https')) {
+    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  }
+  next();
+});
+
+// In-Memory Sliding Window Rate Limiter
+const rateLimitBuckets = new Map<string, number[]>();
+function checkRateLimit(key: string, maxReq: number, windowMs: number): boolean {
+  const now = Date.now();
+  const cutoff = now - windowMs;
+  const arr = (rateLimitBuckets.get(key) || []).filter((ts) => ts > cutoff);
+  if (arr.length >= maxReq) {
+    rateLimitBuckets.set(key, arr);
+    return false;
+  }
+  arr.push(now);
+  rateLimitBuckets.set(key, arr);
+  return true;
+}
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws' });
@@ -1420,19 +2048,22 @@ function getTenantId(req: express.Request): number {
 
 function logAudit(req: express.Request, action: string, module: string, summary: string, explicitTenantId?: number) {
   const tid = explicitTenantId ?? getTenantId(req);
-  const actorName = String(req.headers['x-actor-name'] || 'System Operator');
-  const actorRole = String(req.headers['x-actor-role'] || 'Super Administrator');
+  const authed = (req as AuthedRequest).authUser;
+  const actorName = authed ? authed.full_name : String(req.headers['x-actor-name'] || 'System Operator');
+  const actorRole = authed ? authed.role : String(req.headers['x-actor-role'] || 'Employee');
   db.prepare(
     'INSERT INTO audit_logs (tenant_id, actor_name, actor_role, action, module, summary, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
   ).run(tid, actorName, actorRole, action, module, summary, new Date().toISOString());
 }
 
 function getActorName(req: express.Request): string {
-  return String(req.headers['x-actor-name'] || 'System Operator');
+  const authed = (req as AuthedRequest).authUser;
+  return authed ? authed.full_name : String(req.headers['x-actor-name'] || 'System Operator');
 }
 
 function getActorRole(req: express.Request): string {
-  return String(req.headers['x-actor-role'] || '');
+  const authed = (req as AuthedRequest).authUser;
+  return authed ? authed.role : String(req.headers['x-actor-role'] || '');
 }
 
 const ATTENDANCE_MANAGER_ROLES = new Set([
@@ -1457,15 +2088,71 @@ const SHIFT_DEPT_ADMIN_ROLES = new Set([
   'Department Manager',
 ]);
 
+const USER_ADMIN_ROLES = new Set(['System Administrator', 'Super Administrator', 'Company Owner', 'General Manager']);
+
+const SALARY_MANAGER_ROLES = new Set([
+  'System Administrator',
+  'Super Administrator',
+  'Company Owner',
+  'General Manager',
+  'Human Resource Manager',
+  'Finance Manager',
+  'Accountant',
+]);
+
+const FINANCE_ROLES = new Set([
+  'System Administrator',
+  'Super Administrator',
+  'Company Owner',
+  'General Manager',
+  'Finance Manager',
+  'Accountant',
+  'Auditor',
+]);
+
 function requireRole(req: express.Request, res: express.Response, allowed: Set<string>, actionDesc: string): boolean {
   const role = getActorRole(req);
-  // If internal or missing header in non-user background scripts, treat gracefully only if explicit role wasn't blocked;
-  // Wait: if header is present and not allowed, block with 403!
-  if (role && !allowed.has(role)) {
-    res.status(403).json({ error: `Permission denied (${role}) for ${actionDesc}.` });
+  if (!role || !allowed.has(role)) {
+    res.status(403).json({ error: `Permission denied (${role || 'Unauthenticated'}) for ${actionDesc}.` });
     return false;
   }
   return true;
+}
+
+const DEFAULT_ACTION_PERMISSIONS: Record<string, { view: boolean; create: boolean; edit: boolean; delete: boolean; approve: boolean; export: boolean; manage: boolean }> = {
+  'System Administrator': { view: true, create: true, edit: true, delete: true, approve: true, export: true, manage: true },
+  'Super Administrator': { view: true, create: true, edit: true, delete: true, approve: true, export: true, manage: true },
+  'Company Owner': { view: true, create: true, edit: true, delete: true, approve: true, export: true, manage: true },
+  'General Manager': { view: true, create: true, edit: true, delete: true, approve: true, export: true, manage: true },
+  'Human Resource Manager': { view: true, create: true, edit: true, delete: false, approve: true, export: true, manage: false },
+  'Department Manager': { view: true, create: true, edit: true, delete: false, approve: true, export: true, manage: false },
+  'Finance Manager': { view: true, create: true, edit: true, delete: false, approve: true, export: true, manage: false },
+  Accountant: { view: true, create: true, edit: true, delete: false, approve: false, export: true, manage: false },
+  'Inventory Manager': { view: true, create: true, edit: true, delete: false, approve: true, export: true, manage: false },
+  'Warehouse Manager': { view: true, create: true, edit: true, delete: false, approve: true, export: true, manage: false },
+  'Procurement Officer': { view: true, create: true, edit: true, delete: false, approve: false, export: true, manage: false },
+  'Sales Manager': { view: true, create: true, edit: true, delete: false, approve: true, export: true, manage: false },
+  'Attendance Officer': { view: true, create: true, edit: true, delete: false, approve: false, export: true, manage: false },
+  'Security Supervisor': { view: true, create: true, edit: true, delete: false, approve: true, export: true, manage: false },
+  'Security Guard': { view: true, create: true, edit: false, delete: false, approve: false, export: false, manage: false },
+  Auditor: { view: true, create: false, edit: false, delete: false, approve: false, export: true, manage: false },
+  Employee: { view: true, create: true, edit: false, delete: false, approve: false, export: false, manage: false },
+  Viewer: { view: true, create: false, edit: false, delete: false, approve: false, export: false, manage: false },
+};
+
+function getRoleActionPerms(tid: number, role: string) {
+  const row = db
+    .prepare('SELECT permissions_json FROM rbac_action_permissions WHERE tenant_id = ? AND role_name = ?')
+    .get(tid, role) as { permissions_json?: string } | undefined;
+  if (row?.permissions_json) {
+    try {
+      const parsed = JSON.parse(row.permissions_json);
+      return { ...(DEFAULT_ACTION_PERMISSIONS[role] || DEFAULT_ACTION_PERMISSIONS.Employee), ...parsed };
+    } catch {
+      // fallback
+    }
+  }
+  return DEFAULT_ACTION_PERMISSIONS[role] || DEFAULT_ACTION_PERMISSIONS.Employee;
 }
 
 function provisionTenantDefaults(tenantId: number, brandName: string) {
@@ -1492,44 +2179,54 @@ function provisionTenantDefaults(tenantId: number, brandName: string) {
   seedWorkforceDefaultsForTenant(tenantId);
 }
 
-function buildCompanySettingsForTenant(tenantId: number) {
+function buildCompanySettingsForTenant(tenantId: number, includeSecrets = false) {
   const base = db.prepare('SELECT * FROM company_settings WHERE id = 1').get() as Record<string, unknown>;
+  let merged: Record<string, unknown>;
   if (tenantId === 1) {
-    return { ...base, tenant_id: 1 };
+    merged = { ...base, tenant_id: 1 };
+  } else {
+    const t = db.prepare('SELECT * FROM tenants WHERE id = ?').get(tenantId) as Record<string, unknown> | undefined;
+    if (!t) {
+      merged = { ...base, tenant_id: 1 };
+    } else {
+      merged = {
+        ...base,
+        id: 1,
+        tenant_id: Number(t.id),
+        company_name: t.name,
+        brand_name: t.brand_name,
+        slogan: t.slogan,
+        secondary_slogan: t.secondary_slogan,
+        address: t.address,
+        phone: t.phone,
+        email: t.email,
+        website: t.website,
+        tin_number: t.tin_number,
+        default_currency: t.default_currency,
+        calendar_mode: t.calendar_mode,
+        default_language: t.default_language,
+        branches: t.branches,
+        departments: t.departments,
+        logo_data: t.logo_data || base.logo_data || '',
+        stamp_data: t.stamp_data || base.stamp_data || '',
+        signature_data: t.signature_data || base.signature_data || '',
+        smtp_host: t.smtp_host || base.smtp_host,
+        smtp_port: t.smtp_port || base.smtp_port,
+        smtp_user: t.smtp_user || base.smtp_user,
+        smtp_pass: t.smtp_pass || base.smtp_pass,
+        smtp_from: t.smtp_from || base.smtp_from,
+        smtp_secure: t.smtp_secure ?? base.smtp_secure,
+        rbac_matrix: t.rbac_matrix && String(t.rbac_matrix) !== '{}' ? t.rbac_matrix : base.rbac_matrix,
+        platform_config: t.platform_config && String(t.platform_config) !== '{}' ? t.platform_config : base.platform_config || '{}',
+        updated_at: t.updated_at,
+      };
+    }
   }
-  const t = db.prepare('SELECT * FROM tenants WHERE id = ?').get(tenantId) as Record<string, unknown> | undefined;
-  if (!t) return { ...base, tenant_id: 1 };
-  return {
-    ...base,
-    id: 1,
-    tenant_id: Number(t.id),
-    company_name: t.name,
-    brand_name: t.brand_name,
-    slogan: t.slogan,
-    secondary_slogan: t.secondary_slogan,
-    address: t.address,
-    phone: t.phone,
-    email: t.email,
-    website: t.website,
-    tin_number: t.tin_number,
-    default_currency: t.default_currency,
-    calendar_mode: t.calendar_mode,
-    default_language: t.default_language,
-    branches: t.branches,
-    departments: t.departments,
-    logo_data: t.logo_data || base.logo_data || '',
-    stamp_data: t.stamp_data || base.stamp_data || '',
-    signature_data: t.signature_data || base.signature_data || '',
-    smtp_host: t.smtp_host || base.smtp_host,
-    smtp_port: t.smtp_port || base.smtp_port,
-    smtp_user: t.smtp_user || base.smtp_user,
-    smtp_pass: t.smtp_pass || base.smtp_pass,
-    smtp_from: t.smtp_from || base.smtp_from,
-    smtp_secure: t.smtp_secure ?? base.smtp_secure,
-    rbac_matrix: t.rbac_matrix && String(t.rbac_matrix) !== '{}' ? t.rbac_matrix : base.rbac_matrix,
-    platform_config: t.platform_config && String(t.platform_config) !== '{}' ? t.platform_config : base.platform_config || '{}',
-    updated_at: t.updated_at,
-  };
+  const rawSmtpPass = String(merged.smtp_pass || '');
+  if (includeSecrets) {
+    return { ...merged, smtp_pass: decryptField(rawSmtpPass) };
+  }
+  return { ...merged, smtp_pass: rawSmtpPass ? '********' : '' };
 }
 
 interface AuthenticatedUser {
@@ -1542,10 +2239,12 @@ interface AuthenticatedUser {
   job_title: string;
   role: string;
   status: string;
+  mfa_enabled?: number;
 }
 
 interface AuthedRequest extends express.Request {
   authUser?: AuthenticatedUser;
+  authSessionId?: number;
 }
 
 const PUBLIC_API_EXEMPT = new Set([
@@ -1553,12 +2252,50 @@ const PUBLIC_API_EXEMPT = new Set([
   '/api/auth/login',
   '/api/auth/register',
   '/api/auth/google',
+  '/api/auth/mfa/verify-login',
+  '/api/auth/password-reset/request',
+  '/api/auth/password-reset/confirm',
   '/api/auth/bootstrap-status',
   '/api/auth/biometric/challenge',
   '/api/auth/biometric/verify',
+  '/api/iclock/cdata',
 ]);
 
 app.use('/api', (req: AuthedRequest, res, next) => {
+  const fullPath = req.baseUrl + req.path;
+  const ip = getClientIp(req);
+
+  if (fullPath !== '/api/health') {
+    if (fullPath.startsWith('/api/auth/login') || fullPath.startsWith('/api/auth/register') || fullPath.startsWith('/api/auth/password-reset/') || fullPath.startsWith('/api/auth/mfa/verify-login')) {
+      if (!checkRateLimit(`auth:${ip}`, 35, 15 * 60 * 1000)) {
+        res.status(429).json({ error: 'Too many authentication attempts. Please wait 15 minutes and try again.' });
+        return;
+      }
+    } else if (!checkRateLimit(`api:${ip}`, 500, 60 * 1000)) {
+      res.status(429).json({ error: 'Rate limit exceeded. Please slow down requests.' });
+      return;
+    }
+  }
+
+  // Origin / CSRF validation for browser state-changing requests
+  if (
+    ['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method) &&
+    fullPath !== '/api/iclock/cdata' &&
+    req.headers.origin
+  ) {
+    try {
+      const originHost = new URL(String(req.headers.origin)).host;
+      const expectedHost = String(req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0].trim();
+      if (expectedHost && originHost !== expectedHost) {
+        res.status(403).json({ error: 'Cross-origin request rejected.' });
+        return;
+      }
+    } catch {
+      res.status(403).json({ error: 'Invalid request origin.' });
+      return;
+    }
+  }
+
   const authHeader = String(req.headers.authorization || '');
   if (authHeader.startsWith('Bearer ')) {
     const rawToken = authHeader.slice(7).trim();
@@ -1566,13 +2303,21 @@ app.use('/api', (req: AuthedRequest, res, next) => {
       const tokenHash = sha256Hex(rawToken);
       const row = db
         .prepare(
-          `SELECT s.user_id, s.expires_at, u.id, u.tenant_id, u.employee_code, u.full_name, u.email, u.department, u.job_title, u.role, u.status
+          `SELECT s.id as session_id, s.user_id, s.auth_method, s.expires_at, s.last_active_at,
+                  u.id, u.tenant_id, u.employee_code, u.full_name, u.email, u.department, u.job_title, u.role, u.status, u.mfa_enabled
            FROM auth_sessions s
            JOIN users u ON u.id = s.user_id
            WHERE s.token_hash = ?`
         )
-        .get(tokenHash) as (AuthenticatedUser & { expires_at: string }) | undefined;
-      if (row && new Date(row.expires_at).getTime() > Date.now() && row.status !== 'Suspended') {
+        .get(tokenHash) as
+        | (AuthenticatedUser & { session_id: number; auth_method: string; expires_at: string; last_active_at?: string })
+        | undefined;
+      if (
+        row &&
+        row.auth_method !== 'mfa_pending' &&
+        new Date(row.expires_at).getTime() > Date.now() &&
+        row.status !== 'Suspended'
+      ) {
         req.authUser = {
           id: row.id,
           tenant_id: row.tenant_id,
@@ -1583,14 +2328,19 @@ app.use('/api', (req: AuthedRequest, res, next) => {
           job_title: row.job_title,
           role: row.role,
           status: row.status,
+          mfa_enabled: row.mfa_enabled,
         };
+        req.authSessionId = row.session_id;
         req.headers['x-actor-name'] = row.full_name;
         req.headers['x-actor-role'] = row.role;
+        const lastMs = row.last_active_at ? new Date(row.last_active_at).getTime() : 0;
+        if (Date.now() - lastMs > 60_000) {
+          db.prepare('UPDATE auth_sessions SET last_active_at = ? WHERE id = ?').run(new Date().toISOString(), row.session_id);
+        }
       }
     }
   }
 
-  const fullPath = req.baseUrl + req.path;
   if (
     PUBLIC_API_EXEMPT.has(fullPath) ||
     (req.method === 'GET' && (fullPath === '/api/company-settings' || fullPath === '/api/tenants'))
@@ -1602,6 +2352,67 @@ app.use('/api', (req: AuthedRequest, res, next) => {
   if (!req.authUser) {
     res.status(401).json({ error: 'Authentication required. Please sign in to access this workspace.' });
     return;
+  }
+
+  // Centralized Server-Side RBAC Enforcement
+  const role = req.authUser.role;
+  const tid = getTenantId(req);
+  const isGlobalAdmin = USER_ADMIN_ROLES.has(role);
+
+  if (fullPath.startsWith('/api/admin/') || fullPath.startsWith('/api/backup/') || fullPath.startsWith('/api/rbac/')) {
+    if (!isGlobalAdmin) {
+      res.status(403).json({ error: `Permission denied (${role}) for system administration or backup controls.` });
+      return;
+    }
+  } else if (
+    (fullPath === '/api/company-settings' && req.method === 'PUT') ||
+    (fullPath.startsWith('/api/tenants') && req.method !== 'GET') ||
+    (fullPath === '/api/notifications/channels' && req.method === 'PUT')
+  ) {
+    if (!isGlobalAdmin) {
+      res.status(403).json({ error: `Permission denied (${role}) for modifying company or tenant governance.` });
+      return;
+    }
+  } else if (fullPath.startsWith('/api/users')) {
+    if (!isGlobalAdmin) {
+      res.status(403).json({ error: `Permission denied (${role}) for user account management.` });
+      return;
+    }
+  } else if (
+    fullPath.startsWith('/api/payroll') ||
+    fullPath.startsWith('/api/ot-settings') ||
+    fullPath.startsWith('/api/salary')
+  ) {
+    const allowedPayrollView = new Set([...SALARY_MANAGER_ROLES, 'Auditor']);
+    if (req.method === 'GET') {
+      if (!allowedPayrollView.has(role)) {
+        res.status(403).json({ error: `Permission denied (${role}) to access payroll or salary data.` });
+        return;
+      }
+    } else if (!SALARY_MANAGER_ROLES.has(role)) {
+      res.status(403).json({ error: `Permission denied (${role}) to modify payroll or salary data.` });
+      return;
+    }
+  } else if (
+    fullPath.startsWith('/api/accounts') ||
+    fullPath.startsWith('/api/journal-entries') ||
+    fullPath.startsWith('/api/finance-')
+  ) {
+    if (req.method === 'GET') {
+      if (!FINANCE_ROLES.has(role)) {
+        res.status(403).json({ error: `Permission denied (${role}) to view financial ledgers.` });
+        return;
+      }
+    } else if (!FINANCE_ROLES.has(role) || role === 'Auditor') {
+      res.status(403).json({ error: `Permission denied (${role}) to post financial transactions.` });
+      return;
+    }
+  } else if (req.method === 'DELETE' && !fullPath.startsWith('/api/auth/')) {
+    const perms = getRoleActionPerms(tid, role);
+    if (!perms.delete) {
+      res.status(403).json({ error: `Delete permission denied for role "${role}".` });
+      return;
+    }
   }
 
   next();
@@ -1620,6 +2431,7 @@ app.get('/api/auth/bootstrap-status', (_req, res) => {
     hasUsers: userCount > 0,
     userCount,
     hasBiometrics: biometricCount > 0,
+    googleConfigured: Boolean(process.env.GOOGLE_CLIENT_ID),
   });
 });
 
@@ -1640,8 +2452,9 @@ app.post('/api/auth/register', (req, res) => {
     res.status(400).json({ error: 'Please provide a valid corporate email address.' });
     return;
   }
-  if (password.length < 6) {
-    res.status(400).json({ error: 'Password must be at least 6 characters.' });
+  const pwErr = validatePasswordStrength(password);
+  if (pwErr) {
+    res.status(400).json({ error: pwErr });
     return;
   }
 
@@ -1665,19 +2478,26 @@ app.post('/api/auth/register', (req, res) => {
       : 'Employee';
 
   const now = new Date().toISOString();
-  const empCode = `SS-USR-${String(userCount + 1).padStart(3, '0')}`;
+  let codeNum = userCount + 1;
+  let empCode = `SS-USR-${String(codeNum).padStart(3, '0')}`;
+  while (
+    db.prepare('SELECT 1 FROM employees WHERE employee_id = ?').get(empCode) ||
+    db.prepare('SELECT 1 FROM users WHERE employee_code = ?').get(empCode)
+  ) {
+    codeNum += 1;
+    empCode = `SS-USR-${String(codeNum).padStart(3, '0')}`;
+  }
   const hashedPw = hashPassword(password);
 
   const tx = db.transaction(() => {
     const info = db
       .prepare(
-        `INSERT INTO users (tenant_id, employee_code, full_name, email, password, department, job_title, role, status, last_login, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Active', ?, ?)`
+        `INSERT INTO users (tenant_id, employee_code, full_name, email, password, department, job_title, role, status, last_login, password_changed_at, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Active', ?, ?, ?)`
       )
-      .run(effectiveTid, empCode, fullName, email, hashedPw, department, jobTitle, assignedRole, now, now);
+      .run(effectiveTid, empCode, fullName, email, hashedPw, department, jobTitle, assignedRole, now, now, now);
     const newId = Number(info.lastInsertRowid);
 
-    // Ensure staff member also appears in HR if registering as employee/staff
     const empExists = db.prepare('SELECT id FROM employees WHERE lower(email) = lower(?) AND tenant_id = ?').get(email, effectiveTid);
     if (!empExists) {
       db.prepare(
@@ -1697,9 +2517,19 @@ app.post('/api/auth/register', (req, res) => {
 
   const userId = tx();
   const created = db
-    .prepare('SELECT id, tenant_id, employee_code, full_name, email, department, job_title, role, status, last_login, created_at FROM users WHERE id = ?')
+    .prepare('SELECT id, tenant_id, employee_code, full_name, email, department, job_title, role, status, mfa_enabled, last_login, created_at FROM users WHERE id = ?')
     .get(userId) as Record<string, unknown>;
-  const { token, encryptedSyncKey } = createSessionToken(userId, effectiveTid, 'register');
+  const { token, encryptedSyncKey } = createSessionToken(userId, effectiveTid, 'register', req);
+
+  void dispatchNotification(effectiveTid, {
+    event_type: 'USER_REGISTER',
+    title: `New Corporate Account: ${fullName}`,
+    message: `${email} joined ${department} (${assignedRole}).`,
+    severity: 'info',
+    module: 'admin',
+    recipientEmail: email,
+  });
+
   res.status(201).json({
     user: created,
     token,
@@ -1711,24 +2541,82 @@ app.post('/api/auth/register', (req, res) => {
 app.post('/api/auth/login', (req, res) => {
   const { email, password, tenant_id } = req.body || {};
   const cleanEmail = String(email || '').trim().toLowerCase();
+  const ip = getClientIp(req);
+  const ua = String(req.headers['user-agent'] || '').slice(0, 240);
+  const now = new Date().toISOString();
+
   const user = db.prepare('SELECT * FROM users WHERE lower(email) = lower(?)').get(cleanEmail) as
     | (Record<string, unknown> & {
         password?: string;
         status?: string;
         id: number;
         full_name: string;
+        email: string;
         role: string;
         tenant_id?: number;
+        mfa_enabled?: number;
+        failed_login_attempts?: number;
+        locked_until?: string | null;
       })
     | undefined;
+
+  if (user?.locked_until && new Date(user.locked_until).getTime() > Date.now()) {
+    db.prepare('INSERT INTO login_attempts (email, ip_address, user_agent, success, reason, created_at) VALUES (?, ?, ?, 0, ?, ?)').run(
+      cleanEmail,
+      ip,
+      ua,
+      'Account locked',
+      now
+    );
+    const unlockAt = new Date(user.locked_until).toLocaleTimeString();
+    res.status(423).json({
+      error: `Account temporarily locked after repeated failed login attempts. Try again after ${unlockAt} or contact System Administrator.`,
+    });
+    return;
+  }
+
   if (!user || !verifyPassword(String(password || ''), String(user.password || ''))) {
+    db.prepare('INSERT INTO login_attempts (email, ip_address, user_agent, success, reason, created_at) VALUES (?, ?, ?, 0, ?, ?)').run(
+      cleanEmail,
+      ip,
+      ua,
+      'Invalid credentials',
+      now
+    );
+    if (user) {
+      const nextFails = (Number(user.failed_login_attempts) || 0) + 1;
+      const shouldLock = nextFails >= 5;
+      const lockUntil = shouldLock ? new Date(Date.now() + 15 * 60 * 1000).toISOString() : null;
+      db.prepare('UPDATE users SET failed_login_attempts = ?, locked_until = ? WHERE id = ?').run(
+        nextFails,
+        lockUntil,
+        user.id
+      );
+      if (shouldLock) {
+        db.prepare(
+          'INSERT INTO audit_logs (tenant_id, actor_name, actor_role, action, module, summary, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+        ).run(user.tenant_id || 1, user.full_name, user.role, 'ACCOUNT_LOCKED', 'Security', `Locked account ${cleanEmail} after 5 failed sign-in attempts (${ip})`, now);
+        void dispatchNotification(user.tenant_id || 1, {
+          event_type: 'SECURITY_LOCKOUT',
+          title: `Security Lockout: ${user.email}`,
+          message: `Account locked for 15 minutes after 5 failed login attempts from ${ip}.`,
+          severity: 'critical',
+          module: 'audit',
+          recipientEmail: user.email,
+        });
+        res.status(423).json({ error: 'Account locked for 15 minutes due to 5 consecutive failed password attempts.' });
+        return;
+      }
+    }
     res.status(401).json({ error: 'Invalid corporate email or password.' });
     return;
   }
+
   if (user.status === 'Suspended') {
     res.status(403).json({ error: 'Account is suspended. Contact System Administrator.' });
     return;
   }
+
   const requestedTid = Number(tenant_id || req.headers['x-tenant-id'] || user.tenant_id || 1);
   const targetTenant = db.prepare('SELECT id, status, brand_name FROM tenants WHERE id = ?').get(requestedTid) as
     | { id: number; status: string; brand_name: string }
@@ -1743,13 +2631,33 @@ app.post('/api/auth/login', (req, res) => {
     res.status(403).json({ error: `Tenant workspace "${targetTenant.brand_name}" is currently suspended.` });
     return;
   }
-  const now = new Date().toISOString();
+
+  db.prepare('UPDATE users SET failed_login_attempts = 0, locked_until = NULL WHERE id = ?').run(user.id);
+  db.prepare('INSERT INTO login_attempts (email, ip_address, user_agent, success, reason, created_at) VALUES (?, ?, ?, 1, ?, ?)').run(
+    cleanEmail,
+    ip,
+    ua,
+    user.mfa_enabled ? 'Password OK (MFA Pending)' : 'Authenticated',
+    now
+  );
+
+  // If MFA is enabled, issue short-lived 5-minute MFA challenge token instead of full session
+  if (Number(user.mfa_enabled) === 1) {
+    const { token: mfaChallenge } = createSessionToken(user.id, effectiveTid, 'mfa_pending', req, 5 * 60 * 1000);
+    res.json({
+      mfa_required: true,
+      mfa_challenge_token: mfaChallenge,
+      email: user.email,
+    });
+    return;
+  }
+
   db.prepare('UPDATE users SET last_login = ? WHERE id = ?').run(now, user.id);
   db.prepare(
     'INSERT INTO audit_logs (tenant_id, actor_name, actor_role, action, module, summary, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
   ).run(effectiveTid, user.full_name, user.role, 'LOGIN', 'Auth', `Signed in via Corporate Email (${user.role})`, now);
-  const { password: _pw, ...safe } = user;
-  const { token, encryptedSyncKey } = createSessionToken(user.id, effectiveTid, 'password');
+  const { password: _pw, mfa_secret: _ms, ...safe } = user;
+  const { token, encryptedSyncKey } = createSessionToken(user.id, effectiveTid, 'password', req);
   res.json({
     user: { ...safe, tenant_id: effectiveTid, last_login: now },
     token,
@@ -1758,103 +2666,372 @@ app.post('/api/auth/login', (req, res) => {
   });
 });
 
-app.post('/api/auth/google', (req, res) => {
-  const b = req.body || {};
-  const email = String(b.email || '').trim().toLowerCase();
-  const fullNameInput = String(b.full_name || '').trim();
-  const requestedTid = Number(b.tenant_id || req.headers['x-tenant-id'] || 1);
-
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-    res.status(400).json({ error: 'Please enter a valid verified corporate Google email address.' });
+app.post('/api/auth/mfa/verify-login', (req, res) => {
+  const { mfa_challenge_token, code, tenant_id } = req.body || {};
+  const rawToken = String(mfa_challenge_token || '').trim();
+  const cleanCode = String(code || '').trim();
+  if (!rawToken || !cleanCode) {
+    res.status(400).json({ error: 'MFA challenge token and 6-digit authenticator code are required.' });
+    return;
+  }
+  const tokenHash = sha256Hex(rawToken);
+  const sess = db
+    .prepare("SELECT * FROM auth_sessions WHERE token_hash = ? AND auth_method = 'mfa_pending'")
+    .get(tokenHash) as { id: number; user_id: number; tenant_id: number; expires_at: string } | undefined;
+  if (!sess || new Date(sess.expires_at).getTime() <= Date.now()) {
+    res.status(401).json({ error: 'MFA verification window expired. Please sign in again.' });
+    return;
+  }
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(sess.user_id) as
+    | (Record<string, unknown> & {
+        id: number;
+        full_name: string;
+        email: string;
+        role: string;
+        status: string;
+        mfa_secret: string;
+        tenant_id: number;
+      })
+    | undefined;
+  if (!user || user.status === 'Suspended') {
+    res.status(403).json({ error: 'Account inactive or suspended.' });
+    return;
+  }
+  const secret = decryptField(String(user.mfa_secret || ''));
+  if (!verifyTotpCode(secret, cleanCode)) {
+    res.status(401).json({ error: 'Invalid 6-digit MFA authenticator code.' });
     return;
   }
 
+  db.prepare('DELETE FROM auth_sessions WHERE id = ?').run(sess.id);
+  const effectiveTid = Number(tenant_id || sess.tenant_id || user.tenant_id || 1);
+  const now = new Date().toISOString();
+  db.prepare('UPDATE users SET last_login = ? WHERE id = ?').run(now, user.id);
+  db.prepare(
+    'INSERT INTO audit_logs (tenant_id, actor_name, actor_role, action, module, summary, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+  ).run(effectiveTid, user.full_name, user.role, 'MFA_LOGIN', 'Auth', `Verified 2FA TOTP & signed in (${user.email})`, now);
+  const { password: _pw, mfa_secret: _ms, ...safe } = user;
+  const { token, encryptedSyncKey } = createSessionToken(user.id, effectiveTid, 'mfa', req);
+  res.json({
+    user: { ...safe, tenant_id: effectiveTid, last_login: now },
+    token,
+    auth_method: 'mfa',
+    encrypted_sync_key: encryptedSyncKey,
+  });
+});
+
+app.post('/api/auth/mfa/setup', (req: AuthedRequest, res) => {
+  const user = req.authUser;
+  if (!user) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+  const secret = generateBase32Secret(20);
+  db.prepare('UPDATE users SET mfa_secret = ? WHERE id = ?').run(encryptField(secret), user.id);
+  const issuer = encodeURIComponent('Seven Sunday Ethiopia');
+  const account = encodeURIComponent(user.email);
+  const otpauth_url = `otpauth://totp/${issuer}:${account}?secret=${secret}&issuer=${issuer}&algorithm=SHA1&digits=6&period=30`;
+  res.json({ secret, otpauth_url, enabled: Boolean(user.mfa_enabled) });
+});
+
+app.post('/api/auth/mfa/enable', (req: AuthedRequest, res) => {
+  const user = req.authUser;
+  if (!user) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+  const code = String(req.body?.code || '').trim();
+  const row = db.prepare('SELECT mfa_secret FROM users WHERE id = ?').get(user.id) as { mfa_secret?: string } | undefined;
+  const secret = decryptField(String(row?.mfa_secret || ''));
+  if (!secret || !verifyTotpCode(secret, code)) {
+    res.status(400).json({ error: 'Invalid 6-digit code from your authenticator app. Scan the QR code and enter the current code.' });
+    return;
+  }
+  db.prepare('UPDATE users SET mfa_enabled = 1 WHERE id = ?').run(user.id);
+  logAudit(req, 'MFA_ENABLE', 'Security', `Enabled 2FA TOTP authentication for ${user.email}`, user.tenant_id);
+  res.json({ ok: true, mfa_enabled: true });
+});
+
+app.post('/api/auth/mfa/disable', (req: AuthedRequest, res) => {
+  const user = req.authUser;
+  if (!user) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+  const password = String(req.body?.password || '');
+  const row = db.prepare('SELECT password FROM users WHERE id = ?').get(user.id) as { password: string } | undefined;
+  if (!row || !verifyPassword(password, row.password)) {
+    res.status(401).json({ error: 'Current password is required to disable 2FA.' });
+    return;
+  }
+  db.prepare("UPDATE users SET mfa_enabled = 0, mfa_secret = '' WHERE id = ?").run(user.id);
+  logAudit(req, 'MFA_DISABLE', 'Security', `Disabled 2FA TOTP authentication for ${user.email}`, user.tenant_id);
+  res.json({ ok: true, mfa_enabled: false });
+});
+
+app.post('/api/auth/change-password', (req: AuthedRequest, res) => {
+  const user = req.authUser;
+  if (!user) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+  const currentPw = String(req.body?.current_password || '');
+  const newPw = String(req.body?.new_password || '');
+  const row = db.prepare('SELECT password FROM users WHERE id = ?').get(user.id) as { password: string } | undefined;
+  if (!row || !verifyPassword(currentPw, row.password)) {
+    res.status(401).json({ error: 'Current password is incorrect.' });
+    return;
+  }
+  const pwErr = validatePasswordStrength(newPw);
+  if (pwErr) {
+    res.status(400).json({ error: pwErr });
+    return;
+  }
+  const now = new Date().toISOString();
+  db.prepare('UPDATE users SET password = ?, password_changed_at = ?, must_change_password = 0 WHERE id = ?').run(
+    hashPassword(newPw),
+    now,
+    user.id
+  );
+  logAudit(req, 'PASSWORD_CHANGE', 'Security', `Changed password for ${user.email}`, user.tenant_id);
+  res.json({ ok: true });
+});
+
+app.post('/api/auth/password-reset/request', async (req, res) => {
+  const email = String(req.body?.email || '').trim().toLowerCase();
+  const tid = getTenantId(req);
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    res.status(400).json({ error: 'Please provide a valid corporate email address.' });
+    return;
+  }
+  const user = db.prepare('SELECT id, full_name, email, tenant_id, status FROM users WHERE lower(email) = lower(?)').get(email) as
+    | { id: number; full_name: string; email: string; tenant_id: number; status: string }
+    | undefined;
+  if (!user || user.status === 'Suspended') {
+    res.json({
+      ok: true,
+      delivered: false,
+      message: 'If this corporate email matches an active account and SMTP is configured, a recovery token will be sent.',
+    });
+    return;
+  }
+
+  const rawResetCode = crypto.randomBytes(16).toString('hex').toUpperCase();
+  const tokenHash = sha256Hex(rawResetCode);
+  const now = new Date().toISOString();
+  const expiresAt = new Date(Date.now() + 30 * 60 * 1000).toISOString();
+  db.prepare('INSERT INTO password_reset_tokens (user_id, token_hash, expires_at, created_at) VALUES (?, ?, ?, ?)').run(
+    user.id,
+    tokenHash,
+    expiresAt,
+    now
+  );
+
+  const emailRes = await sendRealEmail({
+    tid: user.tenant_id || tid,
+    to: user.email,
+    subject: 'Seven Sunday ETMS — Password Recovery Code',
+    text: `Hello ${user.full_name},\n\nUse this single-use recovery code within 30 minutes to reset your password:\n\n${rawResetCode}\n\nIf you did not request this, contact your System Administrator immediately.`,
+  });
+
+  db.prepare(
+    `INSERT INTO notification_logs (tenant_id, event_type, channel, recipient, title, message, severity, module, status, error_message, retry_count, created_at, delivered_at)
+     VALUES (?, 'PASSWORD_RESET', 'Email', ?, 'Password Recovery Email', ?, 'warning', 'audit', ?, ?, 0, ?, ?)`
+  ).run(
+    user.tenant_id || tid,
+    user.email,
+    `Password reset code requested for ${user.email}`,
+    emailRes.ok ? 'Delivered' : 'Failed',
+    emailRes.ok ? '' : emailRes.error || 'SMTP delivery failed',
+    now,
+    emailRes.ok ? new Date().toISOString() : null
+  );
+
+  if (!emailRes.ok) {
+    res.status(502).json({
+      ok: false,
+      delivered: false,
+      error: `Could not deliver recovery email via SMTP (${emailRes.error}). Contact your System Administrator to configure SMTP or reset your password.`,
+    });
+    return;
+  }
+  res.json({ ok: true, delivered: true, message: `Password recovery code sent to ${user.email} via ${emailRes.host}.` });
+});
+
+app.post('/api/auth/password-reset/confirm', (req, res) => {
+  const token = String(req.body?.token || '').trim().toUpperCase();
+  const newPassword = String(req.body?.new_password || '');
+  if (!token) {
+    res.status(400).json({ error: 'Recovery token code is required.' });
+    return;
+  }
+  const pwErr = validatePasswordStrength(newPassword);
+  if (pwErr) {
+    res.status(400).json({ error: pwErr });
+    return;
+  }
+  const tokenHash = sha256Hex(token);
+  const row = db
+    .prepare('SELECT id, user_id, expires_at, used_at FROM password_reset_tokens WHERE token_hash = ?')
+    .get(tokenHash) as { id: number; user_id: number; expires_at: string; used_at: string | null } | undefined;
+  if (!row || row.used_at || new Date(row.expires_at).getTime() <= Date.now()) {
+    res.status(400).json({ error: 'Invalid or expired recovery code.' });
+    return;
+  }
+  const now = new Date().toISOString();
+  const tx = db.transaction(() => {
+    db.prepare('UPDATE password_reset_tokens SET used_at = ? WHERE id = ?').run(now, row.id);
+    db.prepare(
+      'UPDATE users SET password = ?, password_changed_at = ?, failed_login_attempts = 0, locked_until = NULL WHERE id = ?'
+    ).run(hashPassword(newPassword), now, row.user_id);
+    db.prepare('DELETE FROM auth_sessions WHERE user_id = ?').run(row.user_id);
+  });
+  tx();
+  res.json({ ok: true, message: 'Password updated successfully. Please sign in with your new password.' });
+});
+
+app.post('/api/auth/google', async (req, res) => {
+  const b = req.body || {};
+  const idToken = String(b.id_token || '').trim();
+  const requestedTid = Number(b.tenant_id || req.headers['x-tenant-id'] || 1);
+  const googleClientId = String(process.env.GOOGLE_CLIENT_ID || '').trim();
+
+  if (!googleClientId) {
+    res.status(503).json({
+      error:
+        'Verified Google OAuth is not configured on this server (GOOGLE_CLIENT_ID missing). Please sign in using Corporate Email & Password or Biometric Passkey.',
+    });
+    return;
+  }
+  if (!idToken) {
+    res.status(400).json({ error: 'A verified Google OAuth id_token is required.' });
+    return;
+  }
+
+  let verifiedEmail = '';
+  try {
+    const tokenRes = await fetch(
+      `https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(idToken)}`,
+      { signal: AbortSignal.timeout(8000) }
+    );
+    const info = (await tokenRes.json()) as { aud?: string; email?: string; email_verified?: string };
+    if (!tokenRes.ok || info.aud !== googleClientId || info.email_verified !== 'true' || !info.email) {
+      res.status(401).json({ error: 'Google ID token verification failed or email is unverified.' });
+      return;
+    }
+    verifiedEmail = info.email.toLowerCase();
+  } catch {
+    res.status(502).json({ error: 'Unable to verify Google token with Google Identity Services.' });
+    return;
+  }
+
+  const user = db.prepare('SELECT * FROM users WHERE lower(email) = lower(?)').get(verifiedEmail) as
+    | (Record<string, unknown> & {
+        id: number;
+        full_name: string;
+        role: string;
+        status: string;
+        tenant_id: number;
+      })
+    | undefined;
+  if (!user) {
+    res.status(403).json({
+      error: `No provisioned corporate account matches ${verifiedEmail}. Ask your System Administrator to provision your account first.`,
+    });
+    return;
+  }
+  if (user.status === 'Suspended') {
+    res.status(403).json({ error: 'Account is suspended. Contact System Administrator.' });
+    return;
+  }
   const targetTenant = db.prepare('SELECT id, status, brand_name FROM tenants WHERE id = ?').get(requestedTid) as
     | { id: number; status: string; brand_name: string }
     | undefined;
   const effectiveTid = targetTenant ? targetTenant.id : 1;
   const now = new Date().toISOString();
+  db.prepare('UPDATE users SET last_login = ? WHERE id = ?').run(now, user.id);
+  db.prepare(
+    'INSERT INTO audit_logs (tenant_id, actor_name, actor_role, action, module, summary, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+  ).run(effectiveTid, user.full_name, user.role, 'GOOGLE_LOGIN', 'Auth', `Verified Google OAuth login (${verifiedEmail})`, now);
 
-  let user = db.prepare('SELECT * FROM users WHERE lower(email) = lower(?)').get(email) as
-    | (Record<string, unknown> & {
-        password?: string;
-        status?: string;
-        id: number;
-        full_name: string;
-        role: string;
-        tenant_id?: number;
-      })
-    | undefined;
-
-  if (!user) {
-    const userCount = (db.prepare('SELECT COUNT(*) as c FROM users').get() as { c: number }).c;
-    const role = userCount === 0 ? 'Super Administrator' : 'Employee';
-    const derivedName =
-      fullNameInput ||
-      email
-        .split('@')[0]
-        .split(/[._-]+/)
-        .filter(Boolean)
-        .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-        .join(' ') ||
-      'Corporate Google User';
-    const empCode = `SS-GGL-${String(userCount + 1).padStart(3, '0')}`;
-    const unusableHash = hashPassword(crypto.randomBytes(24).toString('hex'));
-
-    const info = db
-      .prepare(
-        `INSERT INTO users (tenant_id, employee_code, full_name, email, password, department, job_title, role, status, last_login, created_at)
-         VALUES (?, ?, ?, ?, ?, 'Management', ?, ?, 'Active', ?, ?)`
-      )
-      .run(
-        effectiveTid,
-        empCode,
-        derivedName,
-        email,
-        unusableHash,
-        role === 'Super Administrator' ? 'Workspace Super Administrator' : 'Corporate Google Staff',
-        role,
-        now,
-        now
-      );
-
-    user = db.prepare('SELECT * FROM users WHERE id = ?').get(info.lastInsertRowid) as typeof user;
-    db.prepare(
-      'INSERT INTO audit_logs (tenant_id, actor_name, actor_role, action, module, summary, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
-    ).run(effectiveTid, derivedName, role, 'GOOGLE_AUTH', 'Auth', `Provisioned & signed in via Corporate Google Account (${email})`, now);
-  } else {
-    if (user.status === 'Suspended') {
-      res.status(403).json({ error: 'Account is suspended. Contact System Administrator.' });
-      return;
-    }
-    if (
-      targetTenant &&
-      targetTenant.status === 'Suspended' &&
-      user.role !== 'System Administrator' &&
-      user.role !== 'Super Administrator'
-    ) {
-      res.status(403).json({ error: `Tenant workspace "${targetTenant.brand_name}" is currently suspended.` });
-      return;
-    }
-    db.prepare('UPDATE users SET last_login = ? WHERE id = ?').run(now, user.id);
-    db.prepare(
-      'INSERT INTO audit_logs (tenant_id, actor_name, actor_role, action, module, summary, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
-    ).run(effectiveTid, user.full_name, user.role, 'LOGIN', 'Auth', `Signed in with Corporate Google Account (${email})`, now);
-  }
-
-  if (!user) {
-    res.status(500).json({ error: 'Failed to initialize corporate Google session.' });
-    return;
-  }
-
-  const { password: _pw, ...safe } = user;
-  const { token, encryptedSyncKey } = createSessionToken(user.id, effectiveTid, 'google');
+  const { password: _pw, mfa_secret: _ms, ...safe } = user;
+  const { token, encryptedSyncKey } = createSessionToken(user.id, effectiveTid, 'google', req);
   res.json({
     user: { ...safe, tenant_id: effectiveTid, last_login: now },
     token,
     auth_method: 'google',
     encrypted_sync_key: encryptedSyncKey,
   });
+});
+
+app.get('/api/auth/sessions', (req: AuthedRequest, res) => {
+  const user = req.authUser;
+  if (!user) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+  const scopeAll = req.query.scope === 'all' && USER_ADMIN_ROLES.has(user.role);
+  const nowIso = new Date().toISOString();
+  const rows = scopeAll
+    ? (db
+        .prepare(
+          `SELECT s.id, s.user_id, s.tenant_id, s.auth_method, s.user_agent, s.ip_address, s.last_active_at, s.expires_at, s.created_at,
+                  u.full_name as user_name, u.email as user_email, u.role as user_role
+           FROM auth_sessions s
+           JOIN users u ON u.id = s.user_id
+           WHERE s.expires_at > ? AND s.auth_method != 'mfa_pending'
+           ORDER BY s.id DESC LIMIT 100`
+        )
+        .all(nowIso) as Array<Record<string, unknown>>)
+    : (db
+        .prepare(
+          `SELECT s.id, s.user_id, s.tenant_id, s.auth_method, s.user_agent, s.ip_address, s.last_active_at, s.expires_at, s.created_at
+           FROM auth_sessions s
+           WHERE s.user_id = ? AND s.expires_at > ? AND s.auth_method != 'mfa_pending'
+           ORDER BY s.id DESC`
+        )
+        .all(user.id, nowIso) as Array<Record<string, unknown>>);
+
+  res.json(
+    rows.map((r) => ({
+      ...r,
+      is_current: Number(r.id) === req.authSessionId,
+    }))
+  );
+});
+
+app.delete('/api/auth/sessions/:id', (req: AuthedRequest, res) => {
+  const user = req.authUser;
+  if (!user) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+  const sid = Number(req.params.id);
+  const target = db.prepare('SELECT id, user_id FROM auth_sessions WHERE id = ?').get(sid) as
+    | { id: number; user_id: number }
+    | undefined;
+  if (!target) {
+    res.status(404).json({ error: 'Session not found' });
+    return;
+  }
+  if (target.user_id !== user.id && !USER_ADMIN_ROLES.has(user.role)) {
+    res.status(403).json({ error: 'Permission denied to revoke another user session.' });
+    return;
+  }
+  db.prepare('DELETE FROM auth_sessions WHERE id = ?').run(sid);
+  logAudit(req, 'SESSION_REVOKE', 'Security', `Revoked active session #${sid}`, user.tenant_id);
+  res.json({ ok: true });
+});
+
+app.post('/api/auth/logout-all', (req: AuthedRequest, res) => {
+  const user = req.authUser;
+  if (!user) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+  db.prepare('DELETE FROM auth_sessions WHERE user_id = ?').run(user.id);
+  logAudit(req, 'LOGOUT_ALL', 'Security', `Revoked all active sessions for ${user.email}`, user.tenant_id);
+  res.json({ ok: true });
 });
 
 app.post('/api/auth/logout', (req, res) => {
@@ -1949,6 +3126,7 @@ app.post('/api/auth/biometric/verify', (req, res) => {
   const b = req.body || {};
   const credentialId = String(b.credential_id || '').trim();
   const requestedTid = Number(b.tenant_id || req.headers['x-tenant-id'] || 1);
+  const now = new Date().toISOString();
   if (!credentialId) {
     res.status(400).json({ error: 'Biometric credential ID is required.' });
     return;
@@ -1957,26 +3135,107 @@ app.post('/api/auth/biometric/verify', (req, res) => {
     | { id: number; user_id: number; email: string; device_label: string; auth_type: string }
     | undefined;
   if (!cred) {
+    insertBiometricAuthLog({
+      tenant_id: requestedTid || 1,
+      device_id: null,
+      device_identifier: credentialId.slice(0, 48),
+      device_name: 'Mobile / WebAuthn Authenticator',
+      auth_source: 'Mobile / WebAuthn',
+      auth_method: 'Fingerprint / Face ID',
+      employee_code: '',
+      employee_name: String(b.email || 'Unknown Device'),
+      department: '',
+      punch_type: 'Check-In',
+      status: 'Failure',
+      failure_reason: 'Unrecognized biometric device credential',
+      verified_at: now,
+    });
     res.status(401).json({ error: 'Biometric device credential not recognized. Sign in with email first and enable under Synchronization Center → Biometric Security.' });
     return;
   }
   const user = db.prepare('SELECT * FROM users WHERE id = ?').get(cred.user_id) as
-    | (Record<string, unknown> & { id: number; full_name: string; role: string; status: string; tenant_id: number })
+    | (Record<string, unknown> & {
+        id: number;
+        employee_code?: string;
+        full_name: string;
+        email: string;
+        department?: string;
+        role: string;
+        status: string;
+        tenant_id: number;
+      })
     | undefined;
   if (!user || user.status === 'Suspended') {
+    insertBiometricAuthLog({
+      tenant_id: user?.tenant_id || requestedTid || 1,
+      device_id: null,
+      device_identifier: credentialId.slice(0, 48),
+      device_name: cred.device_label,
+      auth_source: 'Mobile / WebAuthn',
+      auth_method: cred.auth_type,
+      employee_code: String(user?.employee_code || ''),
+      employee_name: String(user?.full_name || cred.email),
+      department: String(user?.department || ''),
+      punch_type: 'Check-In',
+      status: 'Failure',
+      failure_reason: 'Associated corporate account is inactive or suspended',
+      verified_at: now,
+    });
     res.status(403).json({ error: 'Associated corporate account is inactive or suspended.' });
     return;
   }
   const targetTenant = db.prepare('SELECT id FROM tenants WHERE id = ?').get(requestedTid) as { id: number } | undefined;
   const effectiveTid = targetTenant ? targetTenant.id : 1;
-  const now = new Date().toISOString();
   db.prepare('UPDATE biometric_credentials SET last_used_at = ?, counter = counter + 1 WHERE id = ?').run(now, cred.id);
   db.prepare('UPDATE users SET last_login = ? WHERE id = ?').run(now, user.id);
   db.prepare(
     'INSERT INTO audit_logs (tenant_id, actor_name, actor_role, action, module, summary, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
   ).run(effectiveTid, user.full_name, user.role, 'LOGIN', 'Auth', `Biometric sign-in (${cred.auth_type} · ${cred.device_label})`, now);
-  const { password: _pw, ...safe } = user;
-  const { token, encryptedSyncKey } = createSessionToken(user.id, effectiveTid, 'biometric');
+
+  // Automatically mark attendance when staff authenticate biometrically
+  const matchedEmp = db
+    .prepare('SELECT employee_id, full_name, department, basic_salary FROM employees WHERE tenant_id = ? AND (employee_id = ? OR lower(email) = lower(?)) LIMIT 1')
+    .get(effectiveTid, String(user.employee_code || ''), user.email) as
+    | { employee_id: string; full_name: string; department: string; basic_salary: number }
+    | undefined;
+  const attEmpCode = matchedEmp?.employee_id || String(user.employee_code || `SS-USR-${user.id}`);
+  const attEmpName = matchedEmp?.full_name || user.full_name;
+  const attDept = matchedEmp?.department || String(user.department || 'Operations');
+  const autoAttendance = upsertBiometricAttendanceRecord({
+    tid: effectiveTid,
+    empCode: attEmpCode,
+    empName: attEmpName,
+    department: attDept,
+    attDate: now.slice(0, 10),
+    punchTime: now.slice(11, 16),
+    punchType: 'Check-In',
+    deviceName: cred.device_label,
+    hourlyRateOverride: matchedEmp?.basic_salary ? Number((matchedEmp.basic_salary / 208).toFixed(2)) : undefined,
+    notes: `Auto-marked via ${cred.auth_type} (${cred.device_label})`,
+    actor: user.full_name,
+  });
+  const attId = Number(autoAttendance.id || 0) || null;
+  insertBiometricAuthLog({
+    tenant_id: effectiveTid,
+    device_id: null,
+    device_identifier: credentialId.slice(0, 48),
+    device_name: cred.device_label,
+    auth_source: 'Mobile / WebAuthn',
+    auth_method: cred.auth_type,
+    employee_code: attEmpCode,
+    employee_name: attEmpName,
+    department: attDept,
+    punch_type: 'Check-In',
+    status: 'Success',
+    failure_reason: '',
+    attendance_record_id: attId,
+    attendance_marked: attId ? 1 : 0,
+    verified_at: now,
+  });
+  broadcastWs('attendance:updated', { tenant_id: effectiveTid, attendance_id: attId, employee_code: attEmpCode });
+
+  const { password: _pw, mfa_secret: _ms, ...safe } = user;
+  const { token, encryptedSyncKey } = createSessionToken(user.id, effectiveTid, 'biometric', req);
   res.json({
     user: { ...safe, tenant_id: effectiveTid, last_login: now },
     token,
@@ -2060,7 +3319,8 @@ app.post('/api/tenants', (req, res) => {
     logAudit(req, 'CREATE', 'Tenants', `Created tenant workspace "${brandName}" (${code})`, newTid);
     broadcastWs('tenant:updated', { id: newTid });
     const created = db.prepare('SELECT * FROM tenants WHERE id = ?').get(newTid) as Record<string, unknown>;
-    res.status(201).json({ ...created, employee_count: 0, device_count: 0, pending_approvals: 0 });
+    const { smtp_pass: _sp, ...safeCreated } = created;
+    res.status(201).json({ ...safeCreated, employee_count: 0, device_count: 0, pending_approvals: 0 });
   } catch (err) {
     res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to create tenant workspace' });
   }
@@ -2132,7 +3392,9 @@ app.put('/api/tenants/:id', (req, res) => {
   }
   logAudit(req, 'UPDATE', 'Tenants', `Updated tenant #${id} (${b.brand_name ?? existing.brand_name})`, id);
   broadcastWs('tenant:updated', { id });
-  res.json(db.prepare('SELECT * FROM tenants WHERE id = ?').get(id));
+  const updated = db.prepare('SELECT * FROM tenants WHERE id = ?').get(id) as Record<string, unknown>;
+  const { smtp_pass: _sp, ...safeUpdated } = updated;
+  res.json(safeUpdated);
 });
 
 app.patch('/api/tenants/:id/status', (req, res) => {
@@ -2145,7 +3407,9 @@ app.patch('/api/tenants/:id/status', (req, res) => {
   db.prepare('UPDATE tenants SET status = ?, updated_at = ? WHERE id = ?').run(status, new Date().toISOString(), id);
   logAudit(req, 'STATUS', 'Tenants', `Set tenant #${id} status to ${status}`, id);
   broadcastWs('tenant:updated', { id });
-  res.json(db.prepare('SELECT * FROM tenants WHERE id = ?').get(id));
+  const updated = db.prepare('SELECT * FROM tenants WHERE id = ?').get(id) as Record<string, unknown>;
+  const { smtp_pass: _sp, ...safeUpdated } = updated;
+  res.json(safeUpdated);
 });
 
 app.delete('/api/tenants/:id', (req, res) => {
@@ -2168,24 +3432,25 @@ app.delete('/api/tenants/:id', (req, res) => {
   res.json({ ok: true });
 });
 
-// Company Settings (per-tenant aware)
+// Company Settings (per-tenant aware, SMTP secrets AES-256-GCM encrypted at rest)
 app.get('/api/company-settings', (req: AuthedRequest, res) => {
   const tid = getTenantId(req);
-  const full = buildCompanySettingsForTenant(tid) as Record<string, unknown>;
-  if (!req.authUser) {
-    const { smtp_pass: _sp, ...publicSafe } = full;
-    res.json(publicSafe);
-    return;
-  }
-  res.json(full);
+  res.json(buildCompanySettingsForTenant(tid, false));
 });
 
 app.put('/api/company-settings', (req, res) => {
   const tid = getTenantId(req);
   const b = req.body || {};
   const now = new Date().toISOString();
+  const resolveSmtpPass = (incoming: unknown, existing: unknown) => {
+    const val = incoming === undefined ? undefined : String(incoming || '');
+    if (val === undefined || val === '********') return String(existing || '');
+    return val ? encryptField(val) : '';
+  };
+
   if (tid === 1) {
     const cur = db.prepare('SELECT * FROM company_settings WHERE id = 1').get() as Record<string, unknown>;
+    const encPass = resolveSmtpPass(b.smtp_pass, cur.smtp_pass);
     db.prepare(
       `
       UPDATE company_settings SET
@@ -2216,7 +3481,7 @@ app.put('/api/company-settings', (req, res) => {
       b.smtp_host ?? cur.smtp_host,
       Number(b.smtp_port ?? cur.smtp_port) || 587,
       b.smtp_user ?? cur.smtp_user,
-      b.smtp_pass ?? cur.smtp_pass,
+      encPass,
       b.smtp_from ?? cur.smtp_from,
       b.smtp_secure !== undefined ? Number(b.smtp_secure) : cur.smtp_secure,
       b.rbac_matrix ?? cur.rbac_matrix,
@@ -2253,7 +3518,7 @@ app.put('/api/company-settings', (req, res) => {
       b.smtp_host ?? cur.smtp_host,
       Number(b.smtp_port ?? cur.smtp_port) || 587,
       b.smtp_user ?? cur.smtp_user,
-      b.smtp_pass ?? cur.smtp_pass,
+      encPass,
       b.smtp_from ?? cur.smtp_from,
       b.smtp_secure !== undefined ? Number(b.smtp_secure) : cur.smtp_secure,
       b.rbac_matrix ?? cur.rbac_matrix,
@@ -2262,6 +3527,7 @@ app.put('/api/company-settings', (req, res) => {
     );
   } else {
     const cur = db.prepare('SELECT * FROM tenants WHERE id = ?').get(tid) as Record<string, unknown>;
+    const encPass = resolveSmtpPass(b.smtp_pass, cur.smtp_pass);
     db.prepare(
       `
       UPDATE tenants SET
@@ -2292,7 +3558,7 @@ app.put('/api/company-settings', (req, res) => {
       b.smtp_host ?? cur.smtp_host,
       Number(b.smtp_port ?? cur.smtp_port) || 587,
       b.smtp_user ?? cur.smtp_user,
-      b.smtp_pass ?? cur.smtp_pass,
+      encPass,
       b.smtp_from ?? cur.smtp_from,
       b.smtp_secure !== undefined ? Number(b.smtp_secure) : cur.smtp_secure,
       b.rbac_matrix ?? cur.rbac_matrix,
@@ -2303,17 +3569,63 @@ app.put('/api/company-settings', (req, res) => {
   }
   logAudit(req, 'UPDATE', 'Admin', `Updated workspace settings, RBAC & platform config (Tenant #${tid})`, tid);
   broadcastWs('settings:updated', { tenant_id: tid, updated_at: now });
-  res.json(buildCompanySettingsForTenant(tid));
+  res.json(buildCompanySettingsForTenant(tid, false));
+});
+
+// Granular RBAC Action Permissions
+app.get('/api/rbac/permissions', (req, res) => {
+  const tid = getTenantId(req);
+  const customRows = db
+    .prepare('SELECT role_name, permissions_json FROM rbac_action_permissions WHERE tenant_id = ?')
+    .all(tid) as Array<{ role_name: string; permissions_json: string }>;
+  const merged: Record<string, unknown> = { ...DEFAULT_ACTION_PERMISSIONS };
+  for (const r of customRows) {
+    try {
+      merged[r.role_name] = { ...(DEFAULT_ACTION_PERMISSIONS[r.role_name] || DEFAULT_ACTION_PERMISSIONS.Employee), ...JSON.parse(r.permissions_json) };
+    } catch {
+      // ignore
+    }
+  }
+  res.json(merged);
+});
+
+app.put('/api/rbac/permissions/:role', (req, res) => {
+  const tid = getTenantId(req);
+  const roleName = String(req.params.role || '').trim();
+  if (!roleName || roleName === 'System Administrator' || roleName === 'Super Administrator') {
+    res.status(400).json({ error: 'System Administrator and Super Administrator permissions are locked.' });
+    return;
+  }
+  const b = req.body || {};
+  const perms = {
+    view: Boolean(b.view),
+    create: Boolean(b.create),
+    edit: Boolean(b.edit),
+    delete: Boolean(b.delete),
+    approve: Boolean(b.approve),
+    export: Boolean(b.export),
+    manage: Boolean(b.manage),
+  };
+  const now = new Date().toISOString();
+  db.prepare(
+    `INSERT INTO rbac_action_permissions (tenant_id, role_name, permissions_json, updated_at)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(tenant_id, role_name) DO UPDATE SET permissions_json = excluded.permissions_json, updated_at = excluded.updated_at`
+  ).run(tid, roleName, JSON.stringify(perms), now);
+  logAudit(req, 'RBAC_UPDATE', 'Admin', `Updated granular action permissions for role "${roleName}"`, tid);
+  res.json({ role: roleName, permissions: perms });
 });
 
 // Users
-const USER_ADMIN_ROLES = new Set(['System Administrator', 'Super Administrator', 'Company Owner', 'General Manager']);
-
 app.get('/api/users', (req, res) => {
   const tid = getTenantId(req);
   const rows = db
     .prepare(
-      "SELECT id, tenant_id, employee_code, full_name, email, department, job_title, role, status, last_login, created_at FROM users WHERE tenant_id = ? OR role = 'System Administrator' ORDER BY id DESC"
+      `SELECT id, tenant_id, employee_code, full_name, email, department, job_title, role, status,
+              mfa_enabled, failed_login_attempts, locked_until, last_login, created_at
+       FROM users
+       WHERE tenant_id = ? OR role = 'System Administrator'
+       ORDER BY id DESC`
     )
     .all(tid);
   res.json(rows);
@@ -2324,8 +3636,9 @@ app.post('/api/users', (req, res) => {
   const tid = getTenantId(req);
   const b = req.body || {};
   const rawPw = String(b.password || '').trim();
-  if (rawPw.length < 6) {
-    res.status(400).json({ error: 'A temporary or initial password (min 6 characters) is required when creating a user.' });
+  const pwErr = validatePasswordStrength(rawPw);
+  if (pwErr) {
+    res.status(400).json({ error: pwErr });
     return;
   }
   const now = new Date().toISOString();
@@ -2334,8 +3647,8 @@ app.post('/api/users', (req, res) => {
     const info = db
       .prepare(
         `
-      INSERT INTO users (tenant_id, employee_code, full_name, email, password, department, job_title, role, status, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Active', ?)
+      INSERT INTO users (tenant_id, employee_code, full_name, email, password, department, job_title, role, status, password_changed_at, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Active', ?, ?)
     `
       )
       .run(
@@ -2347,12 +3660,23 @@ app.post('/api/users', (req, res) => {
         b.department || 'Operations',
         b.job_title || 'Staff',
         b.role || 'Employee',
+        now,
         now
       );
     const created = db
-      .prepare('SELECT id, tenant_id, employee_code, full_name, email, department, job_title, role, status, last_login, created_at FROM users WHERE id = ?')
+      .prepare(
+        'SELECT id, tenant_id, employee_code, full_name, email, department, job_title, role, status, mfa_enabled, failed_login_attempts, locked_until, last_login, created_at FROM users WHERE id = ?'
+      )
       .get(info.lastInsertRowid);
     logAudit(req, 'CREATE', 'Users', `Created user ${b.email} (${b.role})`, tid);
+    void dispatchNotification(tid, {
+      event_type: 'USER_REGISTER',
+      title: `Account Created: ${b.full_name}`,
+      message: `Created ${b.role} account for ${b.email}.`,
+      severity: 'info',
+      module: 'admin',
+      recipientEmail: String(b.email || '').trim(),
+    });
     res.status(201).json(created);
   } catch (err) {
     res.status(409).json({ error: err instanceof Error ? err.message : 'User email already exists' });
@@ -2363,12 +3687,32 @@ app.patch('/api/users/:id/status', (req, res) => {
   if (!requireRole(req, res, USER_ADMIN_ROLES, 'modify user roles or status')) return;
   const id = Number(req.params.id);
   const { status, role } = req.body || {};
-  if (status) db.prepare('UPDATE users SET status = ? WHERE id = ?').run(status, id);
+  if (status) {
+    db.prepare('UPDATE users SET status = ? WHERE id = ?').run(status, id);
+    if (status === 'Suspended') {
+      db.prepare('DELETE FROM auth_sessions WHERE user_id = ?').run(id);
+    }
+  }
   if (role) db.prepare('UPDATE users SET role = ? WHERE id = ?').run(role, id);
   const updated = db
-    .prepare('SELECT id, tenant_id, employee_code, full_name, email, department, job_title, role, status, last_login, created_at FROM users WHERE id = ?')
+    .prepare(
+      'SELECT id, tenant_id, employee_code, full_name, email, department, job_title, role, status, mfa_enabled, failed_login_attempts, locked_until, last_login, created_at FROM users WHERE id = ?'
+    )
     .get(id);
   logAudit(req, 'UPDATE', 'Users', `Updated user #${id} role/status`);
+  res.json(updated);
+});
+
+app.post('/api/users/:id/unlock', (req, res) => {
+  if (!requireRole(req, res, USER_ADMIN_ROLES, 'unlock user accounts')) return;
+  const id = Number(req.params.id);
+  db.prepare('UPDATE users SET failed_login_attempts = 0, locked_until = NULL WHERE id = ?').run(id);
+  const updated = db
+    .prepare(
+      'SELECT id, tenant_id, employee_code, full_name, email, department, job_title, role, status, mfa_enabled, failed_login_attempts, locked_until, last_login, created_at FROM users WHERE id = ?'
+    )
+    .get(id);
+  logAudit(req, 'UNLOCK', 'Security', `Cleared login lockout for user #${id}`);
   res.json(updated);
 });
 
@@ -2383,6 +3727,7 @@ app.delete('/api/users/:id', (req, res) => {
       return;
     }
   }
+  db.prepare('DELETE FROM auth_sessions WHERE user_id = ?').run(id);
   db.prepare('DELETE FROM users WHERE id = ?').run(id);
   logAudit(req, 'DELETE', 'Users', `Removed user #${id}`);
   res.json({ ok: true });
@@ -2444,6 +3789,14 @@ app.post('/api/employees', (req, res) => {
     );
   const created = db.prepare('SELECT * FROM employees WHERE id = ?').get(info.lastInsertRowid);
   logAudit(req, 'CREATE', 'HR', `Registered employee ${b.full_name} (${empId})`, tid);
+  void dispatchNotification(tid, {
+    event_type: 'EMPLOYEE_CREATED',
+    title: `New Staff Registered: ${b.full_name}`,
+    message: `${b.full_name} (${empId}) joined ${b.department || 'Operations'} as ${b.job_title || 'Staff'}.`,
+    severity: 'info',
+    module: 'hr',
+    recipientEmail: b.email ? String(b.email).trim() : undefined,
+  });
   res.status(201).json(created);
 });
 
@@ -2516,15 +3869,6 @@ app.delete('/api/employees/:id', (req, res) => {
 });
 
 // ==================== SALARY MODULE (ADD, ADJUST & SYNC STAFF SALARIES) ====================
-const SALARY_MANAGER_ROLES = new Set([
-  'System Administrator',
-  'Super Administrator',
-  'Company Owner',
-  'General Manager',
-  'Human Resource Manager',
-  'Finance Manager',
-  'Accountant',
-]);
 
 app.get('/api/salary', (req, res) => {
   const tid = getTenantId(req);
@@ -3133,6 +4477,13 @@ app.post('/api/payroll-runs/calculate', (req, res) => {
 
   const run = db.prepare('SELECT * FROM payroll_runs WHERE id = ?').get(runInfo.lastInsertRowid);
   logAudit(req, 'RUN', 'Payroll', `Executed monthly payroll run ${runCode} for ${activeEmps.length} staff`, tid);
+  void dispatchNotification(tid, {
+    event_type: 'PAYROLL_RUN',
+    title: `Payroll Run ${runCode} Completed`,
+    message: `Calculated ${month} payroll for ${activeEmps.length} active staff. Net disbursement: ${totalNet.toFixed(2)} ETB.`,
+    severity: 'info',
+    module: 'payroll',
+  });
   res.status(201).json({ run, payrolls: createdPayrolls });
 });
 
@@ -3282,18 +4633,33 @@ async function probeDeviceRecord(dev: {
       dev.id
     );
   }
-  return { probe, status, updated: db.prepare('SELECT * FROM devices WHERE id = ?').get(dev.id) };
+  return { probe, status, updated: maskDeviceRow(db.prepare('SELECT * FROM devices WHERE id = ?').get(dev.id)) };
+}
+
+function maskDeviceRow(row: unknown) {
+  if (!row || typeof row !== 'object') return row;
+  const r = row as Record<string, unknown>;
+  return {
+    ...r,
+    api_key: r.api_key ? '********' : '',
+  };
 }
 
 app.get('/api/devices', (req, res) => {
   const tid = getTenantId(req);
-  res.json(db.prepare('SELECT * FROM devices WHERE tenant_id = ? ORDER BY id DESC').all(tid));
+  const rows = db.prepare('SELECT * FROM devices WHERE tenant_id = ? ORDER BY id DESC').all(tid);
+  res.json(rows.map(maskDeviceRow));
 });
 
 app.post('/api/devices', (req, res) => {
   const tid = getTenantId(req);
   const b = req.body || {};
-  const apiKey = String(b.api_key || '').trim() || `SS-DEV-${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
+  const rawApiKey = String(b.api_key || '').trim();
+  const apiKey =
+    !rawApiKey || rawApiKey === '********'
+      ? `SS-DEV-${crypto.randomBytes(6).toString('hex').toUpperCase()}`
+      : rawApiKey;
+  const encryptedKey = encryptField(apiKey);
   const info = db
     .prepare(
       `
@@ -3315,9 +4681,9 @@ app.post('/api/devices', (req, res) => {
       b.subnet_mask || '255.255.255.0',
       b.gateway || '192.168.10.1',
       b.serial_number || '',
-      apiKey
+      encryptedKey
     );
-  const created = db.prepare('SELECT * FROM devices WHERE id = ?').get(info.lastInsertRowid);
+  const created = maskDeviceRow(db.prepare('SELECT * FROM devices WHERE id = ?').get(info.lastInsertRowid));
   logAudit(req, 'CREATE', 'Device Connections', `Registered ${b.device_name} (${b.protocol || 'TCP/IP Socket'} · ${b.ip_address}:${b.port})`, tid);
   res.status(201).json(created);
 });
@@ -3326,6 +4692,14 @@ app.put('/api/devices/:id', (req, res) => {
   const tid = getTenantId(req);
   const id = Number(req.params.id);
   const b = req.body || {};
+  const existing = db.prepare('SELECT api_key FROM devices WHERE id = ? AND tenant_id = ?').get(id, tid) as
+    | { api_key?: string }
+    | undefined;
+  const incomingKey = String(b.api_key || '').trim();
+  const nextEncryptedKey =
+    !incomingKey || incomingKey === '********'
+      ? existing?.api_key || encryptField(`SS-DEV-${id}`)
+      : encryptField(incomingKey);
   db.prepare(
     `
     UPDATE devices SET
@@ -3343,11 +4717,11 @@ app.put('/api/devices/:id', (req, res) => {
     b.subnet_mask || '255.255.255.0',
     b.gateway || '192.168.10.1',
     b.serial_number || '',
-    b.api_key || `SS-DEV-${id}`,
+    nextEncryptedKey,
     id,
     tid
   );
-  res.json(db.prepare('SELECT * FROM devices WHERE id = ? AND tenant_id = ?').get(id, tid));
+  res.json(maskDeviceRow(db.prepare('SELECT * FROM devices WHERE id = ? AND tenant_id = ?').get(id, tid)));
 });
 
 app.post('/api/devices/:id/connect', async (req, res) => {
@@ -3378,7 +4752,7 @@ app.post('/api/devices/probe-all', async (req, res) => {
     endpoint_url?: string;
   }>;
   await Promise.all(devs.map((d) => probeDeviceRecord(d)));
-  const refreshed = db.prepare('SELECT * FROM devices WHERE tenant_id = ? ORDER BY id DESC').all(tid);
+  const refreshed = db.prepare('SELECT * FROM devices WHERE tenant_id = ? ORDER BY id DESC').all(tid).map(maskDeviceRow);
   logAudit(req, 'PROBE_ALL', 'Device Connections', `Probed all ${devs.length} registered connections`, tid);
   broadcastWs('device:status', { tenant_id: tid, count: devs.length });
   res.json(refreshed);
@@ -3434,77 +4808,386 @@ app.post('/api/devices/scan-subnet', async (req, res) => {
   res.json({ scanned: capped.length, discovered });
 });
 
+// Biometric Authentication Logs & Live Auto-Attendance Endpoints
+app.get('/api/devices/biometric-logs', (req, res) => {
+  const tid = getTenantId(req);
+  const statusFilter = String(req.query.status || '').trim();
+  const deviceIdFilter = req.query.device_id ? Number(req.query.device_id) : null;
+  const search = String(req.query.search || '').trim().toLowerCase();
+  const limit = Math.min(500, Math.max(1, Number(req.query.limit) || 200));
+
+  const where: string[] = ['tenant_id = ?'];
+  const params: unknown[] = [tid];
+  if (statusFilter === 'Success' || statusFilter === 'Failure') {
+    where.push('status = ?');
+    params.push(statusFilter);
+  }
+  if (deviceIdFilter && Number.isFinite(deviceIdFilter)) {
+    where.push('device_id = ?');
+    params.push(deviceIdFilter);
+  }
+  if (search) {
+    where.push('(lower(employee_code) LIKE ? OR lower(employee_name) LIKE ? OR lower(device_identifier) LIKE ? OR lower(device_name) LIKE ?)');
+    const like = `%${search}%`;
+    params.push(like, like, like, like);
+  }
+  params.push(limit);
+
+  const logs = db
+    .prepare(`SELECT * FROM biometric_auth_logs WHERE ${where.join(' AND ')} ORDER BY id DESC LIMIT ?`)
+    .all(...params);
+  res.json(logs);
+});
+
+app.post('/api/devices/biometric-logs/verify', (req, res) => {
+  const tid = getTenantId(req);
+  const b = (req.body || {}) as Record<string, unknown>;
+  const now = new Date().toISOString();
+  const verifiedAt = String(b.verified_at || now);
+  const attDate = verifiedAt.slice(0, 10) || now.slice(0, 10);
+  const punchTime = verifiedAt.slice(11, 16) || now.slice(11, 16);
+  const punchType = b.punch_type === 'Check-Out' ? 'Check-Out' : 'Check-In';
+  const authMethod = String(b.auth_method || 'Fingerprint').trim();
+  const empCode = String(b.employee_code || '').trim();
+
+  let dev: { id: number; device_name: string; serial_number: string; device_type: string; status: string } | undefined;
+  if (b.device_id) {
+    dev = db
+      .prepare('SELECT id, device_name, serial_number, device_type, status FROM devices WHERE id = ? AND tenant_id = ?')
+      .get(Number(b.device_id), tid) as typeof dev;
+  } else if (b.device_identifier) {
+    dev = db
+      .prepare('SELECT id, device_name, serial_number, device_type, status FROM devices WHERE serial_number = ? AND tenant_id = ?')
+      .get(String(b.device_identifier).trim(), tid) as typeof dev;
+  }
+
+  const deviceId = dev?.id ?? null;
+  const deviceIdentifier = dev?.serial_number || String(b.device_identifier || (dev ? `DEV-${dev.id}` : 'UNREGISTERED')).trim();
+  const deviceName = dev?.device_name || String(b.device_name || 'Biometric Terminal').trim();
+
+  if (b.device_id && !dev) {
+    const logRow = insertBiometricAuthLog({
+      tenant_id: tid,
+      device_id: null,
+      device_identifier: String(b.device_id),
+      device_name: deviceName,
+      auth_source: 'Hardware Terminal',
+      auth_method: authMethod,
+      employee_code: empCode,
+      employee_name: String(b.employee_name || ''),
+      department: '',
+      punch_type: punchType,
+      status: 'Failure',
+      failure_reason: 'Registered biometric device ID not found in workspace',
+      verified_at: verifiedAt,
+    });
+    res.status(404).json({ error: 'Selected biometric device was not found.', log: logRow });
+    return;
+  }
+
+  if (b.simulate_failure === true || b.status === 'Failure') {
+    const logRow = insertBiometricAuthLog({
+      tenant_id: tid,
+      device_id: deviceId,
+      device_identifier: deviceIdentifier,
+      device_name: deviceName,
+      auth_source: 'Hardware Terminal',
+      auth_method: authMethod,
+      employee_code: empCode,
+      employee_name: String(b.employee_name || empCode || 'Unverified Scan'),
+      department: String(b.department || ''),
+      punch_type: punchType,
+      status: 'Failure',
+      failure_reason: String(b.failure_reason || 'Biometric template mismatch / low confidence score'),
+      verified_at: verifiedAt,
+    });
+    logAudit(req, 'BIOMETRIC_FAIL', 'Device Connections', `Biometric verification failed on ${deviceName} (${deviceIdentifier})`, tid);
+    res.status(422).json({ error: logRow.failure_reason, log: logRow });
+    return;
+  }
+
+  const emp = empCode
+    ? (db
+        .prepare('SELECT employee_id, full_name, department, basic_salary, status FROM employees WHERE tenant_id = ? AND employee_id = ?')
+        .get(tid, empCode) as
+        | { employee_id: string; full_name: string; department: string; basic_salary: number; status: string }
+        | undefined)
+    : undefined;
+
+  if (!empCode || !emp) {
+    const logRow = insertBiometricAuthLog({
+      tenant_id: tid,
+      device_id: deviceId,
+      device_identifier: deviceIdentifier,
+      device_name: deviceName,
+      auth_source: 'Hardware Terminal',
+      auth_method: authMethod,
+      employee_code: empCode,
+      employee_name: String(b.employee_name || 'Unmatched Employee'),
+      department: '',
+      punch_type: punchType,
+      status: 'Failure',
+      failure_reason: empCode ? `Employee ID "${empCode}" is not registered in HR` : 'Missing employee ID in biometric scan',
+      verified_at: verifiedAt,
+    });
+    res.status(404).json({ error: logRow.failure_reason, log: logRow });
+    return;
+  }
+
+  if (emp.status === 'Suspended' || emp.status === 'Terminated') {
+    const logRow = insertBiometricAuthLog({
+      tenant_id: tid,
+      device_id: deviceId,
+      device_identifier: deviceIdentifier,
+      device_name: deviceName,
+      auth_source: 'Hardware Terminal',
+      auth_method: authMethod,
+      employee_code: emp.employee_id,
+      employee_name: emp.full_name,
+      department: emp.department,
+      punch_type: punchType,
+      status: 'Failure',
+      failure_reason: `Employee ${emp.employee_id} is ${emp.status} and blocked from check-in`,
+      verified_at: verifiedAt,
+    });
+    res.status(403).json({ error: logRow.failure_reason, log: logRow });
+    return;
+  }
+
+  const autoMark = b.auto_mark_attendance !== false;
+  let attendance: Record<string, unknown> | null = null;
+  if (autoMark) {
+    attendance = upsertBiometricAttendanceRecord({
+      tid,
+      empCode: emp.employee_id,
+      empName: emp.full_name,
+      department: emp.department,
+      attDate,
+      punchTime,
+      punchType,
+      deviceName,
+      hourlyRateOverride: emp.basic_salary ? Number((emp.basic_salary / 208).toFixed(2)) : undefined,
+      notes: `Auto-marked via ${deviceName} (${deviceIdentifier} · ${authMethod} ${punchType})`,
+      actor: getActorName(req),
+    });
+  }
+
+  if (deviceId) {
+    db.prepare(
+      "UPDATE devices SET status='Connected', punch_count = COALESCE(punch_count, 0) + 1, last_sync_at=?, last_checked_at=?, last_message=? WHERE id=?"
+    ).run(now, now, `Verified ${emp.employee_id} (${punchType})`, deviceId);
+  }
+
+  const attId = attendance ? Number(attendance.id || 0) || null : null;
+  const logRow = insertBiometricAuthLog({
+    tenant_id: tid,
+    device_id: deviceId,
+    device_identifier: deviceIdentifier,
+    device_name: deviceName,
+    auth_source: 'Hardware Terminal',
+    auth_method: authMethod,
+    employee_code: emp.employee_id,
+    employee_name: emp.full_name,
+    department: emp.department,
+    punch_type: punchType,
+    status: 'Success',
+    failure_reason: '',
+    attendance_record_id: attId,
+    attendance_marked: attId ? 1 : 0,
+    verified_at: verifiedAt,
+  });
+
+  if (attId) {
+    broadcastWs('attendance:updated', { tenant_id: tid, attendance_id: attId, employee_code: emp.employee_id });
+  }
+  if (deviceId) {
+    broadcastWs('device:punch', { device_id: deviceId, tenant_id: tid, employee_code: emp.employee_id });
+  }
+  logAudit(
+    req,
+    'BIOMETRIC_AUTH',
+    'Device Connections',
+    `Verified ${authMethod} for ${emp.full_name} (${emp.employee_id}) on ${deviceName}${attId ? ` · Marked Attendance #${attId}` : ''}`,
+    tid
+  );
+
+  const updatedDevice = deviceId ? maskDeviceRow(db.prepare('SELECT * FROM devices WHERE id = ?').get(deviceId)) : null;
+  res.status(201).json({ log: logRow, attendance, device: updatedDevice });
+});
+
+app.post('/api/devices/biometric-logs/:id/mark-attendance', (req, res) => {
+  const tid = getTenantId(req);
+  const logId = Number(req.params.id);
+  const logRow = db
+    .prepare('SELECT * FROM biometric_auth_logs WHERE id = ? AND tenant_id = ?')
+    .get(logId, tid) as
+    | {
+        id: number;
+        status: string;
+        employee_code: string;
+        employee_name: string;
+        department: string;
+        device_name: string;
+        auth_method: string;
+        punch_type: string;
+        verified_at: string;
+        attendance_record_id: number | null;
+      }
+    | undefined;
+  if (!logRow) {
+    res.status(404).json({ error: 'Biometric authentication log not found.' });
+    return;
+  }
+  if (logRow.status !== 'Success') {
+    res.status(400).json({ error: 'Cannot mark attendance from a failed biometric authentication attempt.' });
+    return;
+  }
+  if (logRow.attendance_record_id) {
+    const existingAtt = db.prepare('SELECT * FROM attendance_records WHERE id = ? AND tenant_id = ?').get(logRow.attendance_record_id, tid);
+    res.json({ log: logRow, attendance: existingAtt });
+    return;
+  }
+  const att = upsertBiometricAttendanceRecord({
+    tid,
+    empCode: logRow.employee_code,
+    empName: logRow.employee_name,
+    department: logRow.department,
+    attDate: logRow.verified_at.slice(0, 10),
+    punchTime: logRow.verified_at.slice(11, 16),
+    punchType: logRow.punch_type || 'Check-In',
+    deviceName: logRow.device_name,
+    notes: `Synced from biometric log #${logRow.id} (${logRow.auth_method})`,
+    actor: getActorName(req),
+  });
+  const attId = Number(att.id || 0) || null;
+  db.prepare('UPDATE biometric_auth_logs SET attendance_record_id = ?, attendance_marked = 1 WHERE id = ? AND tenant_id = ?').run(attId, logId, tid);
+  const updatedLog = db.prepare('SELECT * FROM biometric_auth_logs WHERE id = ?').get(logId);
+  broadcastWs('biometric:auth_log', updatedLog);
+  broadcastWs('attendance:updated', { tenant_id: tid, attendance_id: attId, employee_code: logRow.employee_code });
+  res.json({ log: updatedLog, attendance: att });
+});
+
 app.post('/api/devices/:id/push-punch', (req, res) => {
   const tid = getTenantId(req);
   const id = Number(req.params.id);
   const dev = db.prepare('SELECT * FROM devices WHERE id = ? AND tenant_id = ?').get(id, tid) as
-    | { id: number; device_name: string; api_key?: string }
+    | { id: number; device_name: string; device_type?: string; serial_number?: string; api_key?: string }
     | undefined;
   if (!dev) {
     res.status(404).json({ error: 'Device not found in active tenant workspace' });
     return;
   }
+  const now = new Date().toISOString();
+  const b = (req.body || {}) as Record<string, unknown>;
+  const empCode = String(b.employee_code || 'SS-EMP-008').trim();
+  const punchType = b.punch_type === 'Check-Out' ? 'Check-Out' : 'Check-In';
+  const devIdentifier = dev.serial_number || `DEV-${dev.id}`;
+  const authMethod = dev.device_type?.toLowerCase().includes('face')
+    ? 'Face ID'
+    : dev.device_type?.toLowerCase().includes('rfid')
+    ? 'RFID Card'
+    : 'Fingerprint';
+
   const suppliedKey = req.headers['x-device-key'] ? String(req.headers['x-device-key']).trim() : '';
-  if (suppliedKey && dev.api_key && suppliedKey !== dev.api_key) {
+  const storedPlainKey = dev.api_key ? decryptField(dev.api_key) : '';
+  if (suppliedKey && storedPlainKey && suppliedKey !== storedPlainKey) {
+    insertBiometricAuthLog({
+      tenant_id: tid,
+      device_id: dev.id,
+      device_identifier: devIdentifier,
+      device_name: dev.device_name,
+      auth_source: 'Hardware Terminal',
+      auth_method: authMethod,
+      employee_code: empCode,
+      employee_name: String(b.employee_name || ''),
+      department: String(b.department || ''),
+      punch_type: punchType,
+      status: 'Failure',
+      failure_reason: 'Invalid x-device-key authentication credential',
+      verified_at: now,
+    });
     res.status(401).json({ error: 'Invalid x-device-key credential for this hardware terminal.' });
     return;
   }
-  const b = req.body || {};
-  const now = new Date().toISOString();
-  const empCode = String(b.employee_code || 'SS-EMP-008').trim();
+
   const emp = db
-    .prepare('SELECT full_name, department, basic_salary FROM employees WHERE tenant_id = ? AND employee_id = ?')
-    .get(tid, empCode) as { full_name: string; department: string; basic_salary: number } | undefined;
+    .prepare('SELECT full_name, department, basic_salary, status FROM employees WHERE tenant_id = ? AND employee_id = ?')
+    .get(tid, empCode) as { full_name: string; department: string; basic_salary: number; status?: string } | undefined;
+
+  if (emp && (emp.status === 'Suspended' || emp.status === 'Terminated')) {
+    insertBiometricAuthLog({
+      tenant_id: tid,
+      device_id: dev.id,
+      device_identifier: devIdentifier,
+      device_name: dev.device_name,
+      auth_source: 'Hardware Terminal',
+      auth_method: authMethod,
+      employee_code: empCode,
+      employee_name: emp.full_name,
+      department: emp.department,
+      punch_type: punchType,
+      status: 'Failure',
+      failure_reason: `Employee status is ${emp.status}`,
+      verified_at: now,
+    });
+    res.status(403).json({ error: `Employee ${empCode} is ${emp.status}.` });
+    return;
+  }
 
   const empName = String(b.employee_name || emp?.full_name || 'Hardware Biometric Staff').trim();
   const dept = String(b.department || emp?.department || 'Production').trim();
   const hourly = Number(b.hourly_rate) || (emp?.basic_salary ? Number((emp.basic_salary / 208).toFixed(2)) : 50);
   const otHours = Number(b.ot_hours) || 0;
   const otType = String(b.ot_type || 'None');
-  const { mult, pay } = computeAttOt(otType, otHours, hourly, tid);
   const attDate = String(b.attendance_date || now.slice(0, 10));
   const punchTime = String(b.punch_time || now.slice(11, 16));
-  const checkIn = b.check_in || (b.punch_type === 'Check-Out' ? '08:00' : punchTime);
-  const checkOut = b.check_out || (b.punch_type === 'Check-Out' ? punchTime : '17:00');
 
-  const attInfo = db
-    .prepare(
-      `
-    INSERT INTO attendance_records (
-      tenant_id, employee_code, employee_name, department, attendance_date, shift_name, check_in, check_out,
-      hourly_rate, regular_hours, ot_type, ot_hours, ot_multiplier, ot_pay, status, register_state, notes, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Present', 'Open', ?, ?)
-  `
-    )
-    .run(
-      tid,
-      empCode,
-      empName,
-      dept,
-      attDate,
-      b.shift_name || `Device Sync (${dev.device_name})`,
-      checkIn,
-      checkOut,
-      hourly,
-      Number(b.regular_hours) || 8,
-      otType,
-      otHours,
-      mult,
-      pay,
-      b.notes || `Biometric punch synced via ${dev.device_name} (${b.punch_type || 'Check-In'})`,
-      now
-    );
+  const attendance = upsertBiometricAttendanceRecord({
+    tid,
+    empCode,
+    empName,
+    department: dept,
+    attDate,
+    punchTime,
+    punchType,
+    deviceName: dev.device_name,
+    shiftName: b.shift_name ? String(b.shift_name) : undefined,
+    otType,
+    otHours,
+    regularHoursOverride: b.regular_hours ? Number(b.regular_hours) : undefined,
+    hourlyRateOverride: hourly,
+    notes: b.notes ? String(b.notes) : `Biometric punch synced via ${dev.device_name} (${punchType})`,
+    actor: getActorName(req),
+  });
 
   db.prepare(
     "UPDATE devices SET status='Connected', punch_count = COALESCE(punch_count, 0) + 1, last_sync_at=?, last_checked_at=?, last_message=? WHERE id=?"
-  ).run(now, now, `Synced ${empCode} (${b.punch_type || 'Check-In'})`, id);
+  ).run(now, now, `Synced ${empCode} (${punchType})`, id);
 
-  const attendance = db.prepare('SELECT * FROM attendance_records WHERE id = ?').get(attInfo.lastInsertRowid);
-  const device = db.prepare('SELECT * FROM devices WHERE id = ?').get(id);
+  const attId = Number(attendance.id || 0) || null;
+  const authLog = insertBiometricAuthLog({
+    tenant_id: tid,
+    device_id: dev.id,
+    device_identifier: devIdentifier,
+    device_name: dev.device_name,
+    auth_source: 'Hardware Terminal',
+    auth_method: authMethod,
+    employee_code: empCode,
+    employee_name: empName,
+    department: dept,
+    punch_type: punchType,
+    status: 'Success',
+    failure_reason: '',
+    attendance_record_id: attId,
+    attendance_marked: attId ? 1 : 0,
+    verified_at: now,
+  });
+
+  const device = maskDeviceRow(db.prepare('SELECT * FROM devices WHERE id = ?').get(id));
   logAudit(req, 'PUNCH_SYNC', 'Device Connections', `Ingested biometric punch for ${empName} (${empCode}) via ${dev.device_name}`, tid);
   broadcastWs('device:punch', { device_id: id, tenant_id: tid, employee_code: empCode });
-  broadcastWs('attendance:updated', { tenant_id: tid });
-  res.status(201).json({ device, attendance });
+  broadcastWs('attendance:updated', { tenant_id: tid, attendance_id: attId, employee_code: empCode });
+  res.status(201).json({ device, attendance, authLog });
 });
 
 // ZKTeco / iClock ADMS Hardware Push Compatibility Endpoint
@@ -3523,14 +5206,31 @@ app.get('/api/iclock/cdata', (req, res) => {
 
 app.post('/api/iclock/cdata', express.text({ type: '*/*' }), (req, res) => {
   const sn = String(req.query.SN || '').trim();
+  const now = new Date().toISOString();
   const dev = db.prepare('SELECT * FROM devices WHERE serial_number = ?').get(sn) as
-    | { id: number; tenant_id: number; device_name: string }
+    | { id: number; tenant_id: number; device_name: string; device_type?: string }
     | undefined;
   if (!dev) {
+    if (sn) {
+      insertBiometricAuthLog({
+        tenant_id: 1,
+        device_id: null,
+        device_identifier: sn,
+        device_name: `Unregistered ADMS (${sn})`,
+        auth_source: 'ZKTeco ADMS',
+        auth_method: 'Fingerprint',
+        employee_code: '',
+        employee_name: '',
+        department: '',
+        punch_type: 'Check-In',
+        status: 'Failure',
+        failure_reason: `Unregistered device serial number "${sn}"`,
+        verified_at: now,
+      });
+    }
     res.type('text/plain').send('OK');
     return;
   }
-  const now = new Date().toISOString();
   const bodyText = typeof req.body === 'string' ? req.body : '';
   const lines = bodyText
     .split(/\r?\n/)
@@ -3542,36 +5242,52 @@ app.post('/api/iclock/cdata', express.text({ type: '*/*' }), (req, res) => {
     if (parts.length < 2) continue;
     const empCode = parts[0].trim();
     const ts = parts[1].trim();
+    const punchFlag = parts[2]?.trim();
+    const punchType = punchFlag === '1' ? 'Check-Out' : 'Check-In';
     const attDate = ts.slice(0, 10) || now.slice(0, 10);
     const punchTime = ts.slice(11, 16) || now.slice(11, 16);
     const emp = db
       .prepare('SELECT full_name, department, basic_salary FROM employees WHERE tenant_id = ? AND employee_id = ?')
       .get(dev.tenant_id, empCode) as { full_name: string; department: string; basic_salary: number } | undefined;
-    db.prepare(
-      `
-      INSERT INTO attendance_records (
-        tenant_id, employee_code, employee_name, department, attendance_date, shift_name, check_in, check_out,
-        hourly_rate, regular_hours, ot_type, ot_hours, ot_multiplier, ot_pay, status, register_state, notes, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, '17:00', ?, 8, 'None', 0, 1, 0, 'Present', 'Open', ?, ?)
-    `
-    ).run(
-      dev.tenant_id,
+    const att = upsertBiometricAttendanceRecord({
+      tid: dev.tenant_id,
       empCode,
-      emp?.full_name || empCode,
-      emp?.department || 'Production',
+      empName: emp?.full_name || empCode,
+      department: emp?.department || 'Production',
       attDate,
-      `ADMS Push (${dev.device_name})`,
       punchTime,
-      emp?.basic_salary ? Number((emp.basic_salary / 208).toFixed(2)) : 50,
-      `ZKTeco ADMS Serial ${sn}`,
-      now
-    );
+      punchType,
+      deviceName: dev.device_name,
+      shiftName: `ADMS Push (${dev.device_name})`,
+      hourlyRateOverride: emp?.basic_salary ? Number((emp.basic_salary / 208).toFixed(2)) : 50,
+      notes: `ZKTeco ADMS Serial ${sn}`,
+      actor: 'ZKTeco ADMS',
+    });
+    const attId = Number(att.id || 0) || null;
+    insertBiometricAuthLog({
+      tenant_id: dev.tenant_id,
+      device_id: dev.id,
+      device_identifier: sn,
+      device_name: dev.device_name,
+      auth_source: 'ZKTeco ADMS',
+      auth_method: dev.device_type?.toLowerCase().includes('face') ? 'Face ID' : 'Fingerprint',
+      employee_code: empCode,
+      employee_name: emp?.full_name || empCode,
+      department: emp?.department || 'Production',
+      punch_type: punchType,
+      status: 'Success',
+      failure_reason: '',
+      attendance_record_id: attId,
+      attendance_marked: attId ? 1 : 0,
+      verified_at: ts.includes('T') || ts.includes(' ') ? ts : now,
+    });
     ingested++;
   }
   db.prepare(
     "UPDATE devices SET status='Connected', punch_count = COALESCE(punch_count, 0) + ?, last_sync_at=?, last_checked_at=?, last_message=? WHERE id=?"
   ).run(Math.max(1, ingested), now, now, `ADMS synced ${ingested || 1} record(s)`, dev.id);
   broadcastWs('device:punch', { device_id: dev.id, tenant_id: dev.tenant_id, ingested });
+  broadcastWs('attendance:updated', { tenant_id: dev.tenant_id, ingested });
   res.type('text/plain').send('OK');
 });
 
@@ -3579,7 +5295,7 @@ app.post('/api/devices/:id/disconnect', (req, res) => {
   const tid = getTenantId(req);
   const id = Number(req.params.id);
   db.prepare("UPDATE devices SET status='Disconnected', last_message='Disconnected by operator' WHERE id=? AND tenant_id=?").run(id, tid);
-  res.json(db.prepare('SELECT * FROM devices WHERE id = ? AND tenant_id = ?').get(id, tid));
+  res.json(maskDeviceRow(db.prepare('SELECT * FROM devices WHERE id = ? AND tenant_id = ?').get(id, tid)));
 });
 
 app.delete('/api/devices/:id', (req, res) => {
@@ -3728,6 +5444,252 @@ function computeAttOt(otType: string, otHours: number, hourlyRate: number, tenan
   else mult = 1;
   const pay = otType === 'None' ? 0 : Number((hourlyRate * otHours * mult).toFixed(2));
   return { mult, pay };
+}
+
+function inferShiftPeriodFromTime(hhmm: string): 'Morning' | 'Afternoon' | 'Night' {
+  const mins = timeToMinutes(hhmm);
+  if (mins >= 5 * 60 && mins < 13 * 60) return 'Morning';
+  if (mins >= 13 * 60 && mins < 21 * 60) return 'Afternoon';
+  return 'Night';
+}
+
+function insertBiometricAuthLog(entry: {
+  tenant_id: number;
+  device_id: number | null;
+  device_identifier: string;
+  device_name: string;
+  auth_source: string;
+  auth_method: string;
+  employee_code: string;
+  employee_name: string;
+  department: string;
+  punch_type: string;
+  status: 'Success' | 'Failure';
+  failure_reason?: string;
+  attendance_record_id?: number | null;
+  attendance_marked?: number;
+  verified_at?: string;
+}) {
+  const now = new Date().toISOString();
+  const verifiedAt = entry.verified_at || now;
+  const info = db
+    .prepare(
+      `INSERT INTO biometric_auth_logs (
+        tenant_id, device_id, device_identifier, device_name, auth_source, auth_method,
+        employee_code, employee_name, department, punch_type, status, failure_reason,
+        attendance_record_id, attendance_marked, verified_at, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .run(
+      entry.tenant_id,
+      entry.device_id,
+      entry.device_identifier,
+      entry.device_name,
+      entry.auth_source,
+      entry.auth_method,
+      entry.employee_code,
+      entry.employee_name,
+      entry.department,
+      entry.punch_type,
+      entry.status,
+      entry.failure_reason || '',
+      entry.attendance_record_id ?? null,
+      entry.attendance_marked ? 1 : 0,
+      verifiedAt,
+      now
+    );
+  const row = db.prepare('SELECT * FROM biometric_auth_logs WHERE id = ?').get(info.lastInsertRowid) as Record<string, unknown>;
+  broadcastWs('biometric:auth_log', row);
+  return row;
+}
+
+function upsertBiometricAttendanceRecord(params: {
+  tid: number;
+  empCode: string;
+  empName?: string;
+  department?: string;
+  attDate: string;
+  punchTime: string;
+  punchType: 'Check-In' | 'Check-Out' | string;
+  deviceName: string;
+  shiftName?: string;
+  otType?: string;
+  otHours?: number;
+  regularHoursOverride?: number;
+  hourlyRateOverride?: number;
+  notes?: string;
+  actor?: string;
+}): Record<string, unknown> {
+  const {
+    tid,
+    empCode,
+    empName,
+    department,
+    attDate,
+    punchTime,
+    punchType,
+    deviceName,
+    shiftName,
+    otType,
+    otHours,
+    regularHoursOverride,
+    hourlyRateOverride,
+    notes,
+    actor = 'Biometric Auto-Sync',
+  } = params;
+
+  const now = new Date().toISOString();
+  const existingOpen = db
+    .prepare(
+      "SELECT * FROM attendance_records WHERE tenant_id = ? AND employee_code = ? AND attendance_date = ? AND register_state = 'Open' ORDER BY id DESC LIMIT 1"
+    )
+    .get(tid, empCode, attDate) as Record<string, unknown> | undefined;
+
+  if (existingOpen && punchType === 'Check-Out') {
+    const period = String(existingOpen.shift_period || inferShiftPeriodFromTime(punchTime));
+    const checkInVal = String(existingOpen.check_in || existingOpen.scheduled_start || '08:00');
+    const resolved = resolveAttendancePayload(
+      {
+        employee_code: empCode,
+        employee_name: empName || existingOpen.employee_name,
+        department: department || existingOpen.department,
+        attendance_date: attDate,
+        shift_id: existingOpen.shift_id,
+        shift_name: shiftName || existingOpen.shift_name,
+        shift_period: period,
+        scheduled_start: existingOpen.scheduled_start,
+        scheduled_end: existingOpen.scheduled_end,
+        break_minutes: existingOpen.break_minutes,
+        hourly_rate: hourlyRateOverride || existingOpen.hourly_rate,
+        check_in: checkInVal,
+        check_out: punchTime,
+        morning_check_in: existingOpen.morning_check_in || (period === 'Morning' || period === 'Day' ? checkInVal : ''),
+        morning_check_out: period === 'Morning' || period === 'Day' ? punchTime : existingOpen.morning_check_out,
+        afternoon_check_in: existingOpen.afternoon_check_in || (period === 'Afternoon' ? checkInVal : ''),
+        afternoon_check_out: period === 'Afternoon' ? punchTime : existingOpen.afternoon_check_out,
+        night_check_in: existingOpen.night_check_in || (period === 'Night' || period === 'Security' ? checkInVal : ''),
+        night_check_out: period === 'Night' || period === 'Security' ? punchTime : existingOpen.night_check_out,
+        ot_type: otType && otType !== 'None' ? otType : existingOpen.ot_type,
+        ot_hours: otHours !== undefined && otHours > 0 ? otHours : undefined,
+        notes: `${String(existingOpen.notes || '').trim()} | Out: ${punchTime} (${deviceName})`.replace(/^ \|\s*/, ''),
+      },
+      tid
+    );
+
+    db.prepare(
+      `UPDATE attendance_records SET
+        check_out=?, morning_check_out=?, afternoon_check_out=?, night_check_out=?,
+        regular_hours=?, late_minutes=?, early_departure_minutes=?, absence_hours=?,
+        ot_type=?, ot_hours=?, ot_multiplier=?, ot_pay=?, status=?, notes=?, updated_by=?, updated_at=?
+       WHERE id = ? AND tenant_id = ?`
+    ).run(
+      resolved.lastPunchOut,
+      resolved.morningOut,
+      resolved.afternoonOut,
+      resolved.nightOut,
+      resolved.regularHours,
+      resolved.lateMinutes,
+      resolved.earlyDepartureMinutes,
+      resolved.absenceHours,
+      resolved.otType,
+      resolved.otHours,
+      resolved.mult,
+      resolved.pay,
+      resolved.derivedStatus,
+      resolved.notes,
+      actor,
+      now,
+      existingOpen.id,
+      tid
+    );
+    return db.prepare('SELECT * FROM attendance_records WHERE id = ?').get(existingOpen.id) as Record<string, unknown>;
+  }
+
+  const periodHint = inferShiftPeriodFromTime(punchTime);
+  const schedRow = db
+    .prepare("SELECT * FROM staff_schedules WHERE tenant_id = ? AND employee_id = ? AND schedule_date = ? AND approval_status != 'Rejected' ORDER BY id DESC LIMIT 1")
+    .get(tid, empCode, attDate) as Record<string, unknown> | undefined;
+  const resolvedPeriod = schedRow?.shift_name
+    ? String(schedRow.shift_name).toLowerCase().includes('night')
+      ? 'Night'
+      : String(schedRow.shift_name).toLowerCase().includes('afternoon')
+      ? 'Afternoon'
+      : 'Morning'
+    : periodHint;
+
+  const isOut = punchType === 'Check-Out';
+  const payload = resolveAttendancePayload(
+    {
+      employee_code: empCode,
+      employee_name: empName,
+      department,
+      attendance_date: attDate,
+      shift_name: shiftName || schedRow?.shift_name || `${resolvedPeriod} Shift`,
+      shift_period: resolvedPeriod,
+      check_in: isOut ? undefined : punchTime,
+      check_out: isOut ? punchTime : undefined,
+      morning_check_in: resolvedPeriod === 'Morning' && !isOut ? punchTime : '',
+      morning_check_out: resolvedPeriod === 'Morning' && isOut ? punchTime : '',
+      afternoon_check_in: resolvedPeriod === 'Afternoon' && !isOut ? punchTime : '',
+      afternoon_check_out: resolvedPeriod === 'Afternoon' && isOut ? punchTime : '',
+      night_check_in: resolvedPeriod === 'Night' && !isOut ? punchTime : '',
+      night_check_out: resolvedPeriod === 'Night' && isOut ? punchTime : '',
+      hourly_rate: hourlyRateOverride,
+      regular_hours: regularHoursOverride,
+      ot_type: otType || 'None',
+      ot_hours: otHours,
+      notes: notes || `Auto-marked via biometric auth (${deviceName} · ${punchType})`,
+    },
+    tid
+  );
+
+  const info = db
+    .prepare(
+      `INSERT INTO attendance_records (
+        tenant_id, employee_code, employee_name, department, attendance_date, shift_id, shift_name, shift_period,
+        check_in, check_out, morning_check_in, morning_check_out, afternoon_check_in, afternoon_check_out,
+        night_check_in, night_check_out, scheduled_start, scheduled_end, hourly_rate, regular_hours,
+        late_minutes, early_departure_minutes, break_minutes, absence_hours,
+        ot_type, ot_hours, ot_multiplier, ot_pay, status, register_state, notes, updated_by, updated_at, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Open', ?, ?, ?, ?)`
+    )
+    .run(
+      tid,
+      payload.empCode,
+      payload.employeeName,
+      payload.department,
+      payload.attendanceDate,
+      payload.shiftId,
+      payload.shiftName,
+      payload.shiftPeriod,
+      payload.firstPunchIn,
+      payload.lastPunchOut,
+      payload.morningIn,
+      payload.morningOut,
+      payload.afternoonIn,
+      payload.afternoonOut,
+      payload.nightIn,
+      payload.nightOut,
+      payload.scheduledStart,
+      payload.scheduledEnd,
+      payload.hourlyRate,
+      payload.regularHours,
+      payload.lateMinutes,
+      payload.earlyDepartureMinutes,
+      payload.breakMinutes,
+      payload.absenceHours,
+      payload.otType,
+      payload.otHours,
+      payload.mult,
+      payload.pay,
+      payload.derivedStatus,
+      payload.notes,
+      actor,
+      now,
+      now
+    );
+
+  return db.prepare('SELECT * FROM attendance_records WHERE id = ?').get(info.lastInsertRowid) as Record<string, unknown>;
 }
 
 function resolveAttendancePayload(b: Record<string, unknown>, tid: number) {
@@ -3983,6 +5945,15 @@ app.post('/api/attendance', (req, res) => {
       now
     );
   logAudit(req, 'CREATE', 'Attendance', `Recorded ${r.shiftPeriod} attendance for ${r.employeeName} (${r.empCode}) on ${r.attendanceDate} [${r.derivedStatus}]`, tid);
+  if (r.lateMinutes > 0 || r.absenceHours > 0 || ['Absent', 'Late', 'Late & Early'].includes(r.derivedStatus)) {
+    void dispatchNotification(tid, {
+      event_type: 'ATTENDANCE_ALERT',
+      title: `Attendance Exception (${r.derivedStatus}): ${r.employeeName}`,
+      message: `${r.employeeName} (${r.empCode}, ${r.department}) on ${r.attendanceDate}: Late ${r.lateMinutes}m, Absence ${r.absenceHours}h.`,
+      severity: r.derivedStatus === 'Absent' ? 'critical' : 'warning',
+      module: 'attendance',
+    });
+  }
   res.status(201).json(db.prepare('SELECT * FROM attendance_records WHERE id = ?').get(info.lastInsertRowid));
 });
 
@@ -4069,8 +6040,12 @@ app.post('/api/attendance/import', (req, res) => {
       ot_type, ot_hours, ot_multiplier, ot_pay, status, register_state, notes, updated_by, updated_at, created_at
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Open', ?, ?, ?, ?)
   `);
+  let exceptionCount = 0;
   for (const row of rows) {
     const r = resolveAttendancePayload({ ...row, notes: row.notes || 'CSV Import' }, tid);
+    if (r.lateMinutes > 0 || r.absenceHours > 0 || ['Absent', 'Late', 'Late & Early'].includes(r.derivedStatus)) {
+      exceptionCount += 1;
+    }
     ins.run(
       tid,
       r.empCode,
@@ -4108,6 +6083,15 @@ app.post('/api/attendance/import', (req, res) => {
     );
   }
   logAudit(req, 'IMPORT', 'Attendance', `Imported ${rows.length} attendance records via CSV`, tid);
+  if (exceptionCount > 0) {
+    void dispatchNotification(tid, {
+      event_type: 'ATTENDANCE_ALERT',
+      title: `Attendance Import Alert (${exceptionCount} Exception${exceptionCount > 1 ? 's' : ''})`,
+      message: `CSV import added ${rows.length} attendance records including ${exceptionCount} late or absent exception(s).`,
+      severity: 'warning',
+      module: 'attendance',
+    });
+  }
   res.json({ imported: rows.length });
 });
 
@@ -4843,18 +6827,44 @@ app.post('/api/leaves', (req, res) => {
   `
     )
     .run(tid, b.employee_code, b.employee_name, b.department, b.leave_type, b.start_date, b.end_date, Number(b.days) || 1, b.reason || '', now);
-  res.status(201).json(db.prepare('SELECT * FROM leaves WHERE id = ?').get(info.lastInsertRowid));
+  const created = db.prepare('SELECT * FROM leaves WHERE id = ?').get(info.lastInsertRowid);
+  void dispatchNotification(tid, {
+    event_type: 'LEAVE_STATUS',
+    title: `Leave Request Submitted: ${b.employee_name}`,
+    message: `${b.employee_name} (${b.department}) requested ${Number(b.days) || 1} day(s) of ${b.leave_type} (${b.start_date} to ${b.end_date}).`,
+    severity: 'warning',
+    module: 'leave',
+  });
+  res.status(201).json(created);
 });
 app.patch('/api/leaves/:id/status', (req, res) => {
   const tid = getTenantId(req);
   const id = Number(req.params.id);
+  const nextStatus = req.body?.status || 'Approved';
+  const actor = getActorName(req);
   db.prepare('UPDATE leaves SET status = ?, approved_by = ? WHERE id = ? AND tenant_id = ?').run(
-    req.body?.status || 'Approved',
-    getActorName(req),
+    nextStatus,
+    actor,
     id,
     tid
   );
-  res.json(db.prepare('SELECT * FROM leaves WHERE id = ? AND tenant_id = ?').get(id, tid));
+  const updated = db.prepare('SELECT * FROM leaves WHERE id = ? AND tenant_id = ?').get(id, tid) as
+    | { employee_name?: string; employee_code?: string; leave_type?: string; start_date?: string; end_date?: string }
+    | undefined;
+  if (updated) {
+    const empRow = db
+      .prepare('SELECT email FROM employees WHERE tenant_id = ? AND employee_id = ?')
+      .get(tid, updated.employee_code || '') as { email?: string } | undefined;
+    void dispatchNotification(tid, {
+      event_type: 'LEAVE_STATUS',
+      title: `Leave ${nextStatus}: ${updated.employee_name}`,
+      message: `${updated.leave_type} (${updated.start_date} – ${updated.end_date}) was marked ${nextStatus} by ${actor}.`,
+      severity: nextStatus === 'Rejected' ? 'warning' : 'info',
+      module: 'leave',
+      recipientEmail: empRow?.email || undefined,
+    });
+  }
+  res.json(updated);
 });
 app.delete('/api/leaves/:id', (req, res) => {
   const tid = getTenantId(req);
@@ -4958,6 +6968,7 @@ app.get('/api/files/:id/download', (req, res) => {
     return;
   }
   const safeName = String(row.file_name || 'document').replace(/[\r\n"]/g, '_');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
   if (row.file_data && row.file_data.includes('base64,')) {
     const b64 = row.file_data.split('base64,')[1] || '';
     const buf = Buffer.from(b64, 'base64');
@@ -4971,6 +6982,13 @@ app.get('/api/files/:id/download', (req, res) => {
   res.send(row.extracted_text || '');
 });
 
+const ALLOWED_UPLOAD_EXTS = new Set([
+  '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.csv', '.txt', '.png', '.jpg', '.jpeg', '.webp', '.json', '.rtf',
+]);
+const BLOCKED_UPLOAD_EXTS = new Set(['.svg', '.html', '.htm', '.js', '.mjs', '.cjs', '.php', '.exe', '.bat', '.cmd', '.sh', '.ps1']);
+const BLOCKED_UPLOAD_MIMES = new Set(['image/svg+xml', 'text/html', 'application/javascript', 'text/javascript', 'application/x-msdownload']);
+const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
+
 app.post('/api/files', (req, res) => {
   const tid = getTenantId(req);
   const body = req.body || {};
@@ -4978,6 +6996,32 @@ app.post('/api/files', (req, res) => {
   if (incomingList.length === 0) {
     res.status(400).json({ error: 'No files provided for import.' });
     return;
+  }
+  for (const item of incomingList) {
+    const f = (item || {}) as Record<string, unknown>;
+    const fileName = String(f.file_name || 'document.txt').trim();
+    const ext = path.extname(fileName).toLowerCase();
+    const mime = String(f.mime_type || '').toLowerCase().split(';')[0].trim();
+    if (BLOCKED_UPLOAD_EXTS.has(ext) || BLOCKED_UPLOAD_MIMES.has(mime)) {
+      res.status(400).json({ error: `Executable or active script files (${ext || mime}) are blocked for security.` });
+      return;
+    }
+    if (ext && !ALLOWED_UPLOAD_EXTS.has(ext)) {
+      res.status(400).json({ error: `Unsupported file extension "${ext}". Allowed: PDF, Office docs, CSV, TXT, JSON, PNG, JPG, WEBP.` });
+      return;
+    }
+    const rawData = String(f.file_data || '');
+    if (rawData.includes('base64,')) {
+      const b64 = rawData.split('base64,')[1] || '';
+      const approxBytes = Math.floor((b64.length * 3) / 4);
+      if (approxBytes > MAX_UPLOAD_BYTES) {
+        res.status(413).json({ error: `File "${fileName}" exceeds the 10 MB per-file upload limit.` });
+        return;
+      }
+    } else if (Number(f.file_size || 0) > MAX_UPLOAD_BYTES) {
+      res.status(413).json({ error: `File "${fileName}" exceeds the 10 MB per-file upload limit.` });
+      return;
+    }
   }
   const now = new Date().toISOString();
   const actor = getActorName(req);
@@ -5556,6 +7600,18 @@ app.post('/api/gin', (req, res) => {
       Number(b.material_id),
       tid
     );
+    const mat = db
+      .prepare('SELECT name, stock_qty, reorder_level, unit FROM materials WHERE id = ? AND tenant_id = ?')
+      .get(Number(b.material_id), tid) as { name: string; stock_qty: number; reorder_level: number; unit: string } | undefined;
+    if (mat && mat.stock_qty <= mat.reorder_level) {
+      void dispatchNotification(tid, {
+        event_type: 'LOW_STOCK',
+        title: `Low Stock Alert: ${mat.name}`,
+        message: `After GIN ${num}, stock dropped to ${mat.stock_qty} ${mat.unit} (reorder level: ${mat.reorder_level}).`,
+        severity: 'critical',
+        module: 'materials',
+      });
+    }
   }
   const info = db
     .prepare(
@@ -5631,6 +7687,18 @@ app.post('/api/inventory-movements', (req, res) => {
         Number(b.material_id),
         tid
       );
+    }
+    const mat = db
+      .prepare('SELECT name, stock_qty, reorder_level, unit FROM materials WHERE id = ? AND tenant_id = ?')
+      .get(Number(b.material_id), tid) as { name: string; stock_qty: number; reorder_level: number; unit: string } | undefined;
+    if (mat && mat.stock_qty <= mat.reorder_level) {
+      void dispatchNotification(tid, {
+        event_type: 'LOW_STOCK',
+        title: `Low Stock Alert: ${mat.name}`,
+        message: `Inventory ${b.movement_type || 'Movement'} (${num}) left ${mat.stock_qty} ${mat.unit} (reorder level: ${mat.reorder_level}).`,
+        severity: 'critical',
+        module: 'materials',
+      });
     }
   }
   const info = db
@@ -5830,7 +7898,15 @@ app.post('/api/sales-orders', (req, res) => {
       b.payment_status || 'Pending',
       now
     );
-  res.status(201).json(db.prepare('SELECT * FROM sales_orders WHERE id = ?').get(info.lastInsertRowid));
+  const created = db.prepare('SELECT * FROM sales_orders WHERE id = ?').get(info.lastInsertRowid);
+  void dispatchNotification(tid, {
+    event_type: 'SALE_ORDER',
+    title: `New Sales Order ${num}`,
+    message: `${b.customer_name} ordered ${b.product_service} (Qty ${Number(b.quantity) || 1}) · Amount ${(Number(b.amount) || 0).toFixed(2)}.`,
+    severity: 'info',
+    module: 'sales-crm',
+  });
+  res.status(201).json(created);
 });
 app.patch('/api/sales-orders/:id/status', (req, res) => {
   const tid = getTenantId(req);
@@ -6456,6 +8532,13 @@ app.post('/api/approvals', (req, res) => {
   const created = db.prepare('SELECT * FROM department_approvals WHERE id = ?').get(info.lastInsertRowid);
   logAudit(req, 'DISPATCH', 'Approvals', `Sent "${b.title}" (${b.record_ref}) to ${b.target_department} for approval`, tid);
   broadcastWs('approval:created', created);
+  void dispatchNotification(tid, {
+    event_type: 'APPROVAL_REQUEST',
+    title: `Approval Request (${b.target_department || 'General Manager'}): ${b.title || 'Department Approval Request'}`,
+    message: `Ref: ${b.record_ref || 'DRAFT'} · From ${b.from_department || 'Operations'} · Priority: ${b.priority === 'Urgent' ? 'Urgent' : 'Normal'}.`,
+    severity: b.priority === 'Urgent' ? 'critical' : 'warning',
+    module: 'approvals',
+  });
   res.status(201).json(created);
 });
 
@@ -6473,9 +8556,20 @@ app.patch('/api/approvals/:id/decision', (req, res) => {
     WHERE id = ? AND tenant_id = ?
   `
   ).run(status, decider, b.decision_notes || '', now, id, tid);
-  const updated = db.prepare('SELECT * FROM department_approvals WHERE id = ? AND tenant_id = ?').get(id, tid);
+  const updated = db.prepare('SELECT * FROM department_approvals WHERE id = ? AND tenant_id = ?').get(id, tid) as
+    | { title?: string; request_code?: string; target_department?: string }
+    | undefined;
   logAudit(req, status.toUpperCase(), 'Approvals', `${status} department request #${id} (${decider})`, tid);
   broadcastWs('approval:decided', updated);
+  if (updated) {
+    void dispatchNotification(tid, {
+      event_type: 'APPROVAL_REQUEST',
+      title: `Approval ${status}: ${updated.title || updated.request_code}`,
+      message: `${updated.request_code} was ${status.toLowerCase()} by ${decider} (${updated.target_department}).`,
+      severity: status === 'Rejected' ? 'warning' : 'info',
+      module: 'approvals',
+    });
+  }
   res.json(updated);
 });
 
@@ -6485,26 +8579,81 @@ app.delete('/api/approvals/:id', (req, res) => {
   res.json({ ok: true });
 });
 
-// Share Dispatch Audit & Email Endpoint
-app.post('/api/share/email', (req, res) => {
+// Share Dispatch Audit & Real Email Delivery Endpoint
+app.post('/api/share/email', async (req, res) => {
   const tid = getTenantId(req);
   const b = req.body || {};
   const recipient = String(b.recipient || '').trim();
   const subject = String(b.subject || 'Seven Sunday Document Share').trim();
   const channel = String(b.channel || 'Email').trim();
-  if (channel === 'Email' && !recipient) {
-    res.status(400).json({ error: 'Recipient email address is required.' });
+  const bodyText = String(b.body || subject).trim();
+  const now = new Date().toISOString();
+
+  if (channel === 'Email') {
+    if (!recipient || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(recipient)) {
+      res.status(400).json({ error: 'A valid recipient email address is required.' });
+      return;
+    }
+    const emailRes = await sendRealEmail({
+      tid,
+      to: recipient,
+      subject,
+      text: bodyText,
+    });
+    const logStatus = emailRes.ok ? 'Delivered' : 'Failed';
+    db.prepare(
+      `INSERT INTO notification_logs (
+        tenant_id, event_type, channel, recipient, title, message, severity, module, status, error_message, retry_count, created_at, delivered_at
+      ) VALUES (?, 'DOCUMENT_SHARE', 'Email', ?, ?, ?, ?, 'secretary', ?, ?, 0, ?, ?)`
+    ).run(
+      tid,
+      recipient,
+      subject,
+      bodyText.slice(0, 1000),
+      emailRes.ok ? 'info' : 'warning',
+      logStatus,
+      emailRes.error || '',
+      now,
+      emailRes.ok ? new Date().toISOString() : null
+    );
+    logAudit(req, emailRes.ok ? 'SHARE' : 'SHARE_FAILED', 'Sharing', `Email share "${subject}" to ${recipient}: ${logStatus}${emailRes.error ? ` (${emailRes.error})` : ''}`, tid);
+
+    if (!emailRes.ok) {
+      res.status(502).json({
+        ok: false,
+        delivered: false,
+        error: emailRes.error || 'SMTP delivery failed.',
+        smtp_host: emailRes.host,
+      });
+      return;
+    }
+
+    res.json({
+      ok: true,
+      delivered: true,
+      channel,
+      recipient,
+      subject,
+      smtp_host: emailRes.host,
+      messageId: emailRes.messageId,
+      recorded_at: now,
+    });
     return;
   }
-  const settings = buildCompanySettingsForTenant(tid) as { smtp_host?: string; smtp_port?: number; smtp_from?: string };
+
+  db.prepare(
+    `INSERT INTO notification_logs (
+      tenant_id, event_type, channel, recipient, title, message, severity, module, status, error_message, retry_count, created_at, delivered_at
+    ) VALUES (?, 'DOCUMENT_SHARE', ?, ?, ?, ?, 'info', 'secretary', 'Logged (Client Action)', '', 0, ?, ?)`
+  ).run(tid, channel, recipient || channel, subject, bodyText.slice(0, 500), now, now);
   logAudit(req, 'SHARE', 'Sharing', `Shared "${subject}" via ${channel}${recipient ? ` to ${recipient}` : ''}`, tid);
   res.json({
     ok: true,
+    delivered: true,
     channel,
     recipient,
     subject,
-    smtp_host: settings?.smtp_host || 'smtp.sevensundayethiopia.com',
-    recorded_at: new Date().toISOString(),
+    recorded_at: now,
   });
 });
 
@@ -6618,6 +8767,137 @@ app.get('/api/notifications', (req, res) => {
   }
 
   res.json(items);
+});
+
+app.get('/api/notifications/history', (req, res) => {
+  const tid = getTenantId(req);
+  const rows = db
+    .prepare('SELECT * FROM notification_logs WHERE tenant_id = ? ORDER BY id DESC LIMIT 150')
+    .all(tid);
+  res.json(rows);
+});
+
+app.post('/api/notifications/:id/retry', async (req, res) => {
+  const tid = getTenantId(req);
+  const id = Number(req.params.id);
+  const logRow = db.prepare('SELECT * FROM notification_logs WHERE id = ? AND tenant_id = ?').get(id, tid) as
+    | {
+        id: number;
+        event_type: string;
+        channel: string;
+        recipient: string;
+        title: string;
+        message: string;
+        severity: string;
+        module: string;
+        retry_count: number;
+      }
+    | undefined;
+  if (!logRow) {
+    res.status(404).json({ error: 'Notification log entry not found.' });
+    return;
+  }
+  let ok = false;
+  let errorMsg = '';
+  const cfg = getNotificationChannelConfig(tid);
+
+  if (logRow.channel === 'Email') {
+    const emailRes = await sendRealEmail({
+      tid,
+      to: logRow.recipient,
+      subject: logRow.title,
+      text: logRow.message,
+    });
+    ok = emailRes.ok;
+    errorMsg = emailRes.error || '';
+  } else if (logRow.channel === 'Telegram') {
+    const tgToken = decryptField(String(cfg.telegram_bot_token || ''));
+    const tgChat = String(cfg.telegram_chat_id || '').trim() || logRow.recipient;
+    const tgRes = await sendTelegramBotMessage(tgToken, tgChat, `[${logRow.severity.toUpperCase()}] ${logRow.title}\n${logRow.message}`);
+    ok = tgRes.ok;
+    errorMsg = tgRes.error || '';
+  } else if (logRow.channel === 'Webhook') {
+    const whUrl = String(cfg.whatsapp_webhook_url || logRow.recipient || '').trim();
+    const whRes = await sendWebhookAlert(whUrl, {
+      tenant_id: tid,
+      event_type: logRow.event_type,
+      title: logRow.title,
+      message: logRow.message,
+      severity: logRow.severity,
+      module: logRow.module,
+      retried_at: new Date().toISOString(),
+    });
+    ok = whRes.ok;
+    errorMsg = whRes.error || '';
+  } else {
+    ok = true;
+  }
+
+  const nextStatus = ok ? 'Delivered' : 'Failed';
+  db.prepare(
+    `UPDATE notification_logs
+     SET status = ?, error_message = ?, retry_count = COALESCE(retry_count, 0) + 1,
+         delivered_at = CASE WHEN ? = 'Delivered' THEN ? ELSE delivered_at END
+     WHERE id = ? AND tenant_id = ?`
+  ).run(nextStatus, errorMsg, nextStatus, new Date().toISOString(), id, tid);
+
+  const updated = db.prepare('SELECT * FROM notification_logs WHERE id = ? AND tenant_id = ?').get(id, tid);
+  logAudit(req, 'RETRY_NOTIFICATION', 'Notifications', `Retried ${logRow.channel} notification #${id} -> ${nextStatus}`, tid);
+  res.json(updated);
+});
+
+app.get('/api/notifications/channels', (req, res) => {
+  const tid = getTenantId(req);
+  const cfg = getNotificationChannelConfig(tid);
+  res.json({
+    ...cfg,
+    telegram_bot_token: cfg.telegram_bot_token ? '********' : '',
+  });
+});
+
+app.put('/api/notifications/channels', (req, res) => {
+  const tid = getTenantId(req);
+  const b = (req.body || {}) as Record<string, unknown>;
+  const existing = getNotificationChannelConfig(tid);
+  const rawToken = String(b.telegram_bot_token ?? '').trim();
+  const nextToken =
+    rawToken === '********'
+      ? String(existing.telegram_bot_token || '')
+      : rawToken
+      ? encryptField(rawToken)
+      : '';
+  const whUrl = String(b.whatsapp_webhook_url ?? '').trim();
+  if (whUrl && !isSafeExternalHttpsUrl(whUrl)) {
+    res.status(400).json({ error: 'Webhook URL must be a valid public HTTPS/HTTP endpoint.' });
+    return;
+  }
+  const now = new Date().toISOString();
+  db.prepare(
+    `UPDATE notification_channels
+     SET email_enabled=?, telegram_enabled=?, telegram_bot_token=?, telegram_chat_id=?,
+         webhook_enabled=?, whatsapp_webhook_url=?, notify_on_events_json=?, updated_at=?
+     WHERE tenant_id = ?`
+  ).run(
+    b.email_enabled !== undefined ? (b.email_enabled ? 1 : 0) : Number(existing.email_enabled ?? 1),
+    b.telegram_enabled !== undefined ? (b.telegram_enabled ? 1 : 0) : Number(existing.telegram_enabled ?? 0),
+    nextToken,
+    String(b.telegram_chat_id ?? existing.telegram_chat_id ?? '').trim(),
+    b.webhook_enabled !== undefined ? (b.webhook_enabled ? 1 : 0) : Number(existing.webhook_enabled ?? 0),
+    whUrl,
+    typeof b.notify_on_events_json === 'string'
+      ? b.notify_on_events_json
+      : Array.isArray(b.notify_on_events)
+      ? JSON.stringify(b.notify_on_events)
+      : String(existing.notify_on_events_json || '["APPROVAL_REQUEST","LOW_STOCK","LEAVE_STATUS","PAYROLL_RUN","ATTENDANCE_ALERT","SECURITY_LOCKOUT"]'),
+    now,
+    tid
+  );
+  const updated = getNotificationChannelConfig(tid);
+  logAudit(req, 'UPDATE', 'Notifications', `Updated multi-channel notification config (Tenant #${tid})`, tid);
+  res.json({
+    ...updated,
+    telegram_bot_token: updated.telegram_bot_token ? '********' : '',
+  });
 });
 
 app.get('/api/search', (req, res) => {
@@ -6922,7 +9202,7 @@ app.get('/api/backup/export', (_req, res) => {
   const tables = [
     'tenants', 'company_settings', 'users', 'biometric_credentials', 'employees', 'salary_records', 'shifts', 'departments', 'staff_schedules',
     'holidays_calendar', 'workforce_rules', 'ot_settings', 'payroll_rules',
-    'payroll_records', 'payroll_runs', 'devices', 'attendance_records', 'leaves',
+    'payroll_records', 'payroll_runs', 'devices', 'biometric_auth_logs', 'attendance_records', 'leaves',
     'company_documents', 'imported_files', 'company_form_templates', 'company_form_submissions',
     'gate_passes', 'department_approvals', 'materials', 'material_requests',
     'grn_records', 'gin_records', 'inventory_movements', 'procurement_records',
@@ -6938,12 +9218,23 @@ app.get('/api/backup/export', (_req, res) => {
   res.json({ exported_at: new Date().toISOString(), tables: dump });
 });
 
+const ALLOWED_RESTORE_TABLES = new Set([
+  'tenants', 'company_settings', 'users', 'biometric_credentials', 'biometric_auth_logs', 'employees', 'salary_records', 'shifts',
+  'departments', 'staff_schedules', 'holidays_calendar', 'workforce_rules', 'ot_settings', 'payroll_rules',
+  'payroll_records', 'payroll_runs', 'devices', 'attendance_records', 'leaves', 'company_documents',
+  'imported_files', 'company_form_templates', 'company_form_submissions', 'gate_passes', 'department_approvals',
+  'materials', 'material_requests', 'grn_records', 'gin_records', 'inventory_movements', 'procurement_records',
+  'purchasing_orders', 'crm_deals', 'sales_orders', 'ledger_accounts', 'journal_entries', 'journal_lines',
+  'finance_vouchers', 'finance_budgets', 'assets_uniforms', 'vehicles', 'equipment_maintenance', 'chat_channels',
+  'chat_messages', 'audit_logs', 'notification_channels', 'notification_logs', 'rbac_action_permissions',
+]);
+
 app.post('/api/backup/restore', (req, res) => {
   const payload = req.body?.tables || req.body || {};
   const restoredCounts: Record<string, number> = {};
   const tx = db.transaction(() => {
     for (const [table, rows] of Object.entries(payload)) {
-      if (!Array.isArray(rows) || !/^[a-z_]+$/.test(table)) continue;
+      if (!Array.isArray(rows) || !ALLOWED_RESTORE_TABLES.has(table)) continue;
       db.exec(`DELETE FROM ${table}`);
       if (rows.length === 0) {
         restoredCounts[table] = 0;
@@ -6964,10 +9255,109 @@ app.post('/api/backup/restore', (req, res) => {
   res.json({ ok: true, restoredCounts });
 });
 
+// Automated SQLite Snapshots (.db) Management
+app.get('/api/admin/backups', (_req, res) => {
+  try {
+    if (!fs.existsSync(BACKUP_DIR)) {
+      res.json([]);
+      return;
+    }
+    const files = fs
+      .readdirSync(BACKUP_DIR)
+      .filter((f) => /^sevensunday-(auto|manual)-[a-zA-Z0-9_-]+\.db$/.test(f))
+      .map((f) => {
+        const st = fs.statSync(path.join(BACKUP_DIR, f));
+        return {
+          filename: f,
+          size_bytes: st.size,
+          created_at: new Date(st.mtimeMs).toISOString(),
+          kind: f.includes('-auto-') ? ('auto' as const) : ('manual' as const),
+        };
+      })
+      .sort((a, b) => b.created_at.localeCompare(a.created_at));
+    res.json(files);
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to list backups' });
+  }
+});
+
+app.post('/api/admin/backups/create', async (req, res) => {
+  try {
+    const created = await createDatabaseBackup('manual');
+    logAudit(req, 'BACKUP', 'Admin', `Created SQLite snapshot ${created.filename} (${created.size_bytes} bytes)`);
+    res.status(201).json(created);
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to create database snapshot' });
+  }
+});
+
+app.get('/api/admin/backups/:filename/download', (req, res) => {
+  const filename = String(req.params.filename || '').trim();
+  if (!/^sevensunday-(auto|manual)-[a-zA-Z0-9_-]+\.db$/.test(filename)) {
+    res.status(400).json({ error: 'Invalid backup filename.' });
+    return;
+  }
+  const resolved = path.resolve(BACKUP_DIR, filename);
+  if (!resolved.startsWith(path.resolve(BACKUP_DIR) + path.sep) || !fs.existsSync(resolved)) {
+    res.status(404).json({ error: 'Backup snapshot not found.' });
+    return;
+  }
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.download(resolved, filename);
+});
+
+app.delete('/api/admin/backups/:filename', (req, res) => {
+  const filename = String(req.params.filename || '').trim();
+  if (!/^sevensunday-(auto|manual)-[a-zA-Z0-9_-]+\.db$/.test(filename)) {
+    res.status(400).json({ error: 'Invalid backup filename.' });
+    return;
+  }
+  const resolved = path.resolve(BACKUP_DIR, filename);
+  if (!resolved.startsWith(path.resolve(BACKUP_DIR) + path.sep) || !fs.existsSync(resolved)) {
+    res.status(404).json({ error: 'Backup snapshot not found.' });
+    return;
+  }
+  fs.unlinkSync(resolved);
+  logAudit(req, 'DELETE', 'Admin', `Removed SQLite backup snapshot ${filename}`);
+  res.json({ ok: true });
+});
+
+// Sanitized JSON error handler for /api routes (prevents stack trace / SQL leakage)
+app.use('/api', (err: unknown, _req: express.Request, res: express.Response, next: express.NextFunction) => {
+  if (res.headersSent) {
+    next(err);
+    return;
+  }
+  const errObj = err as { status?: number; type?: string } | null;
+  if (errObj?.type === 'entity.parse.failed' || (err instanceof SyntaxError && errObj?.status === 400)) {
+    res.status(400).json({ error: 'Malformed JSON request payload.' });
+    return;
+  }
+  console.error('[API Error]', err instanceof Error ? err.message : err);
+  res.status(500).json({ error: 'An unexpected server error occurred. Please check server logs or retry.' });
+});
+
 // ============================================================================
 // VITE DEV MIDDLEWARE / PRODUCTION STATIC SERVING ON PORT 3000
 // ============================================================================
 async function startServer() {
+  try {
+    const existingBackups = fs.existsSync(BACKUP_DIR)
+      ? fs.readdirSync(BACKUP_DIR).filter((f) => f.endsWith('.db'))
+      : [];
+    if (existingBackups.length === 0) {
+      await createDatabaseBackup('auto');
+    }
+  } catch (err) {
+    console.warn('Initial SQLite backup check skipped:', err instanceof Error ? err.message : err);
+  }
+  const backupTimer = setInterval(() => {
+    void createDatabaseBackup('auto').catch((err) => {
+      console.error('Scheduled SQLite backup failed:', err instanceof Error ? err.message : err);
+    });
+  }, 6 * 60 * 60 * 1000);
+  backupTimer.unref();
+
   if (!IS_PROD) {
     const vite = await createViteServer({
       server: { middlewareMode: true, hmr: false },

@@ -81,16 +81,20 @@ export const ShareButton: React.FC<ShareButtonProps> = ({
     }
     setSendingEmail(true);
     try {
-      const res = await api.post<{ ok: boolean; smtp_host: string }>('/api/share/email', {
+      const res = await api.post<{ ok: boolean; delivered?: boolean; smtp_host?: string; error?: string }>('/api/share/email', {
         channel: 'Email',
         recipient: emailTo.trim(),
         subject: `${reference ? `${reference} - ` : ''}${title}`,
         body: fullText,
       });
-      setFeedback(`Dispatched & logged via ${res.smtp_host} to ${emailTo.trim()}. You can also open your mail client below.`);
+      if (!res.ok || res.delivered === false) {
+        setError(res.error || 'Email delivery failed. Check corporate SMTP settings.');
+        return;
+      }
+      setFeedback(`Email delivered via ${res.smtp_host || 'corporate SMTP'} to ${emailTo.trim()}.`);
       onShared?.('Email');
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to log email share');
+      setError(err instanceof Error ? err.message : 'SMTP delivery failed');
     } finally {
       setSendingEmail(false);
     }

@@ -14,7 +14,7 @@ import {
   FileCheck2,
   FileSpreadsheet,
   FileText,
-  FileUp,
+  GitBranch,
   Globe,
   HardDriveUpload,
   LayoutDashboard,
@@ -48,7 +48,6 @@ import { DevicesModule } from './components/DevicesModule';
 import { FinanceModule } from './components/FinanceModule';
 import { GatePassModule } from './components/GatePassModule';
 import { HrPayrollModule } from './components/HrPayrollModule';
-import { ImportFilesModal } from './components/ImportFilesModal';
 import { LeaveModule } from './components/LeaveModule';
 import { LoginScreen } from './components/LoginScreen';
 import { OperationsCenterModule } from './components/OperationsCenterModule';
@@ -62,7 +61,7 @@ import { SupplyChainModule, type SupplyChainTab } from './components/SupplyChain
 import { ALL_COMPANY_FORMS } from './data/companyFormsCatalog';
 import { useOnlineStatus } from './hooks/usePWAInstall';
 import { useRealtimeWS, type WsEventPayload } from './hooks/useRealtimeWS';
-import { getPendingQueue, syncQueuedMutations } from './offline/syncEngine';
+import { getPendingQueue, setOfflineSyncKey, syncQueuedMutations } from './offline/syncEngine';
 import type {
   AuthSessionResponse,
   CompanySettings,
@@ -320,7 +319,6 @@ export default function App() {
   const [searchingDb, setSearchingDb] = useState(false);
   const [lastWsEvent, setLastWsEvent] = useState<WsEventPayload | null>(null);
   const [pendingQueueCount, setPendingQueueCount] = useState(0);
-  const [importModalOpen, setImportModalOpen] = useState(false);
 
   const isOnline = useOnlineStatus();
 
@@ -456,6 +454,7 @@ export default function App() {
     }
     const onUnauthorized = () => {
       setAuthToken(null);
+      setOfflineSyncKey(null);
       setEncryptedSyncKey(null);
       setCurrentUser(null);
     };
@@ -555,8 +554,10 @@ export default function App() {
   }, [currentUser, allowedModules, activeModule]);
 
   const handleLogin = (auth: AuthSessionResponse) => {
+    if (!auth.user || !auth.token) return;
     const user = auth.user;
     setAuthToken(auth.token);
+    setOfflineSyncKey(auth.encrypted_sync_key || null);
     setEncryptedSyncKey(auth.encrypted_sync_key || null);
     setApiActor(user.full_name, user.role);
     if (user.tenant_id && user.tenant_id !== activeTenantId) {
@@ -575,6 +576,7 @@ export default function App() {
       // ignore network error on sign-out
     }
     setAuthToken(null);
+    setOfflineSyncKey(null);
     setEncryptedSyncKey(null);
     setCurrentUser(null);
   };
@@ -657,6 +659,11 @@ export default function App() {
   const selectableTenants = tenants.filter(
     (t) => t.status === 'Active' || currentUser.role === 'System Administrator' || t.id === activeTenantId
   );
+  const activeTenantObj =
+    selectableTenants.find((t) => t.id === activeTenantId) ||
+    tenants.find((t) => t.id === activeTenantId);
+  const activeBranchSummary =
+    company?.branches || activeTenantObj?.branches || 'Addis Ababa HQ';
 
   return (
     <div
@@ -698,6 +705,51 @@ export default function App() {
           >
             <X className="w-4 h-4" />
           </button>
+        </div>
+
+        {/* Relocated HQ & Branch Display Bar (Sidebar Workspace Selector) */}
+        <div
+          className="px-3 py-2.5 border-b border-white/10 bg-[#121C2E]/75 space-y-1.5 shrink-0"
+          title={translateUi(lang, 'tenant_workspace', 'Branch & HQ Workspace')}
+        >
+          <div className="flex items-center justify-between gap-2 text-[10px] font-bold uppercase tracking-wider text-[#7DD3FC]/90">
+            <span className="flex items-center gap-1.5 truncate">
+              <Building2 className="w-3 h-3 text-[#38BDF8] shrink-0" />
+              {translateUi(lang, 'tenant_workspace', 'HQ & Branch Workspace')}
+            </span>
+            {activeTenantObj?.tenant_code && (
+              <span className="font-mono text-[10px] px-1.5 py-0.5 rounded bg-white/10 text-[#38BDF8] shrink-0">
+                {activeTenantObj.tenant_code}
+              </span>
+            )}
+          </div>
+
+          {platformConfig.enable_multi_tenant !== false && selectableTenants.length > 0 ? (
+            <select
+              value={activeTenantId}
+              onChange={(e) => handleSwitchTenant(Number(e.target.value))}
+              aria-label="Branch and HQ workspace switcher"
+              className="w-full px-2.5 py-1.5 text-xs font-semibold bg-white/10 hover:bg-white/15 text-white border border-white/15 rounded-lg focus:outline-none focus:border-[#38BDF8] transition-colors truncate"
+            >
+              {selectableTenants.map((t) => (
+                <option key={t.id} value={t.id} className="bg-[#18243A] text-white">
+                  {t.brand_name} ({t.tenant_code})
+                </option>
+              ))}
+            </select>
+          ) : (
+            <div className="px-2.5 py-1.5 text-xs font-semibold bg-white/10 text-white border border-white/15 rounded-lg truncate">
+              {company?.brand_name || 'Seven Sunday Ethiopia'}
+            </div>
+          )}
+
+          <div
+            className="flex items-center gap-1.5 text-[11px] text-white/75 truncate"
+            title={activeBranchSummary}
+          >
+            <GitBranch className="w-3 h-3 text-[#38BDF8] shrink-0" />
+            <span className="truncate">{activeBranchSummary}</span>
+          </div>
         </div>
 
         <nav className="flex-1 overflow-y-auto px-3 py-4 space-y-5">
@@ -758,15 +810,15 @@ export default function App() {
       </aside>
 
       {/* Main Content Shell */}
-      <div className="app-content-shell flex-1 min-w-0 flex flex-col">
+      <div className="app-content-shell flex-1 min-w-0 overflow-x-clip flex flex-col">
         <OfflineIndicator pendingCount={pendingQueueCount} />
 
         <header className="no-print h-16 bg-[#FFFFFF] dark:bg-slate-900 border-b border-slate-200 dark:border-slate-800 px-3 sm:px-6 flex items-center justify-between gap-3 sticky top-0 z-20">
-          <div className="flex items-center gap-2.5 min-w-0">
+          <div className="flex items-center gap-2.5 min-w-0 flex-1">
             <button
               type="button"
               onClick={() => setSidebarOpen(true)}
-              className="lg:hidden p-2 text-[#172033] dark:text-slate-300 hover:bg-[#F8FAFC] rounded-lg border border-slate-200 dark:border-slate-700"
+              className="lg:hidden p-2 text-[#172033] dark:text-slate-300 hover:bg-[#F8FAFC] rounded-lg border border-slate-200 dark:border-slate-700 shrink-0"
               aria-label="Open navigation"
             >
               <Menu className="w-4 h-4" />
@@ -783,56 +835,23 @@ export default function App() {
           </div>
 
           <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
-            {/* Multi-Tenant Workspace Switcher */}
-            {platformConfig.enable_multi_tenant !== false && selectableTenants.length > 0 && (
-              <div
-                className="flex items-center gap-1 px-2 py-1 bg-[#EAF4FF] dark:bg-slate-800 border border-[#087CEB]/30 rounded-lg"
-                title={translateUi(lang, 'tenant_workspace', 'Tenant Workspace')}
-              >
-                <Building2 className="w-3.5 h-3.5 text-[#087CEB] shrink-0" />
-                <select
-                  value={activeTenantId}
-                  onChange={(e) => handleSwitchTenant(Number(e.target.value))}
-                  aria-label="Tenant workspace switcher"
-                  className="max-w-[130px] sm:max-w-[175px] text-xs font-bold bg-transparent text-[#18243A] dark:text-white focus:outline-none truncate"
-                >
-                  {selectableTenants.map((t) => (
-                    <option key={t.id} value={t.id} className="text-[#172033]">
-                      {t.brand_name} ({t.tenant_code})
-                    </option>
-                  ))}
-                </select>
-              </div>
-            )}
-
-            {/* Global Search (Ctrl+K) Trigger Button */}
+            {/* Adjusted Global Search (Ctrl+K) Bar */}
             <button
               type="button"
               onClick={() => setSearchModalOpen(true)}
-              className="inline-flex items-center gap-2 px-2.5 sm:px-3 py-1.5 text-xs text-slate-600 dark:text-slate-300 bg-[#F8FAFC] dark:bg-slate-800 border border-slate-200 dark:border-slate-700 hover:border-[#087CEB] rounded-lg transition-colors whitespace-nowrap shrink-0"
+              className="inline-flex items-center justify-between gap-2 w-auto sm:w-52 md:w-64 lg:w-72 px-2.5 sm:px-3 py-1.5 text-xs text-slate-500 dark:text-slate-300 bg-[#F8FAFC] dark:bg-slate-800 border border-slate-200 dark:border-slate-700 hover:border-[#087CEB] rounded-lg transition-colors min-w-0 shrink-0"
               title="Open Global Search (Ctrl+K)"
             >
-              <Search className="w-3.5 h-3.5 text-[#087CEB]" />
-              <span className="hidden md:inline font-medium">
-                {translateUi(lang, 'search_placeholder', `Search modules, ${ALL_COMPANY_FORMS.length} forms, records...`)}
+              <span className="inline-flex items-center gap-2 min-w-0">
+                <Search className="w-3.5 h-3.5 text-[#087CEB] shrink-0" />
+                <span className="hidden sm:inline font-medium truncate">
+                  {translateUi(lang, 'search_placeholder', 'Search modules, forms, records...')}
+                </span>
+                <span className="sm:hidden font-medium">{translateUi(lang, 'search_short', 'Search')}</span>
               </span>
-              <span className="md:hidden font-medium">{translateUi(lang, 'search_short', 'Search')}</span>
-              <kbd className="hidden lg:inline-flex items-center px-1.5 py-0.5 text-[10px] font-mono font-bold text-[#18243A] dark:text-[#38BDF8] bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded">
+              <kbd className="hidden lg:inline-flex items-center px-1.5 py-0.5 text-[10px] font-mono font-bold text-[#18243A] dark:text-[#38BDF8] bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded shrink-0">
                 Ctrl+K
               </kbd>
-            </button>
-
-            {/* Global Import Files & Documents Trigger */}
-            <button
-              type="button"
-              onClick={() => setImportModalOpen(true)}
-              className="inline-flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 text-xs font-semibold text-[#172033] dark:text-slate-200 bg-[#F8FAFC] dark:bg-slate-800 border border-slate-200 dark:border-slate-700 hover:border-[#087CEB] rounded-lg transition-colors whitespace-nowrap shrink-0"
-              title={translateUi(lang, 'import_files', 'Import Files & Docs')}
-            >
-              <FileUp className="w-3.5 h-3.5 text-[#087CEB]" />
-              <span className="hidden md:inline">
-                {translateUi(lang, 'import_files', 'Import Files & Docs')}
-              </span>
             </button>
 
             {/* Multi-Language Switcher (6 Languages) */}
@@ -900,7 +919,7 @@ export default function App() {
         </header>
 
         {/* Keyed by activeTenantId + tenantRefreshKey so switching tenant cleanly reloads all module data */}
-        <main key={`${activeTenantId}-${tenantRefreshKey}`} className="app-main-shell flex-1 p-3 sm:p-6 max-w-[1440px] w-full mx-auto">
+        <main key={`${activeTenantId}-${tenantRefreshKey}`} className="app-main-shell relative z-0 flex-1 min-w-0 p-3 sm:p-6 max-w-[1440px] w-full mx-auto">
           {activeModule === 'dashboard' && (
             <DashboardModule
               summary={summary}
@@ -955,12 +974,19 @@ export default function App() {
               onRefreshDashboard={refreshDashboard}
             />
           )}
-          {activeModule === 'devices' && <DevicesModule onRefreshDashboard={refreshDashboard} />}
+          {activeModule === 'devices' && (
+            <DevicesModule
+              lastWsEvent={lastWsEvent}
+              onNavigate={handleSelectModule}
+              onRefreshDashboard={refreshDashboard}
+            />
+          )}
           {activeModule === 'attendance' && (
             <AttendanceModule
               currency={currency}
               calendarMode={calendarMode}
               currentUserRole={currentUser.role}
+              lastWsEvent={lastWsEvent}
               onRefreshDashboard={refreshDashboard}
             />
           )}
@@ -1217,16 +1243,6 @@ export default function App() {
         </div>
       )}
 
-      <ImportFilesModal
-        open={importModalOpen}
-        onClose={() => setImportModalOpen(false)}
-        company={company}
-        onNavigate={handleSelectModule}
-        onImported={() => {
-          refreshDashboard();
-          setTenantRefreshKey((k) => k + 1);
-        }}
-      />
     </div>
   );
 }

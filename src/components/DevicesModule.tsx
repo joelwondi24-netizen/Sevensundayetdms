@@ -1,8 +1,11 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Activity,
   Cable,
   CheckCircle2,
+  Clock,
+  ExternalLink,
+  Fingerprint,
   Loader2,
   Pencil,
   Plus,
@@ -10,15 +13,26 @@ import {
   Radar,
   RefreshCw,
   Save,
+  Search,
   Send,
+  ShieldAlert,
+  ShieldCheck,
   Trash2,
   Unplug,
   Usb,
   Webhook,
   X,
+  XCircle,
 } from 'lucide-react';
-import { api } from '../api';
-import type { DeviceRecord, DeviceScanResult } from '../types';
+import { api, getApiTenantId } from '../api';
+import type { WsEventPayload } from '../hooks/useRealtimeWS';
+import type {
+  BiometricAuthLogRecord,
+  DeviceRecord,
+  DeviceScanResult,
+  EmployeeProfile,
+  ModuleKey,
+} from '../types';
 
 const DEVICE_TYPES = [
   'Biometric Fingerprint Terminal',
@@ -38,8 +52,51 @@ const PROTOCOL_OPTIONS = [
   'IoT Gateway',
 ];
 
-export const DevicesModule: React.FC<{ onRefreshDashboard: () => void }> = ({ onRefreshDashboard }) => {
+interface DevicesModuleProps {
+  lastWsEvent?: WsEventPayload | null;
+  onNavigate?: (module: ModuleKey) => void;
+  onRefreshDashboard: () => void;
+}
+
+const AUTH_METHODS = ['Fingerprint', 'Face ID', 'RFID Card', 'Platform Passkey'] as const;
+
+function formatLogTimestamp(iso: string): { date: string; time: string } {
+  if (!iso) return { date: '--', time: '--' };
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) {
+    return { date: iso.slice(0, 10), time: iso.slice(11, 19) || '--' };
+  }
+  return {
+    date: d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: '2-digit' }),
+    time: d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+  };
+}
+
+export const DevicesModule: React.FC<DevicesModuleProps> = ({
+  lastWsEvent,
+  onNavigate,
+  onRefreshDashboard,
+}) => {
+  const [activeTab, setActiveTab] = useState<'connections' | 'biometric-logs'>('connections');
   const [devices, setDevices] = useState<DeviceRecord[]>([]);
+  const [employees, setEmployees] = useState<EmployeeProfile[]>([]);
+  const [bioLogs, setBioLogs] = useState<BiometricAuthLogRecord[]>([]);
+  const [bioLoading, setBioLoading] = useState(false);
+  const [bioStatusFilter, setBioStatusFilter] = useState<'All' | 'Success' | 'Failure'>('All');
+  const [bioDeviceFilter, setBioDeviceFilter] = useState<string>('All');
+  const [bioSearch, setBioSearch] = useState('');
+  const [verifyingScan, setVerifyingScan] = useState(false);
+  const [markingLogId, setMarkingLogId] = useState<number | null>(null);
+  const [lastLiveEventAt, setLastLiveEventAt] = useState<string | null>(null);
+
+  const [verifyForm, setVerifyForm] = useState({
+    device_id: '',
+    employee_code: '',
+    auth_method: 'Fingerprint' as (typeof AUTH_METHODS)[number],
+    punch_type: 'Check-In' as 'Check-In' | 'Check-Out',
+    auto_mark_attendance: true,
+  });
+
   const [loading, setLoading] = useState(true);
   const [connectingId, setConnectingId] = useState<number | null>(null);
   const [probingAll, setProbingAll] = useState(false);
@@ -82,21 +139,83 @@ export const DevicesModule: React.FC<{ onRefreshDashboard: () => void }> = ({ on
   };
   const [form, setForm] = useState(emptyForm);
 
-  const loadDevices = async () => {
+  const loadDevices = async (silent = false) => {
     try {
-      setLoading(true);
+      if (!silent) setLoading(true);
       const data = await api.get<DeviceRecord[]>('/api/devices');
       setDevices(data);
+      setVerifyForm((prev) => {
+        if (prev.device_id || data.length === 0) return prev;
+        return { ...prev, device_id: String(data[0].id) };
+      });
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load devices');
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
+    }
+  };
+
+  const loadBioLogs = async () => {
+    try {
+      setBioLoading(true);
+      const data = await api.get<BiometricAuthLogRecord[]>('/api/devices/biometric-logs?limit=250');
+      setBioLogs(data);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to load biometric authentication logs');
+    } finally {
+      setBioLoading(false);
+    }
+  };
+
+  const loadEmployees = async () => {
+    try {
+      const empData = await api.get<EmployeeProfile[]>('/api/employees');
+      setEmployees(empData);
+      setVerifyForm((prev) => {
+        if (prev.employee_code || empData.length === 0) return prev;
+        const active = empData.find((e) => e.status === 'Active') || empData[0];
+        return { ...prev, employee_code: active.employee_id };
+      });
+    } catch {
+      // Non-HR roles may not have employee directory read access; manual employee ID still works
     }
   };
 
   useEffect(() => {
     loadDevices();
+    loadBioLogs();
+    loadEmployees();
   }, []);
+
+  const lastWsRef = useRef<WsEventPayload | null>(null);
+  useEffect(() => {
+    if (!lastWsEvent || lastWsEvent === lastWsRef.current) return;
+    lastWsRef.current = lastWsEvent;
+    const payload = (lastWsEvent.payload || {}) as Record<string, unknown>;
+    const activeTenant = getApiTenantId();
+    if (payload.tenant_id !== undefined && Number(payload.tenant_id) !== activeTenant) {
+      return;
+    }
+
+    if (lastWsEvent.event === 'biometric:auth_log') {
+      const incoming = payload as unknown as BiometricAuthLogRecord;
+      if (incoming && typeof incoming.id === 'number') {
+        setBioLogs((prev) => {
+          const exists = prev.some((item) => item.id === incoming.id);
+          if (exists) {
+            return prev.map((item) => (item.id === incoming.id ? incoming : item));
+          }
+          return [incoming, ...prev].slice(0, 250);
+        });
+        setLastLiveEventAt(new Date().toLocaleTimeString());
+      }
+      return;
+    }
+
+    if (lastWsEvent.event === 'device:punch' || lastWsEvent.event === 'device:status') {
+      loadDevices(true);
+    }
+  }, [lastWsEvent]);
 
   const handleAddDevice = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -315,11 +434,185 @@ export const DevicesModule: React.FC<{ onRefreshDashboard: () => void }> = ({ on
     }
   };
 
+  const handleVerifyBiometricScan = async (simulateFailure = false) => {
+    setError(null);
+    setNotice(null);
+    setVerifyingScan(true);
+    try {
+      const selectedDev = devices.find((d) => String(d.id) === verifyForm.device_id);
+      const res = await api.post<{
+        log: BiometricAuthLogRecord;
+        attendance: Record<string, unknown> | null;
+        device: DeviceRecord | null;
+      }>('/api/devices/biometric-logs/verify', {
+        device_id: selectedDev ? selectedDev.id : undefined,
+        device_identifier: selectedDev ? selectedDev.serial_number : 'GATE-TERMINAL-01',
+        device_name: selectedDev ? selectedDev.device_name : 'Primary Biometric Gate',
+        employee_code: verifyForm.employee_code.trim(),
+        auth_method: verifyForm.auth_method,
+        punch_type: verifyForm.punch_type,
+        auto_mark_attendance: verifyForm.auto_mark_attendance,
+        simulate_failure: simulateFailure,
+      });
+
+      setBioLogs((prev) => {
+        const exists = prev.some((r) => r.id === res.log.id);
+        return exists ? prev.map((r) => (r.id === res.log.id ? res.log : r)) : [res.log, ...prev];
+      });
+      if (res.device) {
+        setDevices((prev) => prev.map((d) => (d.id === res.device!.id ? res.device! : d)));
+      }
+      setNotice(
+        `Biometric ${res.log.auth_method} verified for ${res.log.employee_name} (${res.log.employee_code})${
+          res.log.attendance_marked && res.log.attendance_record_id
+            ? ` · Attendance #${res.log.attendance_record_id} automatically marked.`
+            : '.'
+        }`
+      );
+      onRefreshDashboard();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Biometric scan failed';
+      setError(`Biometric Failure Logged: ${msg}`);
+      loadBioLogs();
+    } finally {
+      setVerifyingScan(false);
+    }
+  };
+
+  const handleMarkAttendanceFromLog = async (logId: number) => {
+    setError(null);
+    setNotice(null);
+    setMarkingLogId(logId);
+    try {
+      const res = await api.post<{ log: BiometricAuthLogRecord; attendance: Record<string, unknown> }>(
+        `/api/devices/biometric-logs/${logId}/mark-attendance`
+      );
+      setBioLogs((prev) => prev.map((r) => (r.id === logId ? res.log : r)));
+      setNotice(
+        `Linked biometric log #${logId} to Attendance Record #${res.log.attendance_record_id} for ${res.log.employee_name}.`
+      );
+      onRefreshDashboard();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not mark attendance from biometric log');
+    } finally {
+      setMarkingLogId(null);
+    }
+  };
+
+  const filteredBioLogs = useMemo(() => {
+    const q = bioSearch.trim().toLowerCase();
+    return bioLogs.filter((log) => {
+      if (bioStatusFilter !== 'All' && log.status !== bioStatusFilter) return false;
+      if (bioDeviceFilter !== 'All') {
+        if (bioDeviceFilter === 'UNREGISTERED') {
+          if (log.device_id !== null) return false;
+        } else if (String(log.device_id || '') !== bioDeviceFilter) {
+          return false;
+        }
+      }
+      if (q) {
+        const hay = `${log.employee_code} ${log.employee_name} ${log.department} ${log.device_identifier} ${log.device_name} ${log.auth_method} ${log.failure_reason}`.toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
+      return true;
+    });
+  }, [bioLogs, bioStatusFilter, bioDeviceFilter, bioSearch]);
+
+  const bioStats = useMemo(() => {
+    let success = 0;
+    let failure = 0;
+    let marked = 0;
+    for (const l of bioLogs) {
+      if (l.status === 'Success') success += 1;
+      else failure += 1;
+      if (l.attendance_marked) marked += 1;
+    }
+    return { total: bioLogs.length, success, failure, marked };
+  }, [bioLogs]);
+
   const connectedCount = devices.filter((d) => d.status === 'Connected').length;
   const totalPunches = devices.reduce((acc, d) => acc + (Number(d.punch_count) || 0), 0);
 
   return (
-    <div className="space-y-6">
+    <div className="w-full min-w-0 space-y-6">
+      {/* Module Tab Navigation */}
+      <div className="bg-[#FFFFFF] dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-2 flex flex-wrap items-center justify-between gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={() => setActiveTab('connections')}
+            className={`inline-flex items-center gap-2 px-4 py-2 text-xs font-bold rounded-lg transition-colors whitespace-nowrap ${
+              activeTab === 'connections'
+                ? 'bg-[#18243A] text-white shadow-sm'
+                : 'text-[#172033] dark:text-slate-300 hover:bg-[#F8FAFC] dark:hover:bg-slate-800'
+            }`}
+          >
+            <Cable className="w-3.5 h-3.5 text-[#087CEB]" />
+            Device Connections Registry
+            <span className="px-1.5 py-0.5 text-[10px] font-mono rounded bg-white/15 dark:bg-slate-700/60 tabular-nums">
+              {devices.length}
+            </span>
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setActiveTab('biometric-logs');
+              loadBioLogs();
+            }}
+            className={`inline-flex items-center gap-2 px-4 py-2 text-xs font-bold rounded-lg transition-colors whitespace-nowrap ${
+              activeTab === 'biometric-logs'
+                ? 'bg-[#18243A] text-white shadow-sm'
+                : 'text-[#172033] dark:text-slate-300 hover:bg-[#F8FAFC] dark:hover:bg-slate-800'
+            }`}
+          >
+            <Fingerprint className="w-3.5 h-3.5 text-[#087CEB]" />
+            Biometric Authentication Logs
+            <span className="px-1.5 py-0.5 text-[10px] font-mono rounded bg-white/15 dark:bg-slate-700/60 tabular-nums">
+              {bioLogs.length}
+            </span>
+            <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" title="Live WebSocket stream active" />
+          </button>
+        </div>
+
+        <div className="flex items-center gap-2 px-2">
+          {lastLiveEventAt && (
+            <span className="text-[11px] font-mono text-emerald-700 dark:text-emerald-400">
+              Live Sync · {lastLiveEventAt}
+            </span>
+          )}
+          {onNavigate && (
+            <button
+              type="button"
+              onClick={() => onNavigate('attendance')}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-[#087CEB] bg-[#EAF4FF] dark:bg-slate-800 hover:bg-[#DBEAFE] rounded-lg transition-colors whitespace-nowrap"
+            >
+              <ExternalLink className="w-3.5 h-3.5" />
+              Open Attendance Register
+            </button>
+          )}
+        </div>
+      </div>
+
+      {notice && (
+        <div className="px-4 py-2.5 text-xs font-medium text-emerald-800 dark:text-emerald-200 bg-emerald-50 dark:bg-emerald-950/60 border border-emerald-200 dark:border-emerald-800 rounded-lg flex items-center justify-between gap-2">
+          <span>{notice}</span>
+          <button type="button" onClick={() => setNotice(null)} className="shrink-0">
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      )}
+
+      {error && (
+        <div className="px-4 py-2.5 text-xs font-medium text-red-700 dark:text-red-300 bg-red-50 dark:bg-red-950/50 border border-red-200 dark:border-red-900 rounded-lg flex items-center justify-between gap-2">
+          <span>{error}</span>
+          <button type="button" onClick={() => setError(null)} className="shrink-0">
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      )}
+
+      {activeTab === 'connections' && (
+        <>
       <div className="bg-[#FFFFFF] dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-6">
         <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 mb-5">
           <div>
@@ -363,7 +656,7 @@ export const DevicesModule: React.FC<{ onRefreshDashboard: () => void }> = ({ on
             </button>
             <button
               type="button"
-              onClick={loadDevices}
+              onClick={() => loadDevices()}
               className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-[#172033] dark:text-slate-200 bg-[#F8FAFC] dark:bg-slate-800 border border-slate-200 dark:border-slate-700 hover:border-[#087CEB] rounded-lg transition-colors whitespace-nowrap shrink-0"
             >
               <RefreshCw className="w-3.5 h-3.5" />
@@ -371,18 +664,6 @@ export const DevicesModule: React.FC<{ onRefreshDashboard: () => void }> = ({ on
             </button>
           </div>
         </div>
-
-        {notice && (
-          <div className="mb-4 px-4 py-2.5 text-xs font-medium text-emerald-800 dark:text-emerald-200 bg-emerald-50 dark:bg-emerald-950/60 border border-emerald-200 dark:border-emerald-800 rounded-lg">
-            {notice}
-          </div>
-        )}
-
-        {error && (
-          <div className="mb-4 px-4 py-2.5 text-xs font-medium text-red-700 dark:text-red-300 bg-red-50 dark:bg-red-950/50 border border-red-200 dark:border-red-900 rounded-lg">
-            {error}
-          </div>
-        )}
 
         {/* Live Network / Subnet Scanner Panel */}
         {scanPanelOpen && (
@@ -790,6 +1071,345 @@ export const DevicesModule: React.FC<{ onRefreshDashboard: () => void }> = ({ on
           </span>
         </div>
       </div>
+        </>
+      )}
+
+      {activeTab === 'biometric-logs' && (
+        <div className="space-y-6">
+          {/* Summary Metrics */}
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+            <div className="bg-[#FFFFFF] dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-4">
+              <div className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">Total Auth Events</div>
+              <div className="mt-1 text-2xl font-extrabold text-[#172033] dark:text-white font-mono tabular-nums">
+                {bioStats.total}
+              </div>
+              <div className="text-[11px] text-slate-500 mt-0.5">Real-time hardware & passkey stream</div>
+            </div>
+            <div className="bg-[#FFFFFF] dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-4">
+              <div className="text-[11px] font-semibold uppercase tracking-wider text-emerald-700 dark:text-emerald-400">
+                Verified Success
+              </div>
+              <div className="mt-1 text-2xl font-extrabold text-emerald-700 dark:text-emerald-400 font-mono tabular-nums">
+                {bioStats.success}
+              </div>
+              <div className="text-[11px] text-slate-500 mt-0.5">Identity & credential confirmed</div>
+            </div>
+            <div className="bg-[#FFFFFF] dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-4">
+              <div className="text-[11px] font-semibold uppercase tracking-wider text-red-700 dark:text-red-400">
+                Failed Attempts
+              </div>
+              <div className="mt-1 text-2xl font-extrabold text-red-700 dark:text-red-400 font-mono tabular-nums">
+                {bioStats.failure}
+              </div>
+              <div className="text-[11px] text-slate-500 mt-0.5">Blocked / unmatched credentials</div>
+            </div>
+            <div className="bg-[#FFFFFF] dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-4">
+              <div className="text-[11px] font-semibold uppercase tracking-wider text-[#087CEB]">
+                Attendance Auto-Marked
+              </div>
+              <div className="mt-1 text-2xl font-extrabold text-[#087CEB] font-mono tabular-nums">
+                {bioStats.marked}
+              </div>
+              <div className="text-[11px] text-slate-500 mt-0.5">Synced into Attendance Register</div>
+            </div>
+          </div>
+
+          {/* Live Biometric Verification Console */}
+          <div className="bg-[#FFFFFF] dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-6 space-y-4">
+            <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
+              <div>
+                <h2 className="text-base font-bold text-[#172033] dark:text-white flex items-center gap-2">
+                  <Fingerprint className="w-4 h-4 text-[#087CEB]" />
+                  Live Biometric Verification & Attendance Auto-Marking
+                </h2>
+                <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                  Captures terminal punches, hardware REST pushes, ZKTeco ADMS events, and passkey logins into persistent audit logs and Attendance Register.
+                </p>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={loadBioLogs}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-[#172033] dark:text-slate-200 bg-[#F8FAFC] dark:bg-slate-800 border border-slate-200 dark:border-slate-700 hover:border-[#087CEB] rounded-lg whitespace-nowrap"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${bioLoading ? 'animate-spin' : ''}`} />
+                  Refresh Stream
+                </button>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3 pt-3 border-t border-slate-200 dark:border-slate-800">
+              <div>
+                <label className="block text-xs font-medium text-[#172033] dark:text-slate-300 mb-1">Biometric Device</label>
+                <select
+                  value={verifyForm.device_id}
+                  onChange={(e) => setVerifyForm({ ...verifyForm, device_id: e.target.value })}
+                  className="w-full px-3 py-2 text-xs bg-[#F8FAFC] dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg"
+                >
+                  {devices.length === 0 && <option value="">Gate Terminal (Default)</option>}
+                  {devices.map((d) => (
+                    <option key={d.id} value={String(d.id)}>
+                      {d.device_name} ({d.serial_number})
+                    </option>
+                  ))}
+                  <option value="">Unregistered Terminal</option>
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-[#172033] dark:text-slate-300 mb-1">Employee ID</label>
+                <input
+                  type="text"
+                  list="biometric-employee-list"
+                  placeholder="e.g. SS-EMP-001"
+                  value={verifyForm.employee_code}
+                  onChange={(e) => setVerifyForm({ ...verifyForm, employee_code: e.target.value })}
+                  className="w-full px-3 py-2 text-xs font-mono bg-[#F8FAFC] dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg"
+                />
+                <datalist id="biometric-employee-list">
+                  {employees.map((emp) => (
+                    <option key={emp.id} value={emp.employee_id}>
+                      {emp.full_name} · {emp.department}
+                    </option>
+                  ))}
+                </datalist>
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-[#172033] dark:text-slate-300 mb-1">Auth Method</label>
+                <select
+                  value={verifyForm.auth_method}
+                  onChange={(e) =>
+                    setVerifyForm({ ...verifyForm, auth_method: e.target.value as (typeof AUTH_METHODS)[number] })
+                  }
+                  className="w-full px-3 py-2 text-xs bg-[#F8FAFC] dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg"
+                >
+                  {AUTH_METHODS.map((m) => (
+                    <option key={m} value={m}>
+                      {m}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-[#172033] dark:text-slate-300 mb-1">Punch Action</label>
+                <select
+                  value={verifyForm.punch_type}
+                  onChange={(e) => setVerifyForm({ ...verifyForm, punch_type: e.target.value as 'Check-In' | 'Check-Out' })}
+                  className="w-full px-3 py-2 text-xs bg-[#F8FAFC] dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg"
+                >
+                  <option value="Check-In">Check-In</option>
+                  <option value="Check-Out">Check-Out</option>
+                </select>
+              </div>
+
+              <div className="flex flex-col justify-end gap-2">
+                <label className="inline-flex items-center gap-2 text-xs font-medium text-[#172033] dark:text-slate-300 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={verifyForm.auto_mark_attendance}
+                    onChange={(e) => setVerifyForm({ ...verifyForm, auto_mark_attendance: e.target.checked })}
+                    className="rounded border-slate-300 text-[#087CEB] focus:ring-[#087CEB]"
+                  />
+                  Auto-mark Attendance Register
+                </label>
+                <div className="flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    disabled={verifyingScan}
+                    onClick={() => handleVerifyBiometricScan(false)}
+                    className="flex-1 inline-flex items-center justify-center gap-1.5 px-3 py-2 text-xs font-bold text-white bg-[#087CEB] hover:bg-[#0265C4] disabled:opacity-60 rounded-lg whitespace-nowrap"
+                  >
+                    {verifyingScan ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldCheck className="w-3.5 h-3.5" />}
+                    Verify Scan
+                  </button>
+                  <button
+                    type="button"
+                    disabled={verifyingScan}
+                    onClick={() => handleVerifyBiometricScan(true)}
+                    className="inline-flex items-center justify-center gap-1 px-2.5 py-2 text-xs font-semibold text-red-700 dark:text-red-300 bg-red-50 dark:bg-red-950/50 border border-red-200 dark:border-red-900 hover:bg-red-100 disabled:opacity-60 rounded-lg whitespace-nowrap"
+                    title="Record a failed biometric authentication attempt"
+                  >
+                    <ShieldAlert className="w-3.5 h-3.5" />
+                    Test Fail
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* Filter Toolbar + Real-Time Authentication Logs Table */}
+          <div className="bg-[#FFFFFF] dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden">
+            <div className="p-4 border-b border-slate-200 dark:border-slate-800 flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+              <div className="flex flex-wrap items-center gap-2">
+                {(['All', 'Success', 'Failure'] as const).map((statusOption) => (
+                  <button
+                    key={statusOption}
+                    type="button"
+                    onClick={() => setBioStatusFilter(statusOption)}
+                    className={`px-3 py-1.5 text-xs font-bold rounded-lg transition-colors whitespace-nowrap ${
+                      bioStatusFilter === statusOption
+                        ? 'bg-[#18243A] text-white'
+                        : 'bg-[#F8FAFC] dark:bg-slate-800 text-slate-600 dark:text-slate-300 border border-slate-200 dark:border-slate-700'
+                    }`}
+                  >
+                    {statusOption === 'All' ? `All Events (${bioStats.total})` : statusOption === 'Success' ? `Success (${bioStats.success})` : `Failure (${bioStats.failure})`}
+                  </button>
+                ))}
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2">
+                <select
+                  value={bioDeviceFilter}
+                  onChange={(e) => setBioDeviceFilter(e.target.value)}
+                  className="px-3 py-1.5 text-xs bg-[#F8FAFC] dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg"
+                >
+                  <option value="All">All Devices</option>
+                  {devices.map((d) => (
+                    <option key={d.id} value={String(d.id)}>
+                      DEV-{d.id} · {d.device_name}
+                    </option>
+                  ))}
+                  <option value="UNREGISTERED">Unregistered / WebAuthn</option>
+                </select>
+                <div className="relative">
+                  <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2" />
+                  <input
+                    type="text"
+                    placeholder="Search employee, device ID, serial..."
+                    value={bioSearch}
+                    onChange={(e) => setBioSearch(e.target.value)}
+                    className="pl-8 pr-3 py-1.5 text-xs bg-[#F8FAFC] dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg w-56"
+                  />
+                </div>
+              </div>
+            </div>
+
+            <div className="w-full overflow-x-auto">
+              <table className="w-full min-w-[880px] text-left border-collapse">
+                <thead>
+                  <tr className="border-b border-slate-200 dark:border-slate-800 bg-[#18243A] text-white text-xs font-semibold">
+                    <th className="py-3 px-4">Timestamp</th>
+                    <th className="py-3 px-4">Device ID</th>
+                    <th className="py-3 px-4">Employee ID</th>
+                    <th className="py-3 px-4">Employee & Method</th>
+                    <th className="py-3 px-4">Status (Success/Failure)</th>
+                    <th className="py-3 px-4 text-right">Attendance Link</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-200 dark:divide-slate-800 text-xs">
+                  {bioLoading && bioLogs.length === 0 ? (
+                    <tr>
+                      <td colSpan={6} className="py-8 text-center text-slate-500">
+                        Loading biometric authentication logs...
+                      </td>
+                    </tr>
+                  ) : filteredBioLogs.length === 0 ? (
+                    <tr>
+                      <td colSpan={6} className="py-10 text-center text-slate-500">
+                        No biometric authentication events match your filter. Verify a scan above or push a terminal punch to see live stream events.
+                      </td>
+                    </tr>
+                  ) : (
+                    filteredBioLogs.map((log) => {
+                      const ts = formatLogTimestamp(log.verified_at || log.created_at);
+                      const isSuccess = log.status === 'Success';
+                      return (
+                        <tr key={log.id} className="hover:bg-[#F8FAFC] dark:hover:bg-slate-800/40 transition-colors">
+                          <td className="py-3 px-4 font-mono tabular-nums whitespace-nowrap">
+                            <div className="flex items-center gap-1.5 font-semibold text-[#172033] dark:text-white">
+                              <Clock className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+                              {ts.time}
+                            </div>
+                            <div className="text-[11px] text-slate-500 pl-5">{ts.date}</div>
+                          </td>
+                          <td className="py-3 px-4">
+                            <div className="font-mono font-bold text-[#172033] dark:text-white whitespace-nowrap">
+                              {log.device_id ? `DEV-${log.device_id}` : 'EXT'} · {log.device_identifier}
+                            </div>
+                            <div className="text-[11px] text-slate-500 truncate max-w-[200px]">
+                              {log.device_name} · {log.auth_source}
+                            </div>
+                          </td>
+                          <td className="py-3 px-4 font-mono font-bold text-[#172033] dark:text-white whitespace-nowrap">
+                            {log.employee_code || 'N/A'}
+                          </td>
+                          <td className="py-3 px-4">
+                            <div className="font-semibold text-[#172033] dark:text-white">
+                              {log.employee_name || 'Unmatched Credential'}
+                            </div>
+                            <div className="text-[11px] text-slate-500">
+                              {log.auth_method} · <span className="font-mono text-[#087CEB]">{log.punch_type}</span>
+                              {log.department ? ` · ${log.department}` : ''}
+                            </div>
+                          </td>
+                          <td className="py-3 px-4">
+                            {isSuccess ? (
+                              <span className="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] font-bold text-emerald-800 dark:text-emerald-300 bg-emerald-50 dark:bg-emerald-950/60 border border-emerald-200 dark:border-emerald-800 rounded">
+                                <CheckCircle2 className="w-3 h-3" />
+                                Success
+                              </span>
+                            ) : (
+                              <div>
+                                <span className="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] font-bold text-red-800 dark:text-red-300 bg-red-50 dark:bg-red-950/60 border border-red-200 dark:border-red-800 rounded">
+                                  <XCircle className="w-3 h-3" />
+                                  Failure
+                                </span>
+                                {log.failure_reason && (
+                                  <div className="text-[11px] text-red-600 dark:text-red-400 mt-0.5 max-w-[240px]">
+                                    {log.failure_reason}
+                                  </div>
+                                )}
+                              </div>
+                            )}
+                          </td>
+                          <td className="py-3 px-4 text-right whitespace-nowrap">
+                            {log.attendance_marked && log.attendance_record_id ? (
+                              <div className="inline-flex items-center gap-2 justify-end">
+                                <span className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-mono font-bold text-[#087CEB] bg-[#EAF4FF] dark:bg-sky-950/60 border border-[#087CEB]/25 rounded">
+                                  Attendance #{log.attendance_record_id}
+                                </span>
+                                {onNavigate && (
+                                  <button
+                                    type="button"
+                                    onClick={() => onNavigate('attendance')}
+                                    className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-semibold text-[#18243A] dark:text-white bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 rounded"
+                                    title="Open Attendance Register"
+                                  >
+                                    <ExternalLink className="w-3 h-3" />
+                                    View
+                                  </button>
+                                )}
+                              </div>
+                            ) : isSuccess ? (
+                              <button
+                                type="button"
+                                disabled={markingLogId === log.id}
+                                onClick={() => handleMarkAttendanceFromLog(log.id)}
+                                className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] font-bold text-white bg-[#087CEB] hover:bg-[#0265C4] disabled:opacity-60 rounded-lg whitespace-nowrap"
+                              >
+                                {markingLogId === log.id ? (
+                                  <Loader2 className="w-3 h-3 animate-spin" />
+                                ) : (
+                                  <CheckCircle2 className="w-3 h-3" />
+                                )}
+                                Mark Attendance
+                              </button>
+                            ) : (
+                              <span className="text-[11px] text-slate-400 italic">Blocked</span>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Live Punch Push & Webhook Modal */}
       {punchModalDevice && (

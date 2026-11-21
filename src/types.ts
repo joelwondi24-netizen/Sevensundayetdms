@@ -104,6 +104,9 @@ export interface UserAccount {
   job_title: string;
   role: UserRole;
   status: 'Active' | 'Suspended';
+  mfa_enabled?: number | boolean;
+  failed_login_attempts?: number;
+  locked_until?: string | null;
   last_login: string | null;
   last_login_at?: string | null;
   created_at: string;
@@ -299,6 +302,26 @@ export interface DeviceScanResult {
   latencyMs: number;
   suggested_type: string;
   message: string;
+}
+
+export interface BiometricAuthLogRecord {
+  id: number;
+  tenant_id: number;
+  device_id: number | null;
+  device_identifier: string;
+  device_name: string;
+  auth_source: string;
+  auth_method: string;
+  employee_code: string;
+  employee_name: string;
+  department: string;
+  punch_type: 'Check-In' | 'Check-Out' | string;
+  status: 'Success' | 'Failure';
+  failure_reason: string;
+  attendance_record_id: number | null;
+  attendance_marked: number | boolean;
+  verified_at: string;
+  created_at: string;
 }
 
 export interface AttendanceRecord {
@@ -960,8 +983,74 @@ export interface BiometricCredential {
 }
 
 export interface AuthSessionResponse {
-  user: UserAccount;
-  token: string;
-  auth_method: 'password' | 'register' | 'google' | 'biometric';
+  user?: UserAccount;
+  token?: string;
+  auth_method?: 'password' | 'register' | 'google' | 'biometric' | 'mfa';
   encrypted_sync_key?: string;
+  mfa_required?: boolean;
+  mfa_challenge_token?: string;
+  email?: string;
 }
+
+export interface ActiveSessionRecord {
+  id: number;
+  user_id: number;
+  tenant_id: number;
+  auth_method: string;
+  user_agent: string;
+  ip_address: string;
+  last_active_at: string;
+  expires_at: string;
+  created_at: string;
+  is_current?: boolean;
+  user_name?: string;
+  user_email?: string;
+  user_role?: string;
+}
+
+export interface NotificationLogRecord {
+  id: number;
+  tenant_id: number;
+  event_type: string;
+  channel: 'In-App' | 'Email' | 'Telegram' | 'Webhook' | string;
+  recipient: string;
+  title: string;
+  message: string;
+  severity: 'info' | 'warning' | 'critical';
+  module: string;
+  status: 'Delivered' | 'Failed' | 'Pending' | 'Logged (Client Action)';
+  error_message: string;
+  retry_count: number;
+  created_at: string;
+  delivered_at: string | null;
+}
+
+export interface NotificationChannelConfig {
+  tenant_id: number;
+  email_enabled: number | boolean;
+  telegram_enabled: number | boolean;
+  telegram_bot_token: string;
+  telegram_chat_id: string;
+  whatsapp_webhook_url: string;
+  webhook_enabled: number | boolean;
+  notify_on_events_json: string;
+  updated_at: string;
+}
+
+export interface BackupSnapshotFile {
+  filename: string;
+  size_bytes: number;
+  created_at: string;
+  kind: 'auto' | 'manual';
+}
+
+export interface RbacActionPermissions {
+  view: boolean;
+  create: boolean;
+  edit: boolean;
+  delete: boolean;
+  approve: boolean;
+  export: boolean;
+  manage: boolean;
+}
+
