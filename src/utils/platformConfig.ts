@@ -14,7 +14,7 @@ export const DEFAULT_APPROVING_DEPARTMENTS = [
 ];
 
 export const DEFAULT_PLATFORM_CONFIG: PlatformConfig = {
-  platform_title: 'Seven Sunday Enterprise ETMS',
+  platform_title: 'Seven Sunday Ethiopia ETMS',
   primary_color: '#087CEB',
   secondary_color: '#18243A',
   accent_color: '#38BDF8',

@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Activity,
+  Banknote,
   Bell,
   BookOpen,
   Building2,
@@ -36,7 +37,7 @@ import {
   Wallet,
   X,
 } from 'lucide-react';
-import { api, getApiActorHeaders, getApiTenantId, setApiActor, setApiTenant } from './api';
+import { api, getApiActorHeaders, getApiTenantId, setApiActor, setApiTenant, setAuthToken } from './api';
 import { AdminModule, DEFAULT_RBAC_MATRIX } from './components/AdminModule';
 import { AssetsVehiclesModule } from './components/AssetsVehiclesModule';
 import { AttendanceModule } from './components/AttendanceModule';
@@ -53,6 +54,7 @@ import { LoginScreen } from './components/LoginScreen';
 import { OperationsCenterModule } from './components/OperationsCenterModule';
 import { OfflineIndicator, PWAInstallButton } from './components/PWAInstallButton';
 import { ReportsModule } from './components/ReportsModule';
+import { SalaryModule } from './components/SalaryModule';
 import { SalesCrmModule } from './components/SalesCrmModule';
 import { SchedulingModule } from './components/SchedulingModule';
 import { SecretaryModule } from './components/SecretaryModule';
@@ -62,6 +64,7 @@ import { useOnlineStatus } from './hooks/usePWAInstall';
 import { useRealtimeWS, type WsEventPayload } from './hooks/useRealtimeWS';
 import { getPendingQueue, syncQueuedMutations } from './offline/syncEngine';
 import type {
+  AuthSessionResponse,
   CompanySettings,
   DashboardSummary,
   GlobalSearchResult,
@@ -92,6 +95,7 @@ const ALL_MODULE_KEYS: ModuleKey[] = [
   'attendance',
   'scheduling',
   'leave',
+  'salary',
   'payroll',
   'secretary',
   'company-forms',
@@ -197,6 +201,7 @@ const NAV_GROUPS: NavGroup[] = [
       { key: 'attendance', fallbackLabel: 'Attendance Register & OT', icon: <Clock className="w-4 h-4" /> },
       { key: 'scheduling', fallbackLabel: 'Staff Scheduling & Shifts', icon: <CalendarClock className="w-4 h-4" /> },
       { key: 'leave', fallbackLabel: 'Leave Management', icon: <CalendarOff className="w-4 h-4" /> },
+      { key: 'salary', fallbackLabel: 'Salary Management', icon: <Banknote className="w-4 h-4" /> },
       { key: 'payroll', fallbackLabel: 'Payroll & Ethiopian Tax', icon: <Wallet className="w-4 h-4" /> },
       { key: 'secretary', fallbackLabel: 'Secretary & A4 Documents', icon: <FileText className="w-4 h-4" /> },
       { key: 'company-forms', fallbackLabel: 'Company Forms & Evaluations', icon: <ClipboardCheck className="w-4 h-4" /> },
@@ -231,7 +236,7 @@ const NAV_GROUPS: NavGroup[] = [
     items: [
       { key: 'chat', fallbackLabel: 'Internal Corporate Chat', icon: <MessageSquare className="w-4 h-4" /> },
       { key: 'audit', fallbackLabel: 'Immutable Audit Trail', icon: <Activity className="w-4 h-4" /> },
-      { key: 'sync', fallbackLabel: 'Offline Sync & Backup', icon: <HardDriveUpload className="w-4 h-4" /> },
+      { key: 'sync', fallbackLabel: 'Synchronization Center', icon: <HardDriveUpload className="w-4 h-4" /> },
     ],
   },
 ];
@@ -245,6 +250,7 @@ const MODULE_TITLES: Record<ModuleKey, string> = {
   attendance: 'Attendance Register & Overtime Multipliers',
   scheduling: 'Staff Scheduling, 3/4-Shift Management & Dept Timetables',
   leave: 'Leave Management',
+  salary: 'Staff Salary Management, Grades & Allowances',
   payroll: 'Payroll, Bonus & Ethiopian Statutory Tax Rules',
   secretary: 'Secretary Department & A4 Official Company Documents',
   'company-forms': 'Complete Company Forms (17 Departments) & Staff Evaluation',
@@ -262,7 +268,7 @@ const MODULE_TITLES: Record<ModuleKey, string> = {
   reports: 'Corporate Reports & Data Exports',
   chat: 'Internal Corporate Chat',
   audit: 'Immutable Security & Activity Audit Trail',
-  sync: 'Offline Synchronization, Local DB & Backup Center',
+  sync: 'Synchronization Center, Biometric Security & Backup',
 };
 
 const SUPPLY_CHAIN_KEYS: ModuleKey[] = [
@@ -274,24 +280,13 @@ const SUPPLY_CHAIN_KEYS: ModuleKey[] = [
   'purchasing',
 ];
 
-const SESSION_KEY = 'seven_sunday_session_user';
+const LEGACY_SESSION_KEY = 'seven_sunday_session_user';
 const THEME_KEY = 'seven_sunday_theme';
 const LANG_KEY = 'seven_sunday_lang';
 
 export default function App() {
-  const [currentUser, setCurrentUser] = useState<UserAccount | null>(() => {
-    try {
-      const raw = sessionStorage.getItem(SESSION_KEY);
-      if (raw) {
-        const parsed = JSON.parse(raw) as UserAccount;
-        setApiActor(parsed.full_name, parsed.role);
-        return parsed;
-      }
-    } catch {
-      // ignore invalid session
-    }
-    return null;
-  });
+  const [currentUser, setCurrentUser] = useState<UserAccount | null>(null);
+  const [encryptedSyncKey, setEncryptedSyncKey] = useState<string | null>(null);
 
   const [tenants, setTenants] = useState<TenantRecord[]>([]);
   const [activeTenantId, setActiveTenantId] = useState<number>(() => getApiTenantId());
@@ -454,6 +449,21 @@ export default function App() {
   }, [refreshCompanyAndSummary, refreshQueueCount]);
 
   useEffect(() => {
+    try {
+      sessionStorage.removeItem(LEGACY_SESSION_KEY);
+    } catch {
+      // ignore
+    }
+    const onUnauthorized = () => {
+      setAuthToken(null);
+      setEncryptedSyncKey(null);
+      setCurrentUser(null);
+    };
+    window.addEventListener('sevensunday:unauthorized', onUnauthorized);
+    return () => window.removeEventListener('sevensunday:unauthorized', onUnauthorized);
+  }, []);
+
+  useEffect(() => {
     const onDataImported = () => {
       refreshDashboard();
       setTenantRefreshKey((k) => k + 1);
@@ -544,20 +554,28 @@ export default function App() {
     }
   }, [currentUser, allowedModules, activeModule]);
 
-  const handleLogin = (user: UserAccount) => {
+  const handleLogin = (auth: AuthSessionResponse) => {
+    const user = auth.user;
+    setAuthToken(auth.token);
+    setEncryptedSyncKey(auth.encrypted_sync_key || null);
     setApiActor(user.full_name, user.role);
     if (user.tenant_id && user.tenant_id !== activeTenantId) {
       setApiTenant(user.tenant_id);
       setActiveTenantId(user.tenant_id);
       refreshCompanyAndSummary();
     }
-    sessionStorage.setItem(SESSION_KEY, JSON.stringify(user));
     setCurrentUser(user);
     setActiveModule('dashboard');
   };
 
-  const handleSignOut = () => {
-    sessionStorage.removeItem(SESSION_KEY);
+  const handleSignOut = async () => {
+    try {
+      await api.post('/api/auth/logout');
+    } catch {
+      // ignore network error on sign-out
+    }
+    setAuthToken(null);
+    setEncryptedSyncKey(null);
     setCurrentUser(null);
   };
 
@@ -914,6 +932,16 @@ export default function App() {
               mode="hr"
               currency={currency}
               company={company}
+              currentUserName={currentUser.full_name}
+              currentUserRole={currentUser.role}
+              onRefreshDashboard={refreshDashboard}
+            />
+          )}
+          {activeModule === 'salary' && (
+            <SalaryModule
+              currency={currency}
+              company={company}
+              currentUserRole={currentUser.role}
               onRefreshDashboard={refreshDashboard}
             />
           )}
@@ -922,6 +950,8 @@ export default function App() {
               mode="payroll"
               currency={currency}
               company={company}
+              currentUserName={currentUser.full_name}
+              currentUserRole={currentUser.role}
               onRefreshDashboard={refreshDashboard}
             />
           )}
@@ -997,6 +1027,8 @@ export default function App() {
               mode={activeModule}
               isOnline={isOnline}
               onNavigate={handleSelectModule}
+              currentUser={currentUser}
+              encryptedSyncKey={encryptedSyncKey}
             />
           )}
         </main>

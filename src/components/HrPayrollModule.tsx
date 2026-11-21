@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import {
   BadgeCheck,
+  BarChart3,
   Calculator,
   Check,
   Download,
@@ -35,11 +36,15 @@ import { SendToApproveButton } from './SendToApproveButton';
 import { ShareButton } from './ShareButton';
 import { PrintableSheetFrame } from './PrintableSheetFrame';
 import { printWithAutoFit } from '../utils/printFit';
+import { exportSignedPayrollSummaryPdf } from '../utils/payrollSignedPdf';
+import { ExecutivePayrollAnalytics } from './ExecutivePayrollAnalytics';
 
 interface HrPayrollModuleProps {
   mode: 'hr' | 'payroll';
   currency: string;
   company?: CompanySettings | null;
+  currentUserName?: string;
+  currentUserRole?: string;
   onRefreshDashboard: () => void;
 }
 
@@ -90,6 +95,8 @@ export const HrPayrollModule: React.FC<HrPayrollModuleProps> = ({
   mode,
   currency,
   company,
+  currentUserName = 'Payroll Officer',
+  currentUserRole = 'Authorized Signatory',
   onRefreshDashboard,
 }) => {
   const [employees, setEmployees] = useState<EmployeeProfile[]>([]);
@@ -117,7 +124,7 @@ export const HrPayrollModule: React.FC<HrPayrollModuleProps> = ({
   const [editingEmpId, setEditingEmpId] = useState<number | null>(null);
   const [hrPreviewMode, setHrPreviewMode] = useState<'id-card' | 'registration-sheet'>('id-card');
   const [selectedPayslip, setSelectedPayslip] = useState<PayrollRecord | null>(null);
-  const [payrollTab, setPayrollTab] = useState<'sheet' | 'runs' | 'individual' | 'rules'>('sheet');
+  const [payrollTab, setPayrollTab] = useState<'sheet' | 'analytics' | 'runs' | 'individual' | 'rules'>('sheet');
   const [sheetMonth, setSheetMonth] = useState<string>('');
   const [sheetCategory, setSheetCategory] = useState<string>('ALL');
   const [standardHoursDivisor, setStandardHoursDivisor] = useState<string>('208.00');
@@ -128,6 +135,7 @@ export const HrPayrollModule: React.FC<HrPayrollModuleProps> = ({
   const [editingIdentityId, setEditingIdentityId] = useState<number | null>(null);
   const [savingRowId, setSavingRowId] = useState<number | null>(null);
   const [savingAll, setSavingAll] = useState(false);
+  const [exportingPdf, setExportingPdf] = useState(false);
   const [mobileCardEditOpen, setMobileCardEditOpen] = useState(false);
 
   const [showAddSheetRow, setShowAddSheetRow] = useState(false);
@@ -603,6 +611,79 @@ export const HrPayrollModule: React.FC<HrPayrollModuleProps> = ({
     URL.revokeObjectURL(url);
   };
 
+  const handleExportSignedPdf = async () => {
+    setExportingPdf(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const viewMode: 'sheet' | 'runs' | 'register' =
+        payrollTab === 'runs' ? 'runs' : payrollTab === 'sheet' ? 'sheet' : 'register';
+
+      const sheetRows = sheetPayrolls.map((p, idx) => {
+        const live = computeRowLive(p);
+        return {
+          no: idx + 1,
+          monthLabel: p.month_label || p.payroll_month,
+          category: p.payroll_category || 'FACTORY PERMANENT',
+          name: live.name,
+          bankAccount: live.bank_account,
+          idNo: live.id_no,
+          basic: live.basic,
+          rate: live.rate,
+          absHrs: live.absHrs,
+          absRate: live.absRate,
+          absAmt: live.absAmt,
+          otNor: live.otNor,
+          otNight: live.otNight,
+          otSun: live.otSun,
+          otHol: live.otHol,
+          otNorBirr: live.otNorBirr,
+          otNightBirr: live.otNightBirr,
+          otSunBirr: live.otSunBirr,
+          otHolBirr: live.otHolBirr,
+          otAmt: live.otAmt,
+          gross: live.gross,
+          tax: live.tax,
+          empPen: live.empPen,
+          erPen: live.erPen,
+          net: live.net,
+          status: p.status,
+        };
+      });
+
+      const result = await exportSignedPayrollSummaryPdf({
+        viewMode,
+        company,
+        currency,
+        monthLabel: activeHeaderMonth,
+        categoryLabel: activeHeaderCategory,
+        standardHoursDivisor: stdHrsDivisor,
+        multipliers: {
+          normal: multNormal,
+          night: multNight,
+          sunday: multSun,
+          holiday: multHol,
+        },
+        sheetRows,
+        sheetTotals,
+        payrollRuns,
+        registerRows: payrolls,
+        selectedPayslip,
+        signerName: currentUserName,
+        signerRole: currentUserRole,
+        preparedBy: currentUserName,
+      });
+
+      setNotice(
+        `Exported signed A4 Landscape PDF (${result.fileName}) · Digital Seal: ${result.signatureHash}`
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to export signed PDF');
+    } finally {
+      setExportingPdf(false);
+    }
+  };
+
   const bonusPreviewTotal = useMemo(() => {
     const pct = Number(runForm.bonus_percent) || 0;
     const fixed = Number(runForm.fixed_bonus) || 0;
@@ -734,7 +815,7 @@ export const HrPayrollModule: React.FC<HrPayrollModuleProps> = ({
                   <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">Email Address</label>
                   <input
                     type="email"
-                    placeholder="name@sevensunday.et"
+                    placeholder="user@sevensundayethiopia.com"
                     value={empForm.email}
                     onChange={(e) => setEmpForm({ ...empForm, email: e.target.value })}
                     className="w-full px-3 py-2 text-sm bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg"
@@ -1367,6 +1448,7 @@ export const HrPayrollModule: React.FC<HrPayrollModuleProps> = ({
           {(
             [
               ['sheet', 'Real Payroll Sheet (Landscape A4)', <FileSpreadsheet className="w-3.5 h-3.5" />],
+              ['analytics', 'Executive Payroll Analytics', <BarChart3 className="w-3.5 h-3.5" />],
               ['runs', 'Monthly Payroll Runs & Bonus', <Play className="w-3.5 h-3.5" />],
               ['individual', 'Single Staff Entry & QR Payslip', <Calculator className="w-3.5 h-3.5" />],
               ['rules', 'Ethiopian Tax & Pension Rules', <Settings className="w-3.5 h-3.5" />],
@@ -1394,6 +1476,16 @@ export const HrPayrollModule: React.FC<HrPayrollModuleProps> = ({
             <Download className="w-3.5 h-3.5" />
             Export CSV
           </button>
+          <button
+            type="button"
+            disabled={exportingPdf}
+            onClick={handleExportSignedPdf}
+            className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-bold text-white bg-[#18243A] hover:bg-[#243656] disabled:opacity-60 rounded-lg whitespace-nowrap"
+            title="Export current payroll view summary as a digitally signed A4 Landscape PDF"
+          >
+            <BadgeCheck className="w-3.5 h-3.5 text-[#38BDF8]" />
+            {exportingPdf ? 'Signing PDF...' : 'Export Signed PDF (A4 Landscape)'}
+          </button>
         </div>
       </div>
 
@@ -1406,6 +1498,27 @@ export const HrPayrollModule: React.FC<HrPayrollModuleProps> = ({
         <div className="no-print px-4 py-2.5 text-xs text-red-700 bg-red-50 border border-red-200 rounded-lg">
           {error}
         </div>
+      )}
+
+      {/* TAB: EXECUTIVE PAYROLL ANALYTICS */}
+      {payrollTab === 'analytics' && (
+        <ExecutivePayrollAnalytics
+          payrolls={payrolls}
+          payrollRuns={payrollRuns}
+          computeRowLive={computeRowLive}
+          currency={currency}
+          multipliers={{
+            normal: multNormal,
+            night: multNight,
+            sunday: multSun,
+            holiday: multHol,
+          }}
+          selectedMonth={sheetMonth}
+          selectedCategory={sheetCategory}
+          onExportSignedPdf={handleExportSignedPdf}
+          exportingPdf={exportingPdf}
+          onBackToSheet={() => setPayrollTab('sheet')}
+        />
       )}
 
       {/* TAB: MONTHLY PAYROLL RUNS */}
@@ -1837,6 +1950,16 @@ export const HrPayrollModule: React.FC<HrPayrollModuleProps> = ({
                 >
                   <Calculator className="w-3.5 h-3.5 text-[#087CEB]" />
                   {mobileCardEditOpen ? 'Hide Card Editor' : 'Mobile / Touch Editor'}
+                </button>
+                <button
+                  type="button"
+                  disabled={exportingPdf}
+                  onClick={handleExportSignedPdf}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-bold text-white bg-[#18243A] hover:bg-[#243656] disabled:opacity-60 rounded-lg whitespace-nowrap"
+                  title="Download current sheet summary as a digitally signed A4 Landscape PDF"
+                >
+                  <BadgeCheck className="w-3.5 h-3.5 text-[#38BDF8]" />
+                  {exportingPdf ? 'Signing PDF...' : 'Export Signed PDF'}
                 </button>
                 <button
                   type="button"
@@ -2974,8 +3097,8 @@ export const HrPayrollModule: React.FC<HrPayrollModuleProps> = ({
         </div>
       )}
 
-      {/* LEDGER + QR PAYSLIP PREVIEW FOR NON-SHEET TABS */}
-      {payrollTab !== 'sheet' && (
+      {/* LEDGER + QR PAYSLIP PREVIEW FOR NON-SHEET / NON-ANALYTICS TABS */}
+      {payrollTab !== 'sheet' && payrollTab !== 'analytics' && (
         <div className="print-grid-reset grid grid-cols-1 lg:grid-cols-12 gap-6">
           <div className="no-print lg:col-span-8 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden">
             <div className="px-4 py-3 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between">

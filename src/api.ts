@@ -3,7 +3,8 @@ import { cacheGetResponse, enqueueMutation, getCachedResponse } from './offline/
 const TENANT_STORAGE_KEY = 'seven_sunday_active_tenant_id';
 
 let actorName = 'System Operator';
-let actorRole = 'Super Administrator';
+let actorRole = 'Employee';
+let authToken: string | null = null;
 let activeTenantId = (() => {
   try {
     const raw = localStorage.getItem(TENANT_STORAGE_KEY);
@@ -14,9 +15,17 @@ let activeTenantId = (() => {
   }
 })();
 
+export function setAuthToken(token: string | null) {
+  authToken = token && token.trim() ? token.trim() : null;
+}
+
+export function getAuthToken(): string | null {
+  return authToken;
+}
+
 export function setApiActor(name: string, role: string) {
   actorName = name || 'System Operator';
-  actorRole = role || 'Super Administrator';
+  actorRole = role || 'Employee';
 }
 
 export function setApiTenant(tenantId: number) {
@@ -34,11 +43,15 @@ export function getApiTenantId(): number {
 }
 
 export function getApiActorHeaders(): Record<string, string> {
-  return {
+  const headers: Record<string, string> = {
     'x-actor-name': actorName,
     'x-actor-role': actorRole,
     'x-tenant-id': String(activeTenantId),
   };
+  if (authToken) {
+    headers['Authorization'] = `Bearer ${authToken}`;
+  }
+  return headers;
 }
 
 function getTenantCacheKey(url: string): string {
@@ -73,15 +86,21 @@ async function request<T>(
         },
       });
       if (!res.ok) {
+        if (res.status === 401 && !url.startsWith('/api/auth/')) {
+          window.dispatchEvent(new CustomEvent('sevensunday:unauthorized'));
+        }
         throw new Error(await parseErrorMessage(res));
       }
       const data = (await res.json()) as T;
       void cacheGetResponse(cacheKey, data);
       return data;
     } catch (err) {
-      const cached = await getCachedResponse<T>(cacheKey);
-      if (cached !== null) {
-        return cached;
+      const msg = err instanceof Error ? err.message : '';
+      if (!navigator.onLine || msg.includes('Failed to fetch')) {
+        const cached = await getCachedResponse<T>(cacheKey);
+        if (cached !== null) {
+          return cached;
+        }
       }
       throw err;
     }
@@ -97,6 +116,9 @@ async function request<T>(
       body: body !== undefined ? JSON.stringify(body) : undefined,
     });
     if (!res.ok) {
+      if (res.status === 401 && !url.startsWith('/api/auth/')) {
+        window.dispatchEvent(new CustomEvent('sevensunday:unauthorized'));
+      }
       throw new Error(await parseErrorMessage(res));
     }
     if (res.status === 204) {

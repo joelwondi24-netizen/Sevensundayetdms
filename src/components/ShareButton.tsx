@@ -37,7 +37,7 @@ export const ShareButton: React.FC<ShareButtonProps> = ({
   const [feedback, setFeedback] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const shareUrl = typeof window !== 'undefined' ? window.location.href : 'https://sevensunday.et';
+  const shareUrl = typeof window !== 'undefined' ? window.location.href : 'https://sevensundayethiopia.com';
   const fullText = [
     `Seven Sunday ETMS — ${moduleName}`,
     reference ? `Ref: ${reference}` : null,

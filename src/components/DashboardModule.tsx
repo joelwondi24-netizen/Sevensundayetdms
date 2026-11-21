@@ -2,6 +2,7 @@ import React, { useMemo, useState } from 'react';
 import {
   Activity,
   ArrowRight,
+  Banknote,
   BarChart3,
   BookOpen,
   CalendarClock,
@@ -90,6 +91,13 @@ export const DashboardModule: React.FC<DashboardModuleProps> = ({
       detail: '3-Shift & 4-Shift timetables · Conflict detector',
       module: 'scheduling',
       icon: <CalendarClock className="w-4 h-4 text-[#087CEB]" />,
+    },
+    {
+      title: 'Staff Salary Management',
+      value: money(summary?.payrollTotalBasic ?? 0),
+      detail: 'Grades, allowances & salary assignment ledger',
+      module: 'salary',
+      icon: <Banknote className="w-4 h-4 text-[#087CEB]" />,
     },
     {
       title: 'Monthly Payroll Net',
@@ -1130,7 +1138,7 @@ export const DashboardModule: React.FC<DashboardModuleProps> = ({
       <div className="space-y-3">
         <div className="flex items-center justify-between">
           <h3 className="text-sm font-bold text-[#172033] dark:text-white">
-            Enterprise Modules & Operational Overview
+            Ethiopia Modules & Operational Overview
           </h3>
           <span className="text-xs text-slate-500 dark:text-slate-400">
             Select any module card to open live records

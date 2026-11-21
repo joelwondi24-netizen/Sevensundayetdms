@@ -1,6 +1,6 @@
 {
   "name": "Seven Sunday ETMS",
-  "description": "Seven Sunday Enterprise Management System with Executive Analytics Charts, Real Payroll Sheet (Absence & Categorized OT Multipliers), Device Connectivity, Attendance Register, Supply Chain, Sales & CRM, Double-Entry Accounting, and Corporate Chat.",
+  "description": "Seven Sunday Ethiopia Management System with Executive Analytics Charts, Real Payroll Sheet (Absence & Categorized OT Multipliers), Device Connectivity, Attendance Register, Supply Chain, Sales & CRM, Double-Entry Accounting, and Corporate Chat.",
   "requestFramePermissions": [],
   "majorCapabilities": [
     "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"

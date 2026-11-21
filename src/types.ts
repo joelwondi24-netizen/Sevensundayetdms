@@ -29,6 +29,7 @@ export type ModuleKey =
   | 'attendance'
   | 'scheduling'
   | 'leave'
+  | 'salary'
   | 'payroll'
   | 'secretary'
   | 'company-forms'
@@ -915,4 +916,52 @@ export interface ScheduleConflictReport {
   overlaps: Array<{ id: number; schedule_code: string; schedule_date: string; shift_name: string; start_time: string; end_time: string }>;
   restViolations: Array<{ id: number; schedule_code: string; schedule_date: string; shift_name: string; restHours: number; requiredHours: number }>;
   leaveConflicts: Array<{ id: number; leave_type: string; start_date: string; end_date: string; status: string }>;
+}
+
+export interface SalaryRecord {
+  id: number;
+  tenant_id?: number;
+  salary_code: string;
+  employee_id: string;
+  employee_name: string;
+  department: string;
+  job_title: string;
+  salary_grade: string;
+  previous_salary: number;
+  basic_salary: number;
+  housing_allowance: number;
+  transport_allowance: number;
+  position_allowance: number;
+  other_allowance: number;
+  gross_salary: number;
+  income_tax: number;
+  employee_pension: number;
+  employer_pension: number;
+  net_salary: number;
+  bank_account: string;
+  effective_date: string;
+  adjustment_type: 'Initial Salary' | 'Annual Increment' | 'Promotion' | 'Contract Adjustment' | 'Allowance Update';
+  status: 'Pending' | 'Approved' | 'Applied';
+  approved_by: string | null;
+  notes: string;
+  created_by: string;
+  created_at: string;
+}
+
+export interface BiometricCredential {
+  id: number;
+  user_id: number;
+  email: string;
+  credential_id: string;
+  device_label: string;
+  auth_type: 'Fingerprint / Face ID' | 'Platform Passkey' | 'Hardware Key';
+  created_at: string;
+  last_used_at: string | null;
+}
+
+export interface AuthSessionResponse {
+  user: UserAccount;
+  token: string;
+  auth_method: 'password' | 'register' | 'google' | 'biometric';
+  encrypted_sync_key?: string;
 }

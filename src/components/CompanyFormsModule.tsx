@@ -311,7 +311,7 @@ export const CompanyFormsModule: React.FC<CompanyFormsModuleProps> = ({
       else if (f.type === 'textarea') {
         sampleVals[f.key] = `Sample entry prepared for ${resolvedForm.name} (${resolvedForm.code}) covering ${resolvedForm.departmentName} operations, compliance verification, and departmental review.`;
       } else if (lbl.includes('phone')) sampleVals[f.key] = '+251 911 234 567';
-      else if (lbl.includes('email')) sampleVals[f.key] = 'operations@sevensunday.et';
+      else if (lbl.includes('email')) sampleVals[f.key] = 'operations@sevensundayethiopia.com';
       else if (lbl.includes('branch') || lbl.includes('location')) sampleVals[f.key] = 'Addis Ababa HQ / Adama Plant';
       else sampleVals[f.key] = f.placeholder || `Sample ${f.label}`;
     }

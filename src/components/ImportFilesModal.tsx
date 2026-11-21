@@ -73,8 +73,8 @@ const SAMPLE_CSV: Record<Exclude<CsvTarget, 'backup'>, { filename: string; conte
     filename: 'sample-employees-import.csv',
     content: [
       'employee_id,full_name,gender,phone,email,national_id,department,job_title,employment_type,start_date,basic_salary,bank_account,status',
-      'SS-EMP-901,Abebe Bikila,Male,+251911223344,abebe@sevensunday.et,ET-NID-90122,Production,Line Supervisor,Permanent,2026-01-15,9500,1078100199001,Active',
-      'SS-EMP-902,Selamawit Tadesse,Female,+251922334455,selam@sevensunday.et,ET-NID-90233,Finance,Cost Accountant,Permanent,2026-02-01,11200,1078100199002,Active',
+      'SS-EMP-901,Abebe Bikila,Male,+251911223344,abebe@sevensundayethiopia.com,ET-NID-90122,Production,Line Supervisor,Permanent,2026-01-15,9500,1078100199001,Active',
+      'SS-EMP-902,Selamawit Tadesse,Female,+251922334455,selam@sevensundayethiopia.com,ET-NID-90233,Finance,Cost Accountant,Permanent,2026-02-01,11200,1078100199002,Active',
     ].join('\n'),
   },
   materials: {

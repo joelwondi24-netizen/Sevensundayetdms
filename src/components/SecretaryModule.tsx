@@ -669,7 +669,7 @@ export const SecretaryModule: React.FC<SecretaryModuleProps> = ({ company, onRef
                     <div className="font-bold text-sm text-[#172033]">{selectedDoc.issued_by}</div>
                     <div>{selectedDoc.department} · Official Corporate Authorization</div>
                     <div className="text-[10px] font-mono text-slate-500">
-                      {company?.email || 'info@sevensunday.et'} · {company?.website || 'https://sevensunday.et'}
+                      {company?.email || 'info@sevensundayethiopia.com'} · {company?.website || 'https://sevensundayethiopia.com'}
                     </div>
                   </div>
 

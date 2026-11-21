@@ -72,6 +72,7 @@ const ALL_MATRIX_MODULES: Array<{ key: ModuleKey; label: string }> = [
   { key: 'attendance', label: 'Attendance' },
   { key: 'scheduling', label: 'Shifts & Schedule' },
   { key: 'leave', label: 'Leave' },
+  { key: 'salary', label: 'Salary' },
   { key: 'payroll', label: 'Payroll' },
   { key: 'secretary', label: 'Secretary' },
   { key: 'company-forms', label: 'Forms' },
@@ -122,6 +123,7 @@ export const DEFAULT_RBAC_MATRIX: Record<UserRole, ModuleKey[]> = {
     'attendance',
     'scheduling',
     'leave',
+    'salary',
     'payroll',
     'secretary',
     'company-forms',
@@ -134,6 +136,7 @@ export const DEFAULT_RBAC_MATRIX: Record<UserRole, ModuleKey[]> = {
   'Finance Manager': [
     'dashboard',
     'approvals',
+    'salary',
     'payroll',
     'company-forms',
     'purchasing',
@@ -144,7 +147,7 @@ export const DEFAULT_RBAC_MATRIX: Record<UserRole, ModuleKey[]> = {
     'chat',
     'sync',
   ],
-  Accountant: ['dashboard', 'payroll', 'company-forms', 'finance', 'sales-crm', 'reports', 'chat', 'sync'],
+  Accountant: ['dashboard', 'salary', 'payroll', 'company-forms', 'finance', 'sales-crm', 'reports', 'chat', 'sync'],
   'Inventory Manager': [
     'dashboard',
     'approvals',
@@ -263,8 +266,8 @@ export const AdminModule: React.FC<AdminModuleProps> = ({
       secondary_slogan: 'Together for a Stronger and Better Tomorrow',
       address: 'Bole Sub-City, Addis Ababa, Ethiopia',
       phone: '+251 11 000 0000',
-      email: 'info@sevensunday.et',
-      website: 'https://sevensunday.et',
+      email: 'info@sevensundayethiopia.com',
+      website: 'https://sevensundayethiopia.com',
       tin_number: '',
       default_currency: 'ETB',
       calendar_mode: 'Gregorian',
@@ -274,11 +277,11 @@ export const AdminModule: React.FC<AdminModuleProps> = ({
       logo_data: '',
       stamp_data: '',
       signature_data: '',
-      smtp_host: 'smtp.sevensunday.et',
+      smtp_host: 'smtp.sevensundayethiopia.com',
       smtp_port: 587,
-      smtp_user: 'noreply@sevensunday.et',
+      smtp_user: 'noreply@sevensundayethiopia.com',
       smtp_pass: '',
-      smtp_from: 'Seven Sunday EMS <noreply@sevensunday.et>',
+      smtp_from: 'Seven Sunday Ethiopia <noreply@sevensundayethiopia.com>',
       smtp_secure: 0,
       rbac_matrix: '{}',
       platform_config: JSON.stringify(DEFAULT_PLATFORM_CONFIG),
@@ -305,11 +308,11 @@ export const AdminModule: React.FC<AdminModuleProps> = ({
     secondary_slogan: 'Together for a Stronger and Better Tomorrow',
     address: 'Addis Ababa, Ethiopia',
     phone: '+251 11 000 0000',
-    email: 'workspace@sevensunday.et',
+    email: 'workspace@sevensundayethiopia.com',
     default_currency: 'ETB' as TenantRecord['default_currency'],
     calendar_mode: 'Gregorian' as 'Gregorian' | 'Ethiopian',
     default_language: 'en' as AppLang,
-    plan: 'Enterprise Branch',
+    plan: 'Ethiopia Branch',
     branches: 'Main Branch HQ',
     departments: 'Operations, HR, Secretary, Finance, Inventory, Procurement, Sales & CRM',
   };
@@ -321,7 +324,7 @@ export const AdminModule: React.FC<AdminModuleProps> = ({
   const [userForm, setUserForm] = useState({
     full_name: '',
     email: '',
-    password: 'SevenSunday@2026',
+    password: '',
     department: 'Operations',
     job_title: 'Staff',
     role: 'Employee' as UserRole,
@@ -461,13 +464,17 @@ export const AdminModule: React.FC<AdminModuleProps> = ({
   const handleCreateUser = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
+    if (userForm.password.trim().length < 6) {
+      setError('Password must be at least 6 characters.');
+      return;
+    }
     try {
       const created = await api.post<UserAccount>('/api/users', userForm);
       setUsers((prev) => [...prev, created]);
       setUserForm({
         full_name: '',
         email: '',
-        password: 'SevenSunday@2026',
+        password: '',
         department: departmentsList[0] || 'Operations',
         job_title: 'Staff',
         role: 'Employee',
@@ -547,15 +554,15 @@ export const AdminModule: React.FC<AdminModuleProps> = ({
     }
   };
 
-  const handleClearDemoData = async () => {
+  const handleClearOperationalRecords = async () => {
     setError(null);
     setNotice(null);
     try {
       await api.post('/api/admin/clear-demo');
-      setNotice('Sample operational records for active tenant cleared safely. Users, Chart of Accounts, and Settings preserved.');
+      setNotice('Operational records for active tenant cleared safely. Users, Chart of Accounts, and Settings preserved.');
       onRefreshDashboard();
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to clear demo records');
+      setError(err instanceof Error ? err.message : 'Failed to clear operational records');
     }
   };
 
@@ -583,7 +590,7 @@ export const AdminModule: React.FC<AdminModuleProps> = ({
     { key: 'users', label: 'User Accounts', icon: <Users className="w-3.5 h-3.5" /> },
     { key: 'rbac', label: 'RBAC Roles', icon: <Shield className="w-3.5 h-3.5" /> },
     { key: 'logins', label: 'Logins & Device Connections', icon: <Cpu className="w-3.5 h-3.5" /> },
-    { key: 'smtp', label: 'Demo Data & SMTP', icon: <Database className="w-3.5 h-3.5" /> },
+    { key: 'smtp', label: 'Backup, Reset & SMTP', icon: <Database className="w-3.5 h-3.5" /> },
   ];
 
   const loginAudits = auditLogs.filter((l) => l.action === 'LOGIN' || l.module === 'Authentication' || l.module === 'Auth');
@@ -1603,11 +1610,11 @@ export const AdminModule: React.FC<AdminModuleProps> = ({
           <div className="flex items-center gap-2">
             <Users className="w-4 h-4 text-[#087CEB]" />
             <h3 className="text-base font-bold text-[#172033] dark:text-white">
-              Enterprise User Accounts ({users.length})
+              Ethiopia User Accounts ({users.length})
             </h3>
           </div>
 
-          <form onSubmit={handleCreateUser} className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-3">
+          <form onSubmit={handleCreateUser} className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-7 gap-3">
             <input
               type="text"
               required
@@ -1619,9 +1626,18 @@ export const AdminModule: React.FC<AdminModuleProps> = ({
             <input
               type="email"
               required
-              placeholder="Email Address"
+              placeholder="user@sevensundayethiopia.com"
               value={userForm.email}
               onChange={(e) => setUserForm({ ...userForm, email: e.target.value })}
+              className="px-3 py-2 text-sm bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg"
+            />
+            <input
+              type="password"
+              required
+              minLength={6}
+              placeholder="Initial Password (min 6)"
+              value={userForm.password}
+              onChange={(e) => setUserForm({ ...userForm, password: e.target.value })}
               className="px-3 py-2 text-sm bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg"
             />
             <input
@@ -1891,7 +1907,7 @@ export const AdminModule: React.FC<AdminModuleProps> = ({
         </div>
       )}
 
-      {/* TAB 6: DEMO DATA & SMTP */}
+      {/* TAB 6: BACKUP, RESET & SMTP */}
       {tab === 'smtp' && (
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
           <form
@@ -1989,9 +2005,9 @@ export const AdminModule: React.FC<AdminModuleProps> = ({
           </form>
 
           <div className="lg:col-span-5 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-6 space-y-4">
-            <h3 className="text-base font-bold text-[#172033] dark:text-white">Database Backup & Demo Data Controls</h3>
+            <h3 className="text-base font-bold text-[#172033] dark:text-white">Database Backup & Tenant Reset Controls</h3>
             <p className="text-xs text-slate-500 dark:text-slate-400">
-              Download a full SQLite JSON snapshot across all tenants before clearing sample records for Tenant #{activeTenantId}.
+              Download a full SQLite JSON snapshot across all tenants before clearing operational records for Tenant #{activeTenantId}.
             </p>
             <div className="space-y-3 pt-2">
               <button
@@ -2004,11 +2020,11 @@ export const AdminModule: React.FC<AdminModuleProps> = ({
               </button>
               <button
                 type="button"
-                onClick={handleClearDemoData}
+                onClick={handleClearOperationalRecords}
                 className="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 text-xs font-semibold text-red-700 bg-red-50 hover:bg-red-100 border border-red-200 rounded-lg whitespace-nowrap"
               >
                 <Trash2 className="w-4 h-4" />
-                Remove Demo Operational Records (Active Tenant)
+                Clear Operational Records (Reset Tenant)
               </button>
             </div>
           </div>
