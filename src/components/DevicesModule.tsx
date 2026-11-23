@@ -4,27 +4,32 @@ import {
   Cable,
   CheckCircle2,
   Clock,
+  Download,
   ExternalLink,
   Fingerprint,
   Loader2,
   Pencil,
+  Play,
   Plus,
   Power,
   Radar,
+  Radio,
   RefreshCw,
   Save,
   Search,
   Send,
   ShieldAlert,
   ShieldCheck,
+  Square,
   Trash2,
   Unplug,
   Usb,
+  UserPlus,
   Webhook,
   X,
   XCircle,
 } from 'lucide-react';
-import { api, getApiTenantId } from '../api';
+import { api, downloadFile, getApiTenantId } from '../api';
 import type { WsEventPayload } from '../hooks/useRealtimeWS';
 import type {
   BiometricAuthLogRecord,
@@ -32,7 +37,14 @@ import type {
   DeviceScanResult,
   EmployeeProfile,
   ModuleKey,
+  StaffFingerprintRecord,
+  ZkEnrollJobRecord,
+  ZkRealtimeListenerStatus,
 } from '../types';
+import {
+  captureHardwareFingerprintCredential,
+  verifyHardwareFingerprintCredential,
+} from '../utils/hardwareBiometric';
 
 const DEVICE_TYPES = [
   'Biometric Fingerprint Terminal',
@@ -72,14 +84,41 @@ function formatLogTimestamp(iso: string): { date: string; time: string } {
   };
 }
 
+const FINGER_OPTIONS: Array<{ index: number; label: string }> = [
+  { index: 6, label: 'Right Index (Recommended)' },
+  { index: 5, label: 'Right Thumb' },
+  { index: 7, label: 'Right Middle' },
+  { index: 8, label: 'Right Ring' },
+  { index: 9, label: 'Right Pinky' },
+  { index: 4, label: 'Left Thumb' },
+  { index: 3, label: 'Left Index' },
+  { index: 2, label: 'Left Middle' },
+  { index: 1, label: 'Left Ring' },
+  { index: 0, label: 'Left Pinky' },
+];
+
+function isZktK40Device(dev: DeviceRecord | null | undefined): boolean {
+  if (!dev) return false;
+  const hay = `${dev.device_name || ''} ${dev.serial_number || ''} ${dev.protocol || ''} ${dev.device_type || ''}`.toLowerCase();
+  return (
+    hay.includes('k40') ||
+    hay.includes('zkteco') ||
+    hay.includes('zk-') ||
+    dev.device_type.includes('Biometric') ||
+    Number(dev.port) === 4370
+  );
+}
+
 export const DevicesModule: React.FC<DevicesModuleProps> = ({
   lastWsEvent,
   onNavigate,
   onRefreshDashboard,
 }) => {
-  const [activeTab, setActiveTab] = useState<'connections' | 'biometric-logs'>('connections');
+  const [activeTab, setActiveTab] = useState<'connections' | 'zkteco-k40' | 'biometric-logs'>('connections');
   const [devices, setDevices] = useState<DeviceRecord[]>([]);
+  const [selectedDeviceId, setSelectedDeviceId] = useState<number | null>(null);
   const [employees, setEmployees] = useState<EmployeeProfile[]>([]);
+  const [fingerprints, setFingerprints] = useState<StaffFingerprintRecord[]>([]);
   const [bioLogs, setBioLogs] = useState<BiometricAuthLogRecord[]>([]);
   const [bioLoading, setBioLoading] = useState(false);
   const [bioStatusFilter, setBioStatusFilter] = useState<'All' | 'Success' | 'Failure'>('All');
@@ -88,6 +127,31 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
   const [verifyingScan, setVerifyingScan] = useState(false);
   const [markingLogId, setMarkingLogId] = useState<number | null>(null);
   const [lastLiveEventAt, setLastLiveEventAt] = useState<string | null>(null);
+
+  // ZKTeco K40 Enrollment & Scan state
+  const [enrollingFinger, setEnrollingFinger] = useState(false);
+  const [waitingK40Enroll, setWaitingK40Enroll] = useState(false);
+  const [hwEnrolling, setHwEnrolling] = useState(false);
+  const [hwScanning, setHwScanning] = useState(false);
+  const [activeEnrollJob, setActiveEnrollJob] = useState<ZkEnrollJobRecord | null>(null);
+  const [realtimeListeners, setRealtimeListeners] = useState<ZkRealtimeListenerStatus[]>([]);
+  const [togglingListenerId, setTogglingListenerId] = useState<number | null>(null);
+  const [scanningFinger, setScanningFinger] = useState(false);
+  const [pullingId, setPullingId] = useState<number | null>(null);
+  const [zkEnrollForm, setZkEnrollForm] = useState({
+    employee_id: '',
+    zk_user_pin: '',
+    finger_index: '6',
+    device_id: '',
+    template_sample: '',
+  });
+  const [zkScanForm, setZkScanForm] = useState({
+    device_id: '',
+    fingerprint_id: '',
+    employee_id: '',
+    zk_user_pin: '',
+    punch_type: 'Auto' as 'Auto' | 'Check-In' | 'Check-Out',
+  });
 
   const [verifyForm, setVerifyForm] = useState({
     device_id: '',
@@ -117,13 +181,29 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
   const [punchModalDevice, setPunchModalDevice] = useState<DeviceRecord | null>(null);
   const [punchSending, setPunchSending] = useState(false);
   const [punchForm, setPunchForm] = useState({
-    employee_code: 'SS-EMP-008',
+    employee_code: '',
     employee_name: '',
     department: '',
     punch_type: 'Check-In' as 'Check-In' | 'Check-Out',
     ot_type: 'None' as 'None' | 'Regular' | 'Night' | 'Sunday' | 'Holiday',
     ot_hours: '0',
   });
+
+  // Register New Biometric Modal state (with connecting/scanning/success/error live status)
+  type ScannerLiveStatus = 'connecting' | 'scanning' | 'success' | 'error';
+  const [registerBioModalOpen, setRegisterBioModalOpen] = useState(false);
+  const [scannerStatus, setScannerStatus] = useState<ScannerLiveStatus>('connecting');
+  const [scannerStatusDetail, setScannerStatusDetail] = useState('');
+  const [scannerDeviceProbeInfo, setScannerDeviceProbeInfo] = useState('');
+  const [modalBioForm, setModalBioForm] = useState({
+    employee_id: '',
+    zk_user_pin: '',
+    finger_index: '6',
+    mode: 'k40' as 'k40' | 'hardware',
+  });
+  const [modalEnrollJob, setModalEnrollJob] = useState<ZkEnrollJobRecord | null>(null);
+  const [modalEnrolledFp, setModalEnrolledFp] = useState<StaffFingerprintRecord | null>(null);
+  const [modalCheckinBusy, setModalCheckinBusy] = useState(false);
 
   const emptyForm = {
     device_type: DEVICE_TYPES[0],
@@ -144,6 +224,15 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
       if (!silent) setLoading(true);
       const data = await api.get<DeviceRecord[]>('/api/devices');
       setDevices(data);
+      const firstK40 = data.find((d) => isZktK40Device(d)) || null;
+      setSelectedDeviceId((prev) => {
+        if (prev !== null && data.some((d) => d.id === prev)) return prev;
+        return firstK40 ? firstK40.id : null;
+      });
+      if (firstK40) {
+        setZkEnrollForm((prev) => (prev.device_id ? prev : { ...prev, device_id: String(firstK40.id) }));
+        setZkScanForm((prev) => (prev.device_id ? prev : { ...prev, device_id: String(firstK40.id) }));
+      }
       setVerifyForm((prev) => {
         if (prev.device_id || data.length === 0) return prev;
         return { ...prev, device_id: String(data[0].id) };
@@ -167,25 +256,112 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
     }
   };
 
+  const loadFingerprints = async () => {
+    try {
+      const list = await api.get<StaffFingerprintRecord[]>('/api/devices/zkteco/fingerprints');
+      setFingerprints(list);
+      setZkScanForm((prev) => {
+        if (prev.fingerprint_id || list.length === 0) return prev;
+        return {
+          ...prev,
+          fingerprint_id: String(list[0].id),
+          employee_id: list[0].employee_id,
+          zk_user_pin: list[0].zk_user_pin,
+        };
+      });
+    } catch {
+      // ignore initial fetch error
+    }
+  };
+
   const loadEmployees = async () => {
     try {
       const empData = await api.get<EmployeeProfile[]>('/api/employees');
       setEmployees(empData);
-      setVerifyForm((prev) => {
-        if (prev.employee_code || empData.length === 0) return prev;
-        const active = empData.find((e) => e.status === 'Active') || empData[0];
-        return { ...prev, employee_code: active.employee_id };
-      });
+      const active = empData.find((e) => e.status === 'Active') || empData[0];
+      if (active) {
+        setVerifyForm((prev) => (prev.employee_code ? prev : { ...prev, employee_code: active.employee_id }));
+        setZkEnrollForm((prev) => (prev.employee_id ? prev : { ...prev, employee_id: active.employee_id }));
+      }
     } catch {
       // Non-HR roles may not have employee directory read access; manual employee ID still works
+    }
+  };
+
+  const loadRealtimeListeners = async () => {
+    try {
+      const list = await api.get<ZkRealtimeListenerStatus[]>('/api/devices/zkteco/realtime/status');
+      setRealtimeListeners(list);
+    } catch {
+      // ignore initial listener fetch error
     }
   };
 
   useEffect(() => {
     loadDevices();
     loadBioLogs();
+    loadFingerprints();
     loadEmployees();
+    loadRealtimeListeners();
   }, []);
+
+  // Poll active K40 remote enrollment job while WaitingFinger (shared for inline & modal)
+  useEffect(() => {
+    if (!activeEnrollJob || activeEnrollJob.status !== 'WaitingFinger') return;
+    const timer = window.setInterval(async () => {
+      try {
+        const latest = await api.get<ZkEnrollJobRecord>(
+          `/api/devices/zkteco/enroll-jobs/${activeEnrollJob.id}`
+        );
+        setActiveEnrollJob(latest);
+        if (latest.status === 'Enrolled') {
+          loadFingerprints();
+          setNotice(
+            latest.status_message ||
+              `ZKTeco K40 captured real fingerprint for ${latest.employee_name} (${latest.employee_id}).`
+          );
+        } else if (latest.status === 'Failed' || latest.status === 'Cancelled') {
+          setError(latest.status_message || 'ZKTeco K40 remote enrollment stopped.');
+        }
+      } catch {
+        // ignore transient poll error
+      }
+    }, 2000);
+    return () => window.clearInterval(timer);
+  }, [activeEnrollJob]);
+
+  // Poll modal K40 remote enrollment job while modal is open and scanning
+  useEffect(() => {
+    if (!registerBioModalOpen || !modalEnrollJob || modalEnrollJob.status !== 'WaitingFinger') return;
+    const timer = window.setInterval(async () => {
+      try {
+        const latest = await api.get<ZkEnrollJobRecord>(
+          `/api/devices/zkteco/enroll-jobs/${modalEnrollJob.id}`
+        );
+        setModalEnrollJob(latest);
+        if (latest.status === 'Enrolled') {
+          const updatedFps = await api.get<StaffFingerprintRecord[]>('/api/devices/zkteco/fingerprints').catch(() => [] as StaffFingerprintRecord[]);
+          if (updatedFps.length > 0) setFingerprints(updatedFps);
+          const matched = updatedFps.find(
+            (fp) => fp.employee_id === latest.employee_id && fp.finger_index === latest.finger_index
+          ) || null;
+          setModalEnrolledFp(matched);
+          setScannerStatus('success');
+          setScannerStatusDetail(
+            latest.status_message ||
+              `ZKTeco K40 captured and saved fingerprint for ${latest.employee_name} (${latest.employee_id}, PIN ${latest.zk_user_pin}).`
+          );
+        } else if (latest.status === 'Failed' || latest.status === 'Cancelled') {
+          setScannerStatus('error');
+          setScannerStatusDetail(latest.status_message || 'ZKTeco K40 biometric capture was cancelled or failed.');
+        }
+      } catch (err) {
+        setScannerStatus('error');
+        setScannerStatusDetail(err instanceof Error ? err.message : 'Lost connection while polling ZKTeco K40 enrollment status.');
+      }
+    }, 1500);
+    return () => window.clearInterval(timer);
+  }, [registerBioModalOpen, modalEnrollJob]);
 
   const lastWsRef = useRef<WsEventPayload | null>(null);
   useEffect(() => {
@@ -212,8 +388,39 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
       return;
     }
 
+    if (lastWsEvent.event === 'zkteco:finger_enrolled') {
+      loadFingerprints();
+      const enrolledFp = payload.fingerprint as StaffFingerprintRecord | undefined;
+      if (enrolledFp) {
+        setNotice(
+          `Real fingerprint enrolled for ${enrolledFp.employee_name} (${enrolledFp.employee_id}) via ${
+            enrolledFp.auth_source || 'ZKTeco K40'
+          }.`
+        );
+        if (
+          registerBioModalOpen &&
+          (!modalBioForm.employee_id || enrolledFp.employee_id === modalBioForm.employee_id.trim())
+        ) {
+          setModalEnrolledFp(enrolledFp);
+          setScannerStatus('success');
+          setScannerStatusDetail(
+            `Real fingerprint enrolled for ${enrolledFp.employee_name} (${enrolledFp.employee_id}, PIN ${enrolledFp.zk_user_pin}) via ${
+              enrolledFp.auth_source || 'ZKTeco K40'
+            }.`
+          );
+        }
+      }
+      return;
+    }
+
+    if (lastWsEvent.event === 'zkteco:realtime_status') {
+      loadRealtimeListeners();
+      return;
+    }
+
     if (lastWsEvent.event === 'device:punch' || lastWsEvent.event === 'device:status') {
       loadDevices(true);
+      loadRealtimeListeners();
     }
   }, [lastWsEvent]);
 
@@ -434,7 +641,7 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
     }
   };
 
-  const handleVerifyBiometricScan = async (simulateFailure = false) => {
+  const handleVerifyBiometricScan = async () => {
     setError(null);
     setNotice(null);
     setVerifyingScan(true);
@@ -452,7 +659,6 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
         auth_method: verifyForm.auth_method,
         punch_type: verifyForm.punch_type,
         auto_mark_attendance: verifyForm.auto_mark_attendance,
-        simulate_failure: simulateFailure,
       });
 
       setBioLogs((prev) => {
@@ -472,10 +678,304 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
       onRefreshDashboard();
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Biometric scan failed';
-      setError(`Biometric Failure Logged: ${msg}`);
+      setError(`Biometric Verification Failed: ${msg}`);
       loadBioLogs();
     } finally {
       setVerifyingScan(false);
+    }
+  };
+
+  const handleLoadZktecoK40Preset = () => {
+    setEditingId(null);
+    setForm({
+      device_type: 'Biometric Fingerprint Terminal',
+      protocol: 'ZKTeco ADMS / iClock Push',
+      device_name: 'ZKTeco K40 Biometric Terminal',
+      ip_address: '192.168.1.201',
+      port: '4370',
+      endpoint_url: '/iclock/cdata',
+      subnet_mask: '255.255.255.0',
+      gateway: '192.168.1.1',
+      serial_number: `ZKT-K40-${Date.now().toString().slice(-4)}`,
+      api_key: '',
+    });
+    setNotice('Loaded ZKTeco K40 preset (TCP 4370 + ADMS /iclock/cdata). Enter your K40 LAN IP & Serial Number and click Save.');
+  };
+
+  const handlePullK40Attendance = async (dev: DeviceRecord) => {
+    setError(null);
+    setNotice(null);
+    setPullingId(dev.id);
+    try {
+      const res = await api.post<{ device: DeviceRecord; ingested: number; message: string }>(
+        `/api/devices/${dev.id}/zkteco/pull-attendance`
+      );
+      setDevices((prev) => prev.map((d) => (d.id === dev.id ? res.device : d)));
+      setNotice(`${res.message} · Ingested ${res.ingested} attendance record(s) into Attendance Register.`);
+      loadBioLogs();
+      onRefreshDashboard();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'ZKTeco K40 TCP 4370 pull failed');
+      loadDevices(true);
+    } finally {
+      setPullingId(null);
+    }
+  };
+
+  const handleEnrollFingerprint = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError(null);
+    setNotice(null);
+    setEnrollingFinger(true);
+    try {
+      const fingerObj = FINGER_OPTIONS.find((f) => String(f.index) === zkEnrollForm.finger_index);
+      const res = await api.post<{ fingerprint: StaffFingerprintRecord; message: string }>(
+        '/api/devices/zkteco/fingerprints/register',
+        {
+          employee_id: zkEnrollForm.employee_id.trim(),
+          zk_user_pin: zkEnrollForm.zk_user_pin.trim() || undefined,
+          finger_index: Number(zkEnrollForm.finger_index),
+          finger_label: fingerObj ? fingerObj.label.replace(' (Recommended)', '') : undefined,
+          device_id: zkEnrollForm.device_id ? Number(zkEnrollForm.device_id) : undefined,
+          template_sample: zkEnrollForm.template_sample.trim() || undefined,
+        }
+      );
+      setFingerprints((prev) => [
+        res.fingerprint,
+        ...prev.filter((fp) => fp.id !== res.fingerprint.id),
+      ]);
+      setZkScanForm((prev) => ({
+        ...prev,
+        fingerprint_id: String(res.fingerprint.id),
+        employee_id: res.fingerprint.employee_id,
+        zk_user_pin: res.fingerprint.zk_user_pin,
+      }));
+      setZkEnrollForm((prev) => ({ ...prev, template_sample: '' }));
+      setNotice(
+        `Enrolled ${res.fingerprint.finger_label} for ${res.fingerprint.employee_name} (${res.fingerprint.employee_id}, ZK PIN ${res.fingerprint.zk_user_pin}). ${res.message}`
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to enroll ZKTeco K40 fingerprint');
+    } finally {
+      setEnrollingFinger(false);
+    }
+  };
+
+  const handleDeleteFingerprint = async (id: number) => {
+    setError(null);
+    try {
+      await api.del(`/api/devices/zkteco/fingerprints/${id}`);
+      setFingerprints((prev) => prev.filter((fp) => fp.id !== id));
+      setNotice('Removed enrolled staff fingerprint.');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to remove enrolled fingerprint');
+    }
+  };
+
+  const handleZktecoScan = async () => {
+    setError(null);
+    setNotice(null);
+    setScanningFinger(true);
+    try {
+      const res = await api.post<{
+        log: BiometricAuthLogRecord;
+        attendance: Record<string, unknown>;
+        device: DeviceRecord | null;
+        punch_time: string;
+        punch_type: 'Check-In' | 'Check-Out';
+      }>('/api/devices/zkteco/scan', {
+        device_id: zkScanForm.device_id ? Number(zkScanForm.device_id) : undefined,
+        fingerprint_id: zkScanForm.fingerprint_id ? Number(zkScanForm.fingerprint_id) : undefined,
+        employee_id: zkScanForm.employee_id.trim() || undefined,
+        zk_user_pin: zkScanForm.zk_user_pin.trim() || undefined,
+        punch_type: zkScanForm.punch_type,
+      });
+
+      setBioLogs((prev) => [res.log, ...prev.filter((r) => r.id !== res.log.id)]);
+      if (res.device) {
+        setDevices((prev) => prev.map((d) => (d.id === res.device!.id ? res.device! : d)));
+      }
+      loadFingerprints();
+      setNotice(
+        `ZKTeco K40 finger verified for ${res.log.employee_name} (${res.log.employee_code}) · Recorded ${res.punch_type} at ${res.punch_time} in Attendance Register.`
+      );
+      onRefreshDashboard();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'ZKTeco K40 finger scan failed');
+      loadBioLogs();
+    } finally {
+      setScanningFinger(false);
+    }
+  };
+
+  const handleStartRealtimeListener = async (deviceId: number) => {
+    setError(null);
+    setNotice(null);
+    setTogglingListenerId(deviceId);
+    try {
+      const res = await api.post<{ ok: boolean; message: string }>(
+        `/api/devices/${deviceId}/zkteco/realtime/start`
+      );
+      setNotice(res.message);
+      await Promise.all([loadRealtimeListeners(), loadDevices(true)]);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to start ZKTeco K40 TCP 4370 listener');
+    } finally {
+      setTogglingListenerId(null);
+    }
+  };
+
+  const handleStopRealtimeListener = async (deviceId: number) => {
+    setError(null);
+    setTogglingListenerId(deviceId);
+    try {
+      await api.post(`/api/devices/${deviceId}/zkteco/realtime/stop`);
+      setNotice('Stopped ZKTeco K40 real-time TCP 4370 stream.');
+      await loadRealtimeListeners();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to stop real-time listener');
+    } finally {
+      setTogglingListenerId(null);
+    }
+  };
+
+  const handleDownloadBridgeScript = async (deviceId?: number) => {
+    setError(null);
+    try {
+      const url = `/api/devices/zkteco/bridge-script${deviceId ? `?device_id=${deviceId}` : ''}`;
+      await downloadFile(url, 'zkteco-k40-bridge.mjs');
+      setNotice('Downloaded zkteco-k40-bridge.mjs. Run "node zkteco-k40-bridge.mjs" on any PC in your factory LAN.');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to download ZKTeco K40 LAN bridge script');
+    }
+  };
+
+  const handleAskK40RemoteEnroll = async () => {
+    const empId = zkEnrollForm.employee_id.trim();
+    if (!empId) {
+      setError('Select or enter a Staff Employee ID before requesting a real finger on ZKTeco K40.');
+      return;
+    }
+    setError(null);
+    setNotice(null);
+    setWaitingK40Enroll(true);
+    try {
+      const fingerObj = FINGER_OPTIONS.find((f) => String(f.index) === zkEnrollForm.finger_index);
+      const res = await api.post<{ job: ZkEnrollJobRecord; tcp_triggered: boolean }>(
+        '/api/devices/zkteco/fingerprints/remote-enroll',
+        {
+          employee_id: empId,
+          zk_user_pin: zkEnrollForm.zk_user_pin.trim() || undefined,
+          finger_index: Number(zkEnrollForm.finger_index),
+          finger_label: fingerObj ? fingerObj.label.replace(' (Recommended)', '') : 'Right Index',
+          device_id: zkEnrollForm.device_id ? Number(zkEnrollForm.device_id) : undefined,
+        }
+      );
+      setActiveEnrollJob(res.job);
+      setNotice(res.job.status_message);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to ask ZKTeco K40 for finger enrollment');
+    } finally {
+      setWaitingK40Enroll(false);
+    }
+  };
+
+  const handleCancelRemoteEnroll = async () => {
+    if (!activeEnrollJob) return;
+    try {
+      await api.post(`/api/devices/zkteco/enroll-jobs/${activeEnrollJob.id}/cancel`);
+      setActiveEnrollJob({ ...activeEnrollJob, status: 'Cancelled' });
+      setNotice('Cancelled waiting on ZKTeco K40.');
+    } catch {
+      // ignore cancel failure
+    }
+  };
+
+  const handleHardwareSensorEnroll = async () => {
+    const empId = zkEnrollForm.employee_id.trim();
+    if (!empId) {
+      setError('Enter or select a Staff Employee ID first before scanning a finger on the hardware reader.');
+      return;
+    }
+    setError(null);
+    setNotice(null);
+    setHwEnrolling(true);
+    try {
+      const emp = employees.find((e) => e.employee_id === empId);
+      const fingerObj = FINGER_OPTIONS.find((f) => String(f.index) === zkEnrollForm.finger_index);
+      const fingerLabel = fingerObj ? fingerObj.label.replace(' (Recommended)', '') : 'Right Index';
+      const captured = await captureHardwareFingerprintCredential({
+        employeeId: empId,
+        employeeName: emp?.full_name || empId,
+        fingerLabel,
+      });
+      const res = await api.post<{ fingerprint: StaffFingerprintRecord; message: string }>(
+        '/api/devices/zkteco/fingerprints/hardware-register',
+        {
+          employee_id: empId,
+          zk_user_pin: zkEnrollForm.zk_user_pin.trim() || undefined,
+          finger_index: Number(zkEnrollForm.finger_index),
+          finger_label: fingerLabel,
+          device_id: zkEnrollForm.device_id ? Number(zkEnrollForm.device_id) : undefined,
+          credential_id: captured.credentialId,
+          public_key: captured.publicKey,
+          device_label: captured.deviceLabel,
+        }
+      );
+      setFingerprints((prev) => [
+        res.fingerprint,
+        ...prev.filter((fp) => fp.id !== res.fingerprint.id),
+      ]);
+      setZkScanForm((prev) => ({
+        ...prev,
+        fingerprint_id: String(res.fingerprint.id),
+        employee_id: res.fingerprint.employee_id,
+        zk_user_pin: res.fingerprint.zk_user_pin,
+      }));
+      setNotice(
+        `Real hardware fingerprint enrolled for ${res.fingerprint.employee_name} (${res.fingerprint.employee_id}). ${res.message}`
+      );
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : 'Local hardware fingerprint sensor enrollment failed'
+      );
+    } finally {
+      setHwEnrolling(false);
+    }
+  };
+
+  const handleHardwareSensorScan = async () => {
+    setError(null);
+    setNotice(null);
+    setHwScanning(true);
+    try {
+      const registeredCredentialIds = fingerprints
+        .map((fp) => fp.credential_id)
+        .filter((id): id is string => Boolean(id));
+      const verified = await verifyHardwareFingerprintCredential({
+        allowCredentialIds: registeredCredentialIds,
+      });
+      const res = await api.post<{
+        log: BiometricAuthLogRecord;
+        attendance: Record<string, unknown>;
+        punch_time: string;
+        punch_type: 'Check-In' | 'Check-Out';
+      }>('/api/devices/zkteco/hardware-scan', {
+        device_id: zkScanForm.device_id ? Number(zkScanForm.device_id) : undefined,
+        credential_id: verified.credentialId,
+        punch_type: zkScanForm.punch_type,
+      });
+      setBioLogs((prev) => [res.log, ...prev.filter((r) => r.id !== res.log.id)]);
+      loadFingerprints();
+      setNotice(
+        `Real hardware finger verified for ${res.log.employee_name} (${res.log.employee_code}) · Recorded ${res.punch_type} at ${res.punch_time} in Attendance Register.`
+      );
+      onRefreshDashboard();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Hardware fingerprint attendance scan failed');
+      loadBioLogs();
+    } finally {
+      setHwScanning(false);
     }
   };
 
@@ -530,6 +1030,173 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
     return { total: bioLogs.length, success, failure, marked };
   }, [bioLogs]);
 
+  const selectedDevice = useMemo(
+    () => devices.find((d) => d.id === selectedDeviceId) || null,
+    [devices, selectedDeviceId]
+  );
+  const selectedIsZktK40 = useMemo(() => isZktK40Device(selectedDevice), [selectedDevice]);
+
+  const handleOpenRegisterBiometricModal = async (targetDev?: DeviceRecord | null) => {
+    const dev = targetDev || selectedDevice;
+    if (!dev || !isZktK40Device(dev)) return;
+    setSelectedDeviceId(dev.id);
+    setZkEnrollForm((prev) => ({ ...prev, device_id: String(dev.id) }));
+    const activeEmp = employees.find((e) => e.status === 'Active') || employees[0];
+    setModalBioForm({
+      employee_id: zkEnrollForm.employee_id || activeEmp?.employee_id || '',
+      zk_user_pin: zkEnrollForm.zk_user_pin || '',
+      finger_index: zkEnrollForm.finger_index || '6',
+      mode: 'k40',
+    });
+    setModalEnrollJob(null);
+    setModalEnrolledFp(null);
+    setRegisterBioModalOpen(true);
+    setScannerStatus('connecting');
+    setScannerDeviceProbeInfo(`${dev.device_name} (${dev.ip_address}:${dev.port} · ${dev.serial_number})`);
+    setScannerStatusDetail(`Connecting to ZKTeco K40 terminal ${dev.device_name} at ${dev.ip_address}:${dev.port}...`);
+
+    try {
+      const probed = await api.post<DeviceRecord>(`/api/devices/${dev.id}/connect`);
+      setDevices((prev) => prev.map((d) => (d.id === dev.id ? probed : d)));
+      if (probed.status === 'Connected') {
+        setScannerStatus('scanning');
+        setScannerStatusDetail(
+          `Connected to ${probed.device_name} (${probed.last_latency_ms ?? 0}ms). Select staff member below and initiate finger capture.`
+        );
+      } else {
+        setScannerStatus('scanning');
+        setScannerStatusDetail(
+          `ADMS HTTP Push (/iclock/cdata?SN=${probed.serial_number}) & LAN Bridge standby active. Direct TCP probe returned: ${probed.last_message || 'Unreachable from cloud'}. Ready to queue biometric scan.`
+        );
+      }
+    } catch (err) {
+      setScannerStatus('error');
+      setScannerStatusDetail(
+        err instanceof Error ? err.message : `Failed to connect to ZKTeco K40 terminal ${dev.device_name}.`
+      );
+    }
+  };
+
+  const handleModalStartBiometricRegistration = async () => {
+    const dev = selectedDevice;
+    const empId = modalBioForm.employee_id.trim();
+    if (!dev || !isZktK40Device(dev)) {
+      setScannerStatus('error');
+      setScannerStatusDetail('Select a ZKTeco K40 biometric terminal first.');
+      return;
+    }
+    if (!empId) {
+      setScannerStatus('error');
+      setScannerStatusDetail('Enter or select a Staff Employee ID before scanning a fingerprint.');
+      return;
+    }
+
+    const fingerObj = FINGER_OPTIONS.find((f) => String(f.index) === modalBioForm.finger_index);
+    const fingerLabel = fingerObj ? fingerObj.label.replace(' (Recommended)', '') : 'Right Index';
+
+    setScannerStatus('connecting');
+    setModalEnrolledFp(null);
+    setModalEnrollJob(null);
+    setScannerStatusDetail(`Handshaking with ${dev.device_name} (${dev.ip_address}:${dev.port})...`);
+
+    if (modalBioForm.mode === 'hardware') {
+      try {
+        const emp = employees.find((e) => e.employee_id === empId);
+        setScannerStatus('scanning');
+        setScannerStatusDetail(`Place staff finger on attached USB / Platform biometric reader for ${emp?.full_name || empId}...`);
+        const captured = await captureHardwareFingerprintCredential({
+          employeeId: empId,
+          employeeName: emp?.full_name || empId,
+          fingerLabel,
+        });
+        const res = await api.post<{ fingerprint: StaffFingerprintRecord; message: string }>(
+          '/api/devices/zkteco/fingerprints/hardware-register',
+          {
+            employee_id: empId,
+            zk_user_pin: modalBioForm.zk_user_pin.trim() || undefined,
+            finger_index: Number(modalBioForm.finger_index),
+            finger_label: fingerLabel,
+            device_id: dev.id,
+            credential_id: captured.credentialId,
+            public_key: captured.publicKey,
+            device_label: captured.deviceLabel,
+          }
+        );
+        setFingerprints((prev) => [res.fingerprint, ...prev.filter((fp) => fp.id !== res.fingerprint.id)]);
+        setModalEnrolledFp(res.fingerprint);
+        setScannerStatus('success');
+        setScannerStatusDetail(
+          `Hardware biometric registered for ${res.fingerprint.employee_name} (${res.fingerprint.employee_id}, PIN ${res.fingerprint.zk_user_pin}).`
+        );
+      } catch (err) {
+        setScannerStatus('error');
+        setScannerStatusDetail(
+          err instanceof Error ? err.message : 'Hardware biometric reader capture failed.'
+        );
+      }
+      return;
+    }
+
+    try {
+      const res = await api.post<{ job: ZkEnrollJobRecord; tcp_triggered: boolean }>(
+        '/api/devices/zkteco/fingerprints/remote-enroll',
+        {
+          employee_id: empId,
+          zk_user_pin: modalBioForm.zk_user_pin.trim() || undefined,
+          finger_index: Number(modalBioForm.finger_index),
+          finger_label: fingerLabel,
+          device_id: dev.id,
+        }
+      );
+      setModalEnrollJob(res.job);
+      setScannerStatus('scanning');
+      setScannerStatusDetail(
+        res.job.status_message ||
+          `Scanner Active — Ask ${res.job.employee_name} (PIN ${res.job.zk_user_pin}) to place finger on ZKTeco K40 (${res.job.channel}).`
+      );
+    } catch (err) {
+      setScannerStatus('error');
+      setScannerStatusDetail(
+        err instanceof Error ? err.message : 'Failed to start ZKTeco K40 biometric enrollment.'
+      );
+    }
+  };
+
+  const handleModalCancelScan = async () => {
+    if (modalEnrollJob && modalEnrollJob.status === 'WaitingFinger') {
+      try {
+        await api.post(`/api/devices/zkteco/enroll-jobs/${modalEnrollJob.id}/cancel`);
+        setModalEnrollJob({ ...modalEnrollJob, status: 'Cancelled' });
+      } catch {
+        // ignore cancel error
+      }
+    }
+    setScannerStatus('error');
+    setScannerStatusDetail('Biometric registration scan cancelled by operator.');
+  };
+
+  const handleModalRecordCheckIn = async () => {
+    if (!modalEnrolledFp) return;
+    setModalCheckinBusy(true);
+    try {
+      const res = await api.post<{ punch_time: string; punch_type: string }>('/api/devices/zkteco/scan', {
+        device_id: selectedDevice?.id,
+        fingerprint_id: modalEnrolledFp.id,
+        punch_type: 'Check-In',
+      });
+      setNotice(
+        `Recorded ${res.punch_type} at ${res.punch_time} for ${modalEnrolledFp.employee_name} (${modalEnrolledFp.employee_id}).`
+      );
+      loadBioLogs();
+      onRefreshDashboard();
+    } catch (err) {
+      setScannerStatus('error');
+      setScannerStatusDetail(err instanceof Error ? err.message : 'Failed to record attendance check-in');
+    } finally {
+      setModalCheckinBusy(false);
+    }
+  };
+
   const connectedCount = devices.filter((d) => d.status === 'Connected').length;
   const totalPunches = devices.reduce((acc, d) => acc + (Number(d.punch_count) || 0), 0);
 
@@ -551,6 +1218,24 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
             Device Connections Registry
             <span className="px-1.5 py-0.5 text-[10px] font-mono rounded bg-white/15 dark:bg-slate-700/60 tabular-nums">
               {devices.length}
+            </span>
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setActiveTab('zkteco-k40');
+              loadFingerprints();
+            }}
+            className={`inline-flex items-center gap-2 px-4 py-2 text-xs font-bold rounded-lg transition-colors whitespace-nowrap ${
+              activeTab === 'zkteco-k40'
+                ? 'bg-[#18243A] text-white shadow-sm'
+                : 'text-[#172033] dark:text-slate-300 hover:bg-[#F8FAFC] dark:hover:bg-slate-800'
+            }`}
+          >
+            <UserPlus className="w-3.5 h-3.5 text-[#087CEB]" />
+            ZKTeco K40 Finger Enroll &amp; Scan
+            <span className="px-1.5 py-0.5 text-[10px] font-mono rounded bg-white/15 dark:bg-slate-700/60 tabular-nums">
+              {fingerprints.length}
             </span>
           </button>
           <button
@@ -625,6 +1310,16 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
+            {selectedIsZktK40 && selectedDevice && (
+              <button
+                type="button"
+                onClick={() => handleOpenRegisterBiometricModal(selectedDevice)}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-bold text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg shadow-sm transition-colors whitespace-nowrap shrink-0"
+              >
+                <Fingerprint className="w-4 h-4" />
+                Register New Biometric
+              </button>
+            )}
             <button
               type="button"
               disabled={probingAll || devices.length === 0}
@@ -648,6 +1343,14 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
             </button>
             <button
               type="button"
+              onClick={handleLoadZktecoK40Preset}
+              className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-bold text-[#087CEB] bg-[#EAF4FF] dark:bg-sky-950/60 border border-[#087CEB]/30 hover:bg-[#DBEAFE] rounded-lg transition-colors whitespace-nowrap shrink-0"
+            >
+              <Fingerprint className="w-3.5 h-3.5" />
+              ZKTeco K40 Preset
+            </button>
+            <button
+              type="button"
               onClick={handleDiscoverLocalUsbSerial}
               className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-[#172033] dark:text-slate-200 bg-[#F8FAFC] dark:bg-slate-800 border border-slate-200 dark:border-slate-700 hover:border-[#087CEB] rounded-lg transition-colors whitespace-nowrap shrink-0"
             >
@@ -664,6 +1367,40 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
             </button>
           </div>
         </div>
+
+        {/* Selected ZKT K40 Action Bar */}
+        {selectedDevice && (
+          <div className="mb-4 px-4 py-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-[#F8FAFC] dark:bg-slate-800/60 flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-2.5 min-w-0">
+              <div className={`w-8 h-8 rounded-lg flex items-center justify-center shrink-0 ${selectedIsZktK40 ? 'bg-emerald-100 dark:bg-emerald-950 text-emerald-700 dark:text-emerald-300' : 'bg-slate-200 dark:bg-slate-700 text-slate-600 dark:text-slate-300'}`}>
+                {selectedIsZktK40 ? <Fingerprint className="w-4 h-4" /> : <Cable className="w-4 h-4" />}
+              </div>
+              <div className="min-w-0">
+                <div className="text-xs font-bold text-[#172033] dark:text-white truncate">
+                  Selected Device: {selectedDevice.device_name}
+                  <span className="ml-2 font-mono text-[11px] font-normal text-slate-500 dark:text-slate-400">
+                    {selectedDevice.ip_address}:{selectedDevice.port} · {selectedDevice.serial_number}
+                  </span>
+                </div>
+                <div className="text-[11px] text-slate-500 dark:text-slate-400">
+                  {selectedIsZktK40
+                    ? 'ZKTeco K40 biometric terminal selected — click "Register New Biometric" to launch the live enrollment scanner.'
+                    : 'Click any ZKTeco K40 / Biometric row below to enable live biometric registration.'}
+                </div>
+              </div>
+            </div>
+            {selectedIsZktK40 && (
+              <button
+                type="button"
+                onClick={() => handleOpenRegisterBiometricModal(selectedDevice)}
+                className="inline-flex items-center gap-2 px-4 py-2 text-xs font-bold text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg shadow-sm transition-colors whitespace-nowrap shrink-0"
+              >
+                <Fingerprint className="w-4 h-4" />
+                Register New Biometric
+              </button>
+            )}
+          </div>
+        )}
 
         {/* Live Network / Subnet Scanner Panel */}
         {scanPanelOpen && (
@@ -931,10 +1668,34 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
                   </td>
                 </tr>
               ) : (
-                devices.map((dev) => (
-                  <tr key={dev.id} className="hover:bg-[#F8FAFC] dark:hover:bg-slate-800/40 transition-colors">
+                devices.map((dev) => {
+                  const isSelected = selectedDeviceId === dev.id;
+                  const k40Capable = isZktK40Device(dev);
+                  return (
+                  <tr
+                    key={dev.id}
+                    onClick={() => {
+                      setSelectedDeviceId(dev.id);
+                      if (k40Capable) {
+                        setZkEnrollForm((prev) => ({ ...prev, device_id: String(dev.id) }));
+                        setZkScanForm((prev) => ({ ...prev, device_id: String(dev.id) }));
+                      }
+                    }}
+                    className={`cursor-pointer transition-colors ${
+                      isSelected
+                        ? 'bg-[#EAF4FF]/80 dark:bg-sky-950/40 ring-1 ring-inset ring-[#087CEB]/50'
+                        : 'hover:bg-[#F8FAFC] dark:hover:bg-slate-800/40'
+                    }`}
+                  >
                     <td className="py-3 px-4">
-                      <div className="font-semibold text-[#172033] dark:text-white">{dev.device_name}</div>
+                      <div className="flex items-center gap-2">
+                        <span className="font-semibold text-[#172033] dark:text-white">{dev.device_name}</span>
+                        {isSelected && (
+                          <span className="px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wide bg-[#087CEB] text-white rounded">
+                            Selected
+                          </span>
+                        )}
+                      </div>
                       <div className="text-xs text-slate-500 dark:text-slate-400">
                         {dev.device_type} · <span className="font-semibold text-[#087CEB]">{dev.protocol || 'TCP/IP Socket'}</span>
                       </div>
@@ -985,8 +1746,18 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
                         </div>
                       )}
                     </td>
-                    <td className="py-3 px-4">
+                    <td className="py-3 px-4" onClick={(e) => e.stopPropagation()}>
                       <div className="flex items-center justify-end gap-1.5 flex-wrap">
+                        {isZktK40Device(dev) && selectedDeviceId === dev.id && (
+                          <button
+                            type="button"
+                            onClick={() => handleOpenRegisterBiometricModal(dev)}
+                            className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-bold text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg transition-colors whitespace-nowrap shrink-0"
+                          >
+                            <Fingerprint className="w-3.5 h-3.5" />
+                            Register New Biometric
+                          </button>
+                        )}
                         <button
                           type="button"
                           disabled={connectingId === dev.id}
@@ -1009,6 +1780,24 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
                           <Webhook className="w-3.5 h-3.5 text-[#087CEB]" />
                           Sync Punch
                         </button>
+                        {(dev.device_type.includes('Biometric') ||
+                          (dev.protocol || '').includes('ZKTeco') ||
+                          Number(dev.port) === 4370) && (
+                          <button
+                            type="button"
+                            disabled={pullingId === dev.id}
+                            onClick={() => handlePullK40Attendance(dev)}
+                            className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-semibold text-emerald-800 dark:text-emerald-300 bg-emerald-50 dark:bg-emerald-950/60 hover:bg-emerald-100 border border-emerald-200 dark:border-emerald-800 disabled:opacity-60 rounded-lg transition-colors whitespace-nowrap shrink-0"
+                            title="Pull Attendance Logs directly from ZKTeco K40 via TCP 4370"
+                          >
+                            {pullingId === dev.id ? (
+                              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                            ) : (
+                              <Download className="w-3.5 h-3.5" />
+                            )}
+                            Pull K40 (4370)
+                          </button>
+                        )}
                         {dev.status === 'Connected' && (
                           <button
                             type="button"
@@ -1054,7 +1843,8 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
                       </div>
                     </td>
                   </tr>
-                ))
+                  );
+                })
               )}
             </tbody>
           </table>
@@ -1072,6 +1862,570 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
         </div>
       </div>
         </>
+      )}
+
+      {activeTab === 'zkteco-k40' && (
+        <div className="space-y-6">
+          {/* ZKTeco K40 Connection & Push Guide */}
+          <div className="bg-[#FFFFFF] dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-5 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+            <div className="space-y-1">
+              <h2 className="text-base font-bold text-[#172033] dark:text-white flex items-center gap-2">
+                <Fingerprint className="w-5 h-5 text-[#087CEB]" />
+                ZKTeco K40 Real Fingerprint Reader — Live Enrollment &amp; Attendance Stream
+              </h2>
+              <p className="text-xs text-slate-500 dark:text-slate-400">
+                Connects via real TCP port <span className="font-mono font-bold text-[#172033] dark:text-slate-200">4370</span> (<span className="font-mono">CMD_STARTENROLL</span> + <span className="font-mono">CMD_REG_EVENT</span>), ZKTeco ADMS HTTP Push at{' '}
+                <span className="font-mono font-bold text-[#087CEB]">/iclock/cdata?SN=SERIAL</span>, Factory LAN Bridge, and attached USB/Platform hardware fingerprint sensors. Every real finger scan automatically logs into Biometric Authentication Logs and records Check-In / Check-Out timestamps in Attendance Register.
+              </p>
+            </div>
+            <div className="flex flex-wrap items-center gap-2 shrink-0">
+              {selectedIsZktK40 && selectedDevice && (
+                <button
+                  type="button"
+                  onClick={() => handleOpenRegisterBiometricModal(selectedDevice)}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-bold text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg whitespace-nowrap"
+                >
+                  <Fingerprint className="w-4 h-4" />
+                  Register New Biometric
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() =>
+                  handleDownloadBridgeScript(
+                    zkEnrollForm.device_id ? Number(zkEnrollForm.device_id) : undefined
+                  )
+                }
+                className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-[#087CEB] bg-[#EAF4FF] dark:bg-sky-950/60 border border-[#087CEB]/30 hover:bg-[#DBEAFE] rounded-lg whitespace-nowrap"
+              >
+                <Download className="w-3.5 h-3.5" />
+                Download K40 LAN Bridge
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  loadFingerprints();
+                  loadRealtimeListeners();
+                }}
+                className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-[#172033] dark:text-slate-200 bg-[#F8FAFC] dark:bg-slate-800 border border-slate-200 dark:border-slate-700 hover:border-[#087CEB] rounded-lg whitespace-nowrap"
+              >
+                <RefreshCw className="w-3.5 h-3.5" />
+                Refresh Status
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setActiveTab('biometric-logs');
+                  loadBioLogs();
+                }}
+                className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-bold text-white bg-[#18243A] hover:bg-[#172033] rounded-lg whitespace-nowrap"
+              >
+                <Activity className="w-3.5 h-3.5 text-[#38BDF8]" />
+                View Biometric Logs
+              </button>
+            </div>
+          </div>
+
+          {/* Live ZKTeco K40 TCP 4370 Real-Time Listeners */}
+          <div className="bg-[#FFFFFF] dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-5 space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <h3 className="text-sm font-bold text-[#172033] dark:text-white flex items-center gap-2">
+                  <Radio className="w-4 h-4 text-[#087CEB]" />
+                  Live ZKTeco K40 Real-Time Streams (TCP 4370 + ADMS + LAN Bridge)
+                </h3>
+                <p className="text-xs text-slate-500">
+                  Start the persistent TCP 4370 event listener on local LAN K40 devices, or run the K40 LAN Bridge script when the ERP is hosted on Render.
+                </p>
+              </div>
+            </div>
+
+            {realtimeListeners.length === 0 ? (
+              <div className="p-3 rounded-lg bg-[#F8FAFC] dark:bg-slate-800/50 border border-dashed border-slate-300 dark:border-slate-700 text-xs text-slate-500 flex flex-wrap items-center justify-between gap-2">
+                <span>No ZKTeco K40 / Biometric devices registered yet. Add one in the Device Connections tab first.</span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setActiveTab('connections');
+                    handleLoadZktecoK40Preset();
+                  }}
+                  className="px-3 py-1.5 text-xs font-bold text-white bg-[#087CEB] hover:bg-[#0265C4] rounded-lg"
+                >
+                  Load K40 Preset
+                </button>
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                {realtimeListeners.map((listener) => (
+                  <div
+                    key={listener.device_id}
+                    className="p-3.5 rounded-xl bg-[#F8FAFC] dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 flex items-center justify-between gap-3"
+                  >
+                    <div className="min-w-0 space-y-0.5">
+                      <div className="flex items-center gap-2">
+                        <span
+                          className={`w-2 h-2 rounded-full ${
+                            listener.running ? 'bg-emerald-500 animate-pulse' : 'bg-slate-400'
+                          }`}
+                        />
+                        <span className="text-xs font-bold text-[#172033] dark:text-white truncate">
+                          {listener.device_name}
+                        </span>
+                        <span className="text-[11px] font-mono text-slate-500">{listener.serial_number}</span>
+                      </div>
+                      <div className="text-[11px] font-mono text-slate-500">
+                        {listener.ip_address}:{listener.port} · {listener.events_count} live event(s)
+                        {listener.last_event_at
+                          ? ` · Last ${formatLogTimestamp(listener.last_event_at).time}`
+                          : ''}
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-1.5 shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => handleDownloadBridgeScript(listener.device_id)}
+                        className="px-2.5 py-1.5 text-[11px] font-semibold text-[#087CEB] bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 hover:border-[#087CEB] rounded-lg"
+                        title="Download pre-configured K40 Bridge Script for this terminal"
+                      >
+                        Bridge
+                      </button>
+                      {listener.running ? (
+                        <button
+                          type="button"
+                          disabled={togglingListenerId === listener.device_id}
+                          onClick={() => handleStopRealtimeListener(listener.device_id)}
+                          className="inline-flex items-center gap-1 px-2.5 py-1.5 text-[11px] font-bold text-red-700 bg-red-50 border border-red-200 hover:bg-red-100 rounded-lg"
+                        >
+                          {togglingListenerId === listener.device_id ? (
+                            <Loader2 className="w-3 h-3 animate-spin" />
+                          ) : (
+                            <Square className="w-3 h-3" />
+                          )}
+                          Stop Live
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          disabled={togglingListenerId === listener.device_id}
+                          onClick={() => handleStartRealtimeListener(listener.device_id)}
+                          className="inline-flex items-center gap-1 px-2.5 py-1.5 text-[11px] font-bold text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg"
+                        >
+                          {togglingListenerId === listener.device_id ? (
+                            <Loader2 className="w-3 h-3 animate-spin" />
+                          ) : (
+                            <Play className="w-3 h-3" />
+                          )}
+                          Start Live (4370)
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
+            {/* Enroll Staff Finger */}
+            <form
+              onSubmit={handleEnrollFingerprint}
+              className="bg-[#FFFFFF] dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-6 space-y-4"
+            >
+              <div>
+                <h3 className="text-sm font-bold text-[#172033] dark:text-white flex items-center gap-2">
+                  <UserPlus className="w-4 h-4 text-[#087CEB]" />
+                  1. Enroll Real Staff Fingerprint (ZKTeco K40 &amp; Hardware Reader)
+                </h3>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Prompt the physical ZKTeco K40 scanner to ask for the staff member’s real finger, or capture directly from an attached USB / Platform fingerprint sensor.
+                </p>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-medium text-[#172033] dark:text-slate-300 mb-1">
+                    Staff Employee ID
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    list="zk-employee-list"
+                    placeholder="e.g. SS-EMP-001"
+                    value={zkEnrollForm.employee_id}
+                    onChange={(e) => setZkEnrollForm({ ...zkEnrollForm, employee_id: e.target.value })}
+                    className="w-full px-3 py-2 text-xs font-mono bg-[#F8FAFC] dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg"
+                  />
+                  <datalist id="zk-employee-list">
+                    {employees.map((emp) => (
+                      <option key={emp.id} value={emp.employee_id}>
+                        {emp.full_name} · {emp.department}
+                      </option>
+                    ))}
+                  </datalist>
+                </div>
+
+                <div>
+                  <label className="block text-xs font-medium text-[#172033] dark:text-slate-300 mb-1">
+                    K40 User PIN (Optional)
+                  </label>
+                  <input
+                    type="text"
+                    placeholder="Auto from Employee ID if empty"
+                    value={zkEnrollForm.zk_user_pin}
+                    onChange={(e) => setZkEnrollForm({ ...zkEnrollForm, zk_user_pin: e.target.value })}
+                    className="w-full px-3 py-2 text-xs font-mono bg-[#F8FAFC] dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-xs font-medium text-[#172033] dark:text-slate-300 mb-1">
+                    Finger Position
+                  </label>
+                  <select
+                    value={zkEnrollForm.finger_index}
+                    onChange={(e) => setZkEnrollForm({ ...zkEnrollForm, finger_index: e.target.value })}
+                    className="w-full px-3 py-2 text-xs bg-[#F8FAFC] dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg"
+                  >
+                    {FINGER_OPTIONS.map((f) => (
+                      <option key={f.index} value={String(f.index)}>
+                        #{f.index} · {f.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block text-xs font-medium text-[#172033] dark:text-slate-300 mb-1">
+                    ZKTeco K40 Terminal
+                  </label>
+                  <select
+                    value={zkEnrollForm.device_id}
+                    onChange={(e) => setZkEnrollForm({ ...zkEnrollForm, device_id: e.target.value })}
+                    className="w-full px-3 py-2 text-xs bg-[#F8FAFC] dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg"
+                  >
+                    <option value="">Default ZKTeco K40 Terminal</option>
+                    {devices.map((d) => (
+                      <option key={d.id} value={String(d.id)}>
+                        {d.device_name} ({d.ip_address}:{d.port})
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div className="sm:col-span-2 grid grid-cols-1 sm:grid-cols-2 gap-2 pt-1">
+                  <button
+                    type="button"
+                    disabled={waitingK40Enroll || hwEnrolling}
+                    onClick={handleAskK40RemoteEnroll}
+                    className="inline-flex items-center justify-center gap-2 px-3 py-2.5 text-xs font-bold text-white bg-[#087CEB] hover:bg-[#0265C4] disabled:opacity-60 rounded-lg transition-colors"
+                  >
+                    {waitingK40Enroll ? (
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                    ) : (
+                      <Fingerprint className="w-4 h-4" />
+                    )}
+                    Ask Real Finger from ZKTeco K40
+                  </button>
+
+                  <button
+                    type="button"
+                    disabled={waitingK40Enroll || hwEnrolling}
+                    onClick={handleHardwareSensorEnroll}
+                    className="inline-flex items-center justify-center gap-2 px-3 py-2.5 text-xs font-bold text-white bg-[#18243A] hover:bg-[#172033] disabled:opacity-60 rounded-lg transition-colors"
+                  >
+                    {hwEnrolling ? (
+                      <Loader2 className="w-4 h-4 animate-spin text-[#38BDF8]" />
+                    ) : (
+                      <Usb className="w-4 h-4 text-[#38BDF8]" />
+                    )}
+                    Scan Local Hardware Reader
+                  </button>
+                </div>
+
+                {activeEnrollJob && activeEnrollJob.status === 'WaitingFinger' && (
+                  <div className="sm:col-span-2 p-3 rounded-lg bg-[#EAF4FF] dark:bg-sky-950/60 border border-[#087CEB]/30 text-xs text-[#18243A] dark:text-[#7DD3FC] flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <Loader2 className="w-4 h-4 animate-spin text-[#087CEB] shrink-0" />
+                      <span className="truncate">
+                        Waiting for {activeEnrollJob.employee_name} on K40 ({activeEnrollJob.channel} · PIN{' '}
+                        {activeEnrollJob.zk_user_pin})...
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={handleCancelRemoteEnroll}
+                      className="text-[11px] font-bold text-red-600 hover:underline shrink-0"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                )}
+
+                <div className="sm:col-span-2 pt-2 border-t border-slate-200 dark:border-slate-800">
+                  <label className="block text-[11px] font-medium text-slate-500 mb-1">
+                    Manual / Pre-Captured ADMS Template Payload (Optional fallback)
+                  </label>
+                  <div className="flex gap-2">
+                    <input
+                      type="text"
+                      placeholder="Paste K40 template string or leave blank to bind PIN"
+                      value={zkEnrollForm.template_sample}
+                      onChange={(e) => setZkEnrollForm({ ...zkEnrollForm, template_sample: e.target.value })}
+                      className="flex-1 px-3 py-2 text-xs font-mono bg-[#F8FAFC] dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg"
+                    />
+                    <button
+                      type="submit"
+                      disabled={enrollingFinger}
+                      className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-[#172033] dark:text-slate-200 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 disabled:opacity-60 rounded-lg whitespace-nowrap"
+                    >
+                      {enrollingFinger ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Save className="w-3.5 h-3.5" />}
+                      Save Template
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </form>
+
+            {/* Live Finger Scan -> Attendance Time Recording */}
+            <div className="bg-[#FFFFFF] dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-6 space-y-4">
+              <div>
+                <h3 className="text-sm font-bold text-[#172033] dark:text-white flex items-center gap-2">
+                  <Clock className="w-4 h-4 text-emerald-600" />
+                  2. Scan Staff Finger &amp; Record Real-Time Attendance
+                </h3>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Reads a real finger from your attached hardware scanner or verifies an enrolled K40 punch, recording Check-In / Check-Out timestamps directly into Attendance Register.
+                </p>
+              </div>
+
+              <div className="p-3.5 rounded-xl bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <div className="text-xs text-emerald-900 dark:text-emerald-200">
+                  <div className="font-bold">Real Hardware Fingerprint Reader</div>
+                  <div className="text-[11px] opacity-85">
+                    Prompts USB FIDO2 / Windows Hello / Touch ID / Android biometric sensor and logs attendance instantly.
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  disabled={hwScanning}
+                  onClick={handleHardwareSensorScan}
+                  className="inline-flex items-center justify-center gap-2 px-4 py-2.5 text-xs font-bold text-white bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 rounded-lg transition-colors whitespace-nowrap shrink-0"
+                >
+                  {hwScanning ? (
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                  ) : (
+                    <Fingerprint className="w-4 h-4" />
+                  )}
+                  Scan Real Hardware Finger
+                </button>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-medium text-[#172033] dark:text-slate-300 mb-1">
+                    ZKTeco K40 Reader
+                  </label>
+                  <select
+                    value={zkScanForm.device_id}
+                    onChange={(e) => setZkScanForm({ ...zkScanForm, device_id: e.target.value })}
+                    className="w-full px-3 py-2 text-xs bg-[#F8FAFC] dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg"
+                  >
+                    <option value="">ZKTeco K40 Terminal (Primary)</option>
+                    {devices.map((d) => (
+                      <option key={d.id} value={String(d.id)}>
+                        {d.device_name} ({d.serial_number})
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block text-xs font-medium text-[#172033] dark:text-slate-300 mb-1">
+                    Attendance Punch Mode
+                  </label>
+                  <select
+                    value={zkScanForm.punch_type}
+                    onChange={(e) =>
+                      setZkScanForm({
+                        ...zkScanForm,
+                        punch_type: e.target.value as 'Auto' | 'Check-In' | 'Check-Out',
+                      })
+                    }
+                    className="w-full px-3 py-2 text-xs bg-[#F8FAFC] dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg"
+                  >
+                    <option value="Auto">Auto (Check-In first, then Check-Out)</option>
+                    <option value="Check-In">Force Check-In Timestamp</option>
+                    <option value="Check-Out">Force Check-Out Timestamp</option>
+                  </select>
+                </div>
+
+                <div className="sm:col-span-2">
+                  <label className="block text-xs font-medium text-[#172033] dark:text-slate-300 mb-1">
+                    Select Enrolled Staff Finger
+                  </label>
+                  <select
+                    value={zkScanForm.fingerprint_id}
+                    onChange={(e) => {
+                      const picked = fingerprints.find((fp) => String(fp.id) === e.target.value);
+                      setZkScanForm({
+                        ...zkScanForm,
+                        fingerprint_id: e.target.value,
+                        employee_id: picked ? picked.employee_id : zkScanForm.employee_id,
+                        zk_user_pin: picked ? picked.zk_user_pin : zkScanForm.zk_user_pin,
+                      });
+                    }}
+                    className="w-full px-3 py-2 text-xs bg-[#F8FAFC] dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg"
+                  >
+                    <option value="">-- Match by Employee ID or ZK PIN below --</option>
+                    {fingerprints.map((fp) => (
+                      <option key={fp.id} value={String(fp.id)}>
+                        {fp.employee_id} · {fp.employee_name} ({fp.finger_label} · PIN {fp.zk_user_pin})
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block text-xs font-medium text-[#172033] dark:text-slate-300 mb-1">
+                    Or Employee ID
+                  </label>
+                  <input
+                    type="text"
+                    placeholder="SS-EMP-001"
+                    value={zkScanForm.employee_id}
+                    onChange={(e) =>
+                      setZkScanForm({ ...zkScanForm, fingerprint_id: '', employee_id: e.target.value })
+                    }
+                    className="w-full px-3 py-2 text-xs font-mono bg-[#F8FAFC] dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-xs font-medium text-[#172033] dark:text-slate-300 mb-1">
+                    Or K40 User PIN
+                  </label>
+                  <input
+                    type="text"
+                    placeholder="e.g. 101"
+                    value={zkScanForm.zk_user_pin}
+                    onChange={(e) =>
+                      setZkScanForm({ ...zkScanForm, fingerprint_id: '', zk_user_pin: e.target.value })
+                    }
+                    className="w-full px-3 py-2 text-xs font-mono bg-[#F8FAFC] dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg"
+                  />
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2 pt-1">
+                <button
+                  type="button"
+                  disabled={scanningFinger}
+                  onClick={() => handleZktecoScan()}
+                  className="flex-1 inline-flex items-center justify-center gap-2 px-4 py-2.5 text-xs font-bold text-white bg-[#18243A] hover:bg-[#172033] disabled:opacity-60 rounded-lg transition-colors whitespace-nowrap"
+                >
+                  {scanningFinger ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle2 className="w-4 h-4 text-[#38BDF8]" />}
+                  Verify K40 PIN / Punch &amp; Record Time
+                </button>
+              </div>
+            </div>
+          </div>
+
+          {/* Enrolled Staff Fingerprints Table */}
+          <div className="bg-[#FFFFFF] dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden">
+            <div className="p-4 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between gap-2">
+              <div>
+                <h3 className="text-sm font-bold text-[#172033] dark:text-white">
+                  Enrolled Staff Fingerprints Registry ({fingerprints.length})
+                </h3>
+                <p className="text-xs text-slate-500">
+                  Synced between ZKTeco K40 hardware templates, local fingerprint sensors, and HR Attendance profiles.
+                </p>
+              </div>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-left border-collapse">
+                <thead>
+                  <tr className="border-b border-slate-200 dark:border-slate-800 bg-[#18243A] text-white text-xs font-semibold">
+                    <th className="py-3 px-4">Employee ID</th>
+                    <th className="py-3 px-4">Staff Name &amp; Department</th>
+                    <th className="py-3 px-4">ZK PIN</th>
+                    <th className="py-3 px-4">Enrolled Finger &amp; Source</th>
+                    <th className="py-3 px-4">K40 Serial / Last Scan</th>
+                    <th className="py-3 px-4 text-right">Actions</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-200 dark:divide-slate-800 text-xs">
+                  {fingerprints.length === 0 ? (
+                    <tr>
+                      <td colSpan={6} className="py-8 text-center text-slate-500">
+                        No staff fingerprints enrolled yet. Register staff in HR Payroll (prompts finger enrollment automatically) or ask ZKTeco K40 above.
+                      </td>
+                    </tr>
+                  ) : (
+                    fingerprints.map((fp) => (
+                      <tr key={fp.id} className="hover:bg-[#F8FAFC] dark:hover:bg-slate-800/40">
+                        <td className="py-3 px-4 font-mono font-bold text-[#172033] dark:text-white whitespace-nowrap">
+                          {fp.employee_id}
+                        </td>
+                        <td className="py-3 px-4">
+                          <div className="font-semibold text-[#172033] dark:text-white">{fp.employee_name}</div>
+                          <div className="text-[11px] text-slate-500">{fp.department || 'Staff'}</div>
+                        </td>
+                        <td className="py-3 px-4 font-mono font-semibold text-[#087CEB]">{fp.zk_user_pin}</td>
+                        <td className="py-3 px-4">
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <span className="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] font-semibold bg-[#EAF4FF] dark:bg-sky-950/60 text-[#18243A] dark:text-[#38BDF8] rounded">
+                              <Fingerprint className="w-3 h-3" />#{fp.finger_index} · {fp.finger_label}
+                            </span>
+                            {fp.auth_source && (
+                              <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300">
+                                {fp.auth_source}
+                              </span>
+                            )}
+                          </div>
+                        </td>
+                        <td className="py-3 px-4 font-mono text-[11px] text-slate-500">
+                          <div>{fp.device_serial || 'ZK-K40'}</div>
+                          <div>
+                            {fp.last_scanned_at
+                              ? `Last scan: ${formatLogTimestamp(fp.last_scanned_at).date} ${formatLogTimestamp(fp.last_scanned_at).time}`
+                              : 'Awaiting first scan'}
+                          </div>
+                        </td>
+                        <td className="py-3 px-4 text-right whitespace-nowrap">
+                          <div className="inline-flex items-center gap-1.5">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setZkScanForm((prev) => ({
+                                  ...prev,
+                                  fingerprint_id: String(fp.id),
+                                  employee_id: fp.employee_id,
+                                  zk_user_pin: fp.zk_user_pin,
+                                }));
+                              }}
+                              className="px-2.5 py-1 text-[11px] font-bold text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg"
+                            >
+                              Select for Scan
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleDeleteFingerprint(fp.id)}
+                              className="p-1.5 text-red-700 dark:text-red-300 bg-red-50 dark:bg-red-950/50 hover:bg-red-100 rounded-lg"
+                              title="Remove Enrolled Fingerprint"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
       )}
 
       {activeTab === 'biometric-logs' && (
@@ -1218,21 +2572,11 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
                   <button
                     type="button"
                     disabled={verifyingScan}
-                    onClick={() => handleVerifyBiometricScan(false)}
+                    onClick={() => handleVerifyBiometricScan()}
                     className="flex-1 inline-flex items-center justify-center gap-1.5 px-3 py-2 text-xs font-bold text-white bg-[#087CEB] hover:bg-[#0265C4] disabled:opacity-60 rounded-lg whitespace-nowrap"
                   >
                     {verifyingScan ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldCheck className="w-3.5 h-3.5" />}
                     Verify Scan
-                  </button>
-                  <button
-                    type="button"
-                    disabled={verifyingScan}
-                    onClick={() => handleVerifyBiometricScan(true)}
-                    className="inline-flex items-center justify-center gap-1 px-2.5 py-2 text-xs font-semibold text-red-700 dark:text-red-300 bg-red-50 dark:bg-red-950/50 border border-red-200 dark:border-red-900 hover:bg-red-100 disabled:opacity-60 rounded-lg whitespace-nowrap"
-                    title="Record a failed biometric authentication attempt"
-                  >
-                    <ShieldAlert className="w-3.5 h-3.5" />
-                    Test Fail
                   </button>
                 </div>
               </div>
@@ -1546,6 +2890,290 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* Register New Biometric Modal with Live Scanner Status Indicator (connecting / scanning / success / error) */}
+      {registerBioModalOpen && selectedDevice && (
+        <div
+          className="fixed inset-0 z-50 bg-[#18243A]/75 backdrop-blur-sm flex items-center justify-center p-4"
+          role="dialog"
+          aria-modal="true"
+          onClick={() => setRegisterBioModalOpen(false)}
+        >
+          <div
+            className="w-full max-w-xl bg-white dark:bg-slate-900 border-2 border-[#087CEB] rounded-2xl shadow-2xl overflow-hidden"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="px-6 py-4 bg-[#18243A] text-white flex items-center justify-between gap-3">
+              <div className="flex items-center gap-3 min-w-0">
+                <div className="w-10 h-10 rounded-xl bg-[#087CEB]/20 border border-[#38BDF8]/40 flex items-center justify-center shrink-0">
+                  <Fingerprint className="w-5 h-5 text-[#38BDF8]" />
+                </div>
+                <div className="min-w-0">
+                  <h3 className="text-base font-bold truncate">Register New Biometric</h3>
+                  <p className="text-xs text-[#7DD3FC] truncate">{scannerDeviceProbeInfo}</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setRegisterBioModalOpen(false)}
+                className="p-1.5 text-white/70 hover:text-white rounded-lg"
+                title="Close"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="p-6 space-y-5 max-h-[84vh] overflow-y-auto">
+              {/* Live Scanner Status Indicator */}
+              <div
+                data-scanner-status={scannerStatus}
+                className={`p-4 rounded-xl border-2 transition-colors ${
+                  scannerStatus === 'connecting'
+                    ? 'bg-amber-50 dark:bg-amber-950/40 border-amber-300 dark:border-amber-700'
+                    : scannerStatus === 'scanning'
+                    ? 'bg-[#EAF4FF] dark:bg-sky-950/50 border-[#087CEB]'
+                    : scannerStatus === 'success'
+                    ? 'bg-emerald-50 dark:bg-emerald-950/50 border-emerald-500'
+                    : 'bg-red-50 dark:bg-red-950/50 border-red-400 dark:border-red-700'
+                }`}
+              >
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-3">
+                    <div
+                      className={`w-10 h-10 rounded-full flex items-center justify-center shrink-0 ${
+                        scannerStatus === 'connecting'
+                          ? 'bg-amber-200/70 text-amber-800 dark:bg-amber-900 dark:text-amber-200'
+                          : scannerStatus === 'scanning'
+                          ? 'bg-[#087CEB] text-white animate-pulse'
+                          : scannerStatus === 'success'
+                          ? 'bg-emerald-600 text-white'
+                          : 'bg-red-600 text-white'
+                      }`}
+                    >
+                      {scannerStatus === 'connecting' ? (
+                        <Loader2 className="w-5 h-5 animate-spin" />
+                      ) : scannerStatus === 'scanning' ? (
+                        <Fingerprint className="w-5 h-5" />
+                      ) : scannerStatus === 'success' ? (
+                        <CheckCircle2 className="w-5 h-5" />
+                      ) : (
+                        <ShieldAlert className="w-5 h-5" />
+                      )}
+                    </div>
+                    <div>
+                      <div className="text-[11px] font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400">
+                        Live Scanner Status
+                      </div>
+                      <div className="text-sm font-extrabold text-[#172033] dark:text-white flex items-center gap-2">
+                        <span
+                          className={`inline-block w-2.5 h-2.5 rounded-full ${
+                            scannerStatus === 'connecting'
+                              ? 'bg-amber-500 animate-ping'
+                              : scannerStatus === 'scanning'
+                              ? 'bg-[#087CEB] animate-pulse'
+                              : scannerStatus === 'success'
+                              ? 'bg-emerald-500'
+                              : 'bg-red-500'
+                          }`}
+                        />
+                        {scannerStatus === 'connecting'
+                          ? 'Connecting'
+                          : scannerStatus === 'scanning'
+                          ? 'Scanning'
+                          : scannerStatus === 'success'
+                          ? 'Success'
+                          : 'Error'}
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* 3-Step Indicator */}
+                  <div className="hidden sm:flex items-center gap-1.5 text-[11px] font-semibold">
+                    <span
+                      className={`px-2 py-0.5 rounded ${
+                        scannerStatus === 'connecting'
+                          ? 'bg-amber-500 text-white'
+                          : 'bg-slate-200 dark:bg-slate-800 text-slate-600 dark:text-slate-300'
+                      }`}
+                    >
+                      Connecting
+                    </span>
+                    <span className="text-slate-400">→</span>
+                    <span
+                      className={`px-2 py-0.5 rounded ${
+                        scannerStatus === 'scanning'
+                          ? 'bg-[#087CEB] text-white'
+                          : 'bg-slate-200 dark:bg-slate-800 text-slate-600 dark:text-slate-300'
+                      }`}
+                    >
+                      Scanning
+                    </span>
+                    <span className="text-slate-400">→</span>
+                    <span
+                      className={`px-2 py-0.5 rounded ${
+                        scannerStatus === 'success'
+                          ? 'bg-emerald-600 text-white'
+                          : scannerStatus === 'error'
+                          ? 'bg-red-600 text-white'
+                          : 'bg-slate-200 dark:bg-slate-800 text-slate-600 dark:text-slate-300'
+                      }`}
+                    >
+                      {scannerStatus === 'error' ? 'Error' : 'Success'}
+                    </span>
+                  </div>
+                </div>
+                <p className="mt-2.5 text-xs font-medium text-[#172033] dark:text-slate-200">
+                  {scannerStatusDetail}
+                </p>
+              </div>
+
+              {/* Staff & Scanner Configuration */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-medium text-[#172033] dark:text-slate-300 mb-1">
+                    Staff Employee ID
+                  </label>
+                  <input
+                    type="text"
+                    list="zk-modal-employee-list"
+                    placeholder="e.g. SS-EMP-101"
+                    value={modalBioForm.employee_id}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      const digits = val.replace(/[^0-9]/g, '').replace(/^0+/, '');
+                      setModalBioForm((prev) => ({
+                        ...prev,
+                        employee_id: val,
+                        zk_user_pin: prev.zk_user_pin || digits,
+                      }));
+                    }}
+                    className="w-full px-3 py-2 text-xs font-mono bg-[#F8FAFC] dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg"
+                  />
+                  <datalist id="zk-modal-employee-list">
+                    {employees.map((emp) => (
+                      <option key={emp.id} value={emp.employee_id}>
+                        {emp.full_name} · {emp.department}
+                      </option>
+                    ))}
+                  </datalist>
+                </div>
+
+                <div>
+                  <label className="block text-xs font-medium text-[#172033] dark:text-slate-300 mb-1">
+                    K40 User PIN
+                  </label>
+                  <input
+                    type="text"
+                    placeholder="Auto from Employee ID"
+                    value={modalBioForm.zk_user_pin}
+                    onChange={(e) => setModalBioForm({ ...modalBioForm, zk_user_pin: e.target.value })}
+                    className="w-full px-3 py-2 text-xs font-mono bg-[#F8FAFC] dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-xs font-medium text-[#172033] dark:text-slate-300 mb-1">
+                    Finger Position
+                  </label>
+                  <select
+                    value={modalBioForm.finger_index}
+                    onChange={(e) => setModalBioForm({ ...modalBioForm, finger_index: e.target.value })}
+                    className="w-full px-3 py-2 text-xs bg-[#F8FAFC] dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg"
+                  >
+                    {FINGER_OPTIONS.map((f) => (
+                      <option key={f.index} value={String(f.index)}>
+                        #{f.index} · {f.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block text-xs font-medium text-[#172033] dark:text-slate-300 mb-1">
+                    Capture Hardware Mode
+                  </label>
+                  <select
+                    value={modalBioForm.mode}
+                    onChange={(e) =>
+                      setModalBioForm({ ...modalBioForm, mode: e.target.value as 'k40' | 'hardware' })
+                    }
+                    className="w-full px-3 py-2 text-xs bg-[#F8FAFC] dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg"
+                  >
+                    <option value="k40">ZKTeco K40 Terminal (TCP 4370 / ADMS)</option>
+                    <option value="hardware">Local USB / Platform Fingerprint Reader</option>
+                  </select>
+                </div>
+              </div>
+
+              {modalEnrolledFp && scannerStatus === 'success' && (
+                <div className="p-3.5 rounded-xl bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800 flex flex-wrap items-center justify-between gap-2 text-xs">
+                  <div className="font-mono text-emerald-900 dark:text-emerald-200">
+                    Registered: <span className="font-bold">{modalEnrolledFp.employee_name}</span> ({modalEnrolledFp.employee_id}) · PIN {modalEnrolledFp.zk_user_pin} · {modalEnrolledFp.finger_label}
+                  </div>
+                  <button
+                    type="button"
+                    disabled={modalCheckinBusy}
+                    onClick={handleModalRecordCheckIn}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold text-white bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 rounded-lg"
+                  >
+                    {modalCheckinBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Clock className="w-3.5 h-3.5" />}
+                    Record Initial Check-In
+                  </button>
+                </div>
+              )}
+
+              <div className="flex flex-wrap items-center justify-between gap-2 pt-3 border-t border-slate-200 dark:border-slate-800">
+                <div className="flex items-center gap-2">
+                  {modalEnrollJob?.status === 'WaitingFinger' && (
+                    <button
+                      type="button"
+                      onClick={handleModalCancelScan}
+                      className="px-3 py-2 text-xs font-bold text-red-700 bg-red-50 hover:bg-red-100 border border-red-200 rounded-lg"
+                    >
+                      Cancel Scan
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => handleOpenRegisterBiometricModal(selectedDevice)}
+                    className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-[#172033] dark:text-slate-200 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 rounded-lg"
+                  >
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    Re-Probe Scanner
+                  </button>
+                </div>
+
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setRegisterBioModalOpen(false)}
+                    className="px-3 py-2 text-xs font-semibold text-slate-600 dark:text-slate-300 hover:text-[#172033]"
+                  >
+                    Close
+                  </button>
+                  <button
+                    type="button"
+                    disabled={scannerStatus === 'connecting'}
+                    onClick={handleModalStartBiometricRegistration}
+                    className="inline-flex items-center gap-2 px-4 py-2 text-xs font-bold text-white bg-[#087CEB] hover:bg-[#0265C4] disabled:opacity-60 rounded-lg whitespace-nowrap"
+                  >
+                    {scannerStatus === 'connecting' ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    ) : (
+                      <Fingerprint className="w-3.5 h-3.5" />
+                    )}
+                    {scannerStatus === 'error'
+                      ? 'Retry Biometric Scan'
+                      : scannerStatus === 'success'
+                      ? 'Register Another Finger'
+                      : 'Start Biometric Scan'}
+                  </button>
+                </div>
+              </div>
+            </div>
           </div>
         </div>
       )}

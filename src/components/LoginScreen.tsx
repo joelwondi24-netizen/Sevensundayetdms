@@ -9,6 +9,10 @@ import {
   UserPlus,
 } from 'lucide-react';
 import { api } from '../api';
+import {
+  getFirebaseAuthorizedOriginStatus,
+  signInWithCorporateGooglePopup,
+} from '../lib/firebase';
 import type {
   AuthSessionResponse,
   CompanySettings,
@@ -82,16 +86,21 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
     userCount: number;
     hasBiometrics: boolean;
     googleConfigured?: boolean;
-  }>({ hasUsers: true, userCount: 0, hasBiometrics: false, googleConfigured: false });
+    firebaseConfigured?: boolean;
+  }>({ hasUsers: true, userCount: 0, hasBiometrics: false, googleConfigured: false, firebaseConfigured: true });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [infoMsg, setInfoMsg] = useState<string | null>(null);
 
   useEffect(() => {
     api
-      .get<{ hasUsers: boolean; userCount: number; hasBiometrics: boolean; googleConfigured?: boolean }>(
-        '/api/auth/bootstrap-status'
-      )
+      .get<{
+        hasUsers: boolean;
+        userCount: number;
+        hasBiometrics: boolean;
+        googleConfigured?: boolean;
+        firebaseConfigured?: boolean;
+      }>('/api/auth/bootstrap-status')
       .then((res) => {
         setBootstrap(res);
         if (!res.hasUsers) {
@@ -164,6 +173,38 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
       onLogin(auth);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Account registration failed');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleFirebaseGooglePopup = async () => {
+    setLoading(true);
+    setError(null);
+    setInfoMsg(null);
+    try {
+      const popupResult = await signInWithCorporateGooglePopup();
+      const authRes = await api.post<AuthSessionResponse>('/api/auth/google', {
+        firebase_id_token: popupResult.firebaseIdToken,
+        id_token: popupResult.googleOAuthIdToken || undefined,
+        tenant_id: activeTenantId,
+      });
+      onLogin(authRes);
+    } catch (err) {
+      const code = (err as { code?: string } | null)?.code || '';
+      if (code === 'auth/unauthorized-domain') {
+        const domainStatus = getFirebaseAuthorizedOriginStatus();
+        setError(
+          `Domain "${domainStatus.currentOriginHost || 'current origin'}" is not authorized in Firebase Console. Add it under Firebase Console → Authentication → Settings → Authorized domains.`
+        );
+      } else if (code === 'auth/popup-blocked') {
+        setInfoMsg('Popup was blocked by your browser. Paste a verified Google OAuth token below or allow popups.');
+        setGooglePromptOpen(true);
+      } else if (code === 'auth/popup-closed-by-user') {
+        setInfoMsg('Google Sign-In window closed before completion.');
+      } else {
+        setError(err instanceof Error ? err.message : 'Corporate Google sign-in failed');
+      }
     } finally {
       setLoading(false);
     }
@@ -405,9 +446,13 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
                 onClick={() => {
                   setError(null);
                   setInfoMsg(null);
+                  if (bootstrap.firebaseConfigured !== false) {
+                    void handleFirebaseGooglePopup();
+                    return;
+                  }
                   if (!bootstrap.googleConfigured) {
                     setInfoMsg(
-                      'Verified Google OAuth requires GOOGLE_CLIENT_ID configured in server environment settings. Use Corporate Email & Password or Biometric Passkey below.'
+                      'Verified Google OAuth requires Firebase or GOOGLE_CLIENT_ID configured. Use Corporate Email & Password or Biometric Passkey below.'
                     );
                     return;
                   }

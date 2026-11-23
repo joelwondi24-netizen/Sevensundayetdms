@@ -1,0 +1,18 @@
+{
+  "entities": {
+    "HealthCheck": {
+      "title": "HealthCheck",
+      "description": "Minimal connectivity probe record for Firebase initialization validation.",
+      "type": "object",
+      "properties": {
+        "status": {
+          "type": "string",
+          "description": "Probe status indicator",
+          "maxLength": 32
+        }
+      },
+      "required": ["status"]
+    }
+  },
+  "firestore": {}
+}

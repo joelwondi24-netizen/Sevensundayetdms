@@ -329,6 +329,54 @@ export function toEthiopianDateString(isoDate: string): string {
   return `${ETH_MONTHS[mIdx]} ${ethDay}, ${ethYear} E.C.`;
 }
 
+export const ETHIOPIAN_SHIFT_WINDOWS = {
+  morning: {
+    inStart: '07:45',
+    inEnd: '08:00',
+    outStart: '11:58',
+    outEnd: '12:30',
+    scheduledStart: '08:00',
+    scheduledEnd: '12:00',
+    ethLabel: 'In 1:45–2:00 · Out 5:58–6:30 (Morning/Noon ET)',
+  },
+  afternoon: {
+    inStart: '12:50',
+    inEnd: '13:00',
+    outStart: '16:58',
+    outEnd: '17:00',
+    otStart: '17:10',
+    otEnd: '19:00',
+    scheduledStart: '13:00',
+    scheduledEnd: '17:00',
+    ethLabel: 'In 6:50–7:00 · Out 10:58–11:00 · OT 11:10–1:00 PM (ET)',
+  },
+  night: {
+    inStart: '18:50',
+    inEnd: '19:00',
+    outStart: '01:58',
+    outEnd: '02:10',
+    otStart: '02:10',
+    otEnd: '07:00',
+    scheduledStart: '19:00',
+    scheduledEnd: '02:00',
+    ethLabel: 'In 12:50–1:00 PM · Out 7:58–8:10 PM · OT 8:10–1:00 AM (ET)',
+  },
+} as const;
+
+export function formatEthiopianLocalTime(hhmm: string): string {
+  const m = String(hhmm || '').match(/^(\d{1,2}):(\d{2})/);
+  if (!m) return hhmm || '--:--';
+  const h24 = Number(m[1]) % 24;
+  const mins = m[2];
+  const ethHour = ((h24 + 18) % 12) || 12;
+  let period = 'Day';
+  if (h24 >= 6 && h24 < 12) period = 'Morning';
+  else if (h24 >= 12 && h24 < 18) period = 'Afternoon';
+  else if (h24 >= 18 && h24 < 24) period = 'Evening';
+  else period = 'Night';
+  return `${ethHour}:${mins} ${period} ET`;
+}
+
 export function formatMoney(amount: number, currency = 'ETB'): string {
   const num = Number(amount) || 0;
   const formatted = num.toLocaleString('en-US', {

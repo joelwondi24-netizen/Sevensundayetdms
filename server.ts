@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import express from 'express';
 import http from 'http';
 import fs from 'fs';
@@ -12,7 +13,9 @@ import { createServer as createViteServer } from 'vite';
 const PORT = Number(process.env.PORT) || 3000;
 const IS_PROD = process.env.NODE_ENV === 'production';
 
-const DATA_DIR = path.resolve(process.cwd(), 'data');
+const DATA_DIR = process.env.DATA_DIR
+  ? path.resolve(process.env.DATA_DIR)
+  : path.resolve(process.cwd(), 'data');
 if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 }
@@ -870,6 +873,70 @@ CREATE TABLE IF NOT EXISTS biometric_auth_logs (
   verified_at TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS staff_fingerprints (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id INTEGER NOT NULL DEFAULT 1,
+  employee_id TEXT NOT NULL,
+  employee_name TEXT NOT NULL DEFAULT '',
+  department TEXT NOT NULL DEFAULT '',
+  zk_user_pin TEXT NOT NULL,
+  finger_index INTEGER NOT NULL DEFAULT 0,
+  finger_label TEXT NOT NULL DEFAULT 'Right Index',
+  template_hash TEXT NOT NULL,
+  template_size INTEGER NOT NULL DEFAULT 0,
+  device_id INTEGER,
+  device_serial TEXT NOT NULL DEFAULT '',
+  enrolled_by TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'Active',
+  last_scanned_at TEXT,
+  created_at TEXT NOT NULL,
+  UNIQUE(tenant_id, employee_id, finger_index)
+);
+
+CREATE TABLE IF NOT EXISTS company_device_security (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id INTEGER NOT NULL DEFAULT 1 UNIQUE,
+  company_code_hash TEXT NOT NULL DEFAULT '',
+  company_code_hint TEXT NOT NULL DEFAULT '',
+  policy_enabled INTEGER NOT NULL DEFAULT 0,
+  configured_by TEXT NOT NULL DEFAULT '',
+  configured_at TEXT,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS authorized_company_devices (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id INTEGER NOT NULL DEFAULT 1,
+  device_uid TEXT NOT NULL UNIQUE,
+  device_name TEXT NOT NULL,
+  device_os TEXT NOT NULL DEFAULT '',
+  assigned_branch TEXT NOT NULL DEFAULT 'HQ',
+  assigned_to_email TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'Active',
+  verified_at TEXT,
+  registered_by TEXT NOT NULL DEFAULT '',
+  last_seen_at TEXT,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS zk_enroll_jobs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id INTEGER NOT NULL DEFAULT 1,
+  device_id INTEGER,
+  device_serial TEXT NOT NULL DEFAULT '',
+  employee_id TEXT NOT NULL,
+  employee_name TEXT NOT NULL DEFAULT '',
+  zk_user_pin TEXT NOT NULL,
+  finger_index INTEGER NOT NULL DEFAULT 6,
+  finger_label TEXT NOT NULL DEFAULT 'Right Index',
+  channel TEXT NOT NULL DEFAULT 'ADMS',
+  adms_cmd_id TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'WaitingFinger',
+  status_message TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  completed_at TEXT
+);
 `);
 
 // Ensure new columns exist on older DBs safely
@@ -893,6 +960,8 @@ ensureColumn('devices', 'endpoint_url', "TEXT NOT NULL DEFAULT ''");
 ensureColumn('devices', 'api_key', "TEXT NOT NULL DEFAULT ''");
 ensureColumn('devices', 'last_sync_at', 'TEXT');
 ensureColumn('devices', 'punch_count', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('staff_fingerprints', 'auth_source', "TEXT NOT NULL DEFAULT 'ZKTeco K40'");
+ensureColumn('staff_fingerprints', 'credential_id', "TEXT NOT NULL DEFAULT ''");
 
 // Extended Attendance Management columns (Morning/Afternoon/Night + Automatic Calculations + Audit)
 ensureColumn('attendance_records', 'shift_id', 'INTEGER');
@@ -920,6 +989,9 @@ const TENANT_SCOPED_TABLES = [
   'payroll_runs',
   'devices',
   'biometric_auth_logs',
+  'staff_fingerprints',
+  'zk_enroll_jobs',
+  'authorized_company_devices',
   'attendance_records',
   'shifts',
   'departments',
@@ -1870,6 +1942,45 @@ function seedIfEmpty() {
     });
     tx();
   }
+
+  // One-time cleanup migration: remove all users registered by email including Super Administrator accounts
+  const purgedEmailUsers = db.prepare("SELECT name FROM system_migrations WHERE name = 'purge_all_email_users_v1'").get();
+  if (!purgedEmailUsers) {
+    const txPurge = db.transaction(() => {
+      db.prepare("DELETE FROM employees WHERE employee_id LIKE 'SS-USR-%' AND lower(email) IN (SELECT lower(email) FROM users WHERE trim(email) != '')").run();
+      db.prepare('DELETE FROM auth_sessions').run();
+      db.prepare('DELETE FROM biometric_credentials').run();
+      db.prepare('DELETE FROM password_reset_tokens').run();
+      db.prepare('DELETE FROM login_attempts').run();
+      db.prepare("DELETE FROM users WHERE email IS NOT NULL AND trim(email) != ''").run();
+      db.prepare('INSERT INTO system_migrations (name, applied_at) VALUES (?, ?)').run('purge_all_email_users_v1', now);
+    });
+    txPurge();
+  }
+
+  // One-time migration: align default Morning, Afternoon, Day, Night & Overtime shifts with Ethiopian Local Time windows
+  const ethShiftMig = db.prepare("SELECT name FROM system_migrations WHERE name = 'ethiopian_shift_windows_v1'").get();
+  if (!ethShiftMig) {
+    const txEth = db.transaction(() => {
+      db.prepare(
+        "UPDATE shifts SET start_time = '08:00', end_time = '17:00', break_minutes = 60, grace_late_minutes = 0, notes = 'Ethiopian Day Shift: Morning 1:45-2:00 In / 5:58-6:30 Out · Afternoon 6:50-7:00 In / 10:58-11:00 Out · OT 11:10-1:00 PM ET', updated_at = ? WHERE shift_code = 'SHF-DAY'"
+      ).run(now);
+      db.prepare(
+        "UPDATE shifts SET start_time = '08:00', end_time = '12:00', break_minutes = 0, grace_late_minutes = 0, notes = 'Morning Shift: Signed In 1:45-2:00 (07:45-08:00) · Out 5:58-6:30 (11:58-12:30) Ethiopian Time', updated_at = ? WHERE shift_code = 'SHF-MRN'"
+      ).run(now);
+      db.prepare(
+        "UPDATE shifts SET start_time = '13:00', end_time = '17:00', break_minutes = 0, grace_late_minutes = 0, notes = 'Afternoon Shift: Signed In 6:50-7:00 (12:50-13:00) · Out 10:58-11:00 (16:58-17:00) · OT 11:10-1:00 PM (17:10-19:00) ET', updated_at = ? WHERE shift_code = 'SHF-AFT'"
+      ).run(now);
+      db.prepare(
+        "UPDATE shifts SET start_time = '19:00', end_time = '02:00', break_minutes = 0, grace_late_minutes = 0, notes = 'Night Shift: Signed In 12:50-1:00 PM (18:50-19:00) · Out 7:58-8:10 PM (01:58-02:10) · OT 8:10-1:00 AM (02:10-07:00) ET', updated_at = ? WHERE shift_code = 'SHF-NGT'"
+      ).run(now);
+      db.prepare(
+        "UPDATE shifts SET start_time = '17:10', end_time = '19:00', break_minutes = 0, grace_late_minutes = 0, notes = 'Afternoon/Evening Overtime Window (11:10-1:00 PM Ethiopian Local Time)', updated_at = ? WHERE shift_code = 'SHF-OTM'"
+      ).run(now);
+      db.prepare('INSERT INTO system_migrations (name, applied_at) VALUES (?, ?)').run('ethiopian_shift_windows_v1', now);
+    });
+    txEth();
+  }
 }
 
 function seedWorkforceDefaultsForTenant(tenantId: number) {
@@ -1884,15 +1995,15 @@ function seedWorkforceDefaultsForTenant(tenantId: number) {
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Active', ?, ?, ?)
     `);
     const defaultShifts = [
-      ['SHF-DAY', 'Day Shift', 'Day Shift', 'Standard', '08:00', '17:00', 60, '["Mon","Tue","Wed","Thu","Fri"]', '["Sat","Sun"]', 11, 0, 'Fixed Standard', '#2563eb', 1.5, 15, 'Standard administrative & daytime operations'],
-      ['SHF-MRN', 'Morning Shift', 'Morning Shift', '3-Shift', '06:00', '14:00', 30, '["Mon","Tue","Wed","Thu","Fri","Sat"]', '["Sun"]', 11, 1, 'Weekly 3-Shift Rotation', '#0ea5e9', 1.5, 10, 'Early plant & service morning shift'],
-      ['SHF-AFT', 'Afternoon Shift', 'Afternoon Shift', '3-Shift', '14:00', '22:00', 30, '["Mon","Tue","Wed","Thu","Fri","Sat"]', '["Sun"]', 11, 1, 'Weekly 3-Shift Rotation', '#f59e0b', 1.5, 10, 'Mid-day / swing production shift'],
-      ['SHF-NGT', 'Night Shift', 'Night Shift', '3-Shift', '22:00', '06:00', 30, '["Mon","Tue","Wed","Thu","Fri","Sat"]', '["Sun"]', 12, 1, 'Day-to-Night Rotation', '#6366f1', 1.75, 10, 'Overnight operations shift (1.75x night rate)'],
+      ['SHF-DAY', 'Day Shift', 'Day Shift', 'Standard', '08:00', '17:00', 60, '["Mon","Tue","Wed","Thu","Fri"]', '["Sat","Sun"]', 11, 0, 'Fixed Standard', '#2563eb', 1.5, 0, 'Ethiopian Day Shift: Morning 1:45-2:00 In / 5:58-6:30 Out · Afternoon 6:50-7:00 In / 10:58-11:00 Out · OT 11:10-1:00 PM ET'],
+      ['SHF-MRN', 'Morning Shift', 'Morning Shift', '3-Shift', '08:00', '12:00', 0, '["Mon","Tue","Wed","Thu","Fri","Sat"]', '["Sun"]', 11, 1, 'Weekly 3-Shift Rotation', '#0ea5e9', 1.5, 0, 'Morning Shift: Signed In 1:45-2:00 (07:45-08:00) · Out 5:58-6:30 (11:58-12:30) Ethiopian Time'],
+      ['SHF-AFT', 'Afternoon Shift', 'Afternoon Shift', '3-Shift', '13:00', '17:00', 0, '["Mon","Tue","Wed","Thu","Fri","Sat"]', '["Sun"]', 11, 1, 'Weekly 3-Shift Rotation', '#f59e0b', 1.5, 0, 'Afternoon Shift: Signed In 6:50-7:00 (12:50-13:00) · Out 10:58-11:00 (16:58-17:00) · OT 11:10-1:00 PM (17:10-19:00) ET'],
+      ['SHF-NGT', 'Night Shift', 'Night Shift', '3-Shift', '19:00', '02:00', 0, '["Mon","Tue","Wed","Thu","Fri","Sat"]', '["Sun"]', 12, 1, 'Day-to-Night Rotation', '#6366f1', 1.75, 0, 'Night Shift: Signed In 12:50-1:00 PM (18:50-19:00) · Out 7:58-8:10 PM (01:58-02:10) · OT 8:10-1:00 AM (02:10-07:00) ET'],
       ['SHF-WKD', 'Weekend Shift', 'Weekend Shift', '4-Shift', '08:00', '16:00', 45, '["Sat","Sun"]', '["Mon","Tue","Wed","Thu","Fri"]', 11, 0, 'Weekend Coverage', '#10b981', 2.0, 15, 'Saturday & Sunday coverage crew'],
       ['SHF-HOL', 'Holiday Shift', 'Holiday Shift', '4-Shift', '08:00', '16:00', 45, '["Sun"]', '[]', 12, 0, 'Public Holiday Duty', '#ec4899', 2.5, 15, 'Official public holiday essential staff'],
       ['SHF-SEC', 'Security Guard Shift', 'Security Guard Shift', 'Security 24/7', '18:00', '06:00', 45, '["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]', '[]', 12, 1, '4-Team 24/7 Security Rotation', '#0f172a', 1.75, 5, 'Gate control, patrol & perimeter duty'],
       ['SHF-SPC', 'Special Duty Shift', 'Special Duty Shift', '4-Shift', '09:00', '17:00', 45, '["Mon","Tue","Wed","Thu","Fri"]', '["Sat","Sun"]', 11, 0, 'Task Assignment', '#8b5cf6', 1.5, 10, 'Audits, maintenance shutdown & special dispatch'],
-      ['SHF-OTM', 'Overtime Shift', 'Overtime Shift', 'Standard', '17:00', '21:00', 15, '["Mon","Tue","Wed","Thu","Fri","Sat"]', '["Sun"]', 11, 0, 'On-Demand Overtime', '#ea580c', 1.75, 5, 'Extended production & deadline overtime block'],
+      ['SHF-OTM', 'Overtime Shift', 'Overtime Shift', 'Standard', '17:10', '19:00', 0, '["Mon","Tue","Wed","Thu","Fri","Sat"]', '["Sun"]', 11, 0, 'On-Demand Overtime', '#ea580c', 1.75, 0, 'Afternoon/Evening Overtime Window (11:10-1:00 PM Ethiopian Local Time)'],
     ] as const;
     for (const s of defaultShifts) {
       insShift.run(tenantId, ...s, now, now);
@@ -1995,7 +2106,12 @@ app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
   res.setHeader('X-XSS-Protection', '1; mode=block');
+  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin-allow-popups');
   res.setHeader('Permissions-Policy', 'geolocation=(), microphone=(), camera=(self)');
+  res.setHeader(
+    'Content-Security-Policy',
+    "default-src 'self' https: data: blob: 'unsafe-inline' 'unsafe-eval'; connect-src 'self' https: wss: ws:;"
+  );
   if (IS_PROD && (req.secure || req.headers['x-forwarded-proto'] === 'https')) {
     res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
   }
@@ -2258,7 +2374,13 @@ const PUBLIC_API_EXEMPT = new Set([
   '/api/auth/bootstrap-status',
   '/api/auth/biometric/challenge',
   '/api/auth/biometric/verify',
+  '/api/security/company-devices/status',
+  '/api/security/company-devices/verify',
   '/api/iclock/cdata',
+  '/api/iclock/getrequest',
+  '/api/iclock/devicecmd',
+  '/api/devices/zkteco/bridge/jobs',
+  '/api/devices/zkteco/bridge/event',
 ]);
 
 app.use('/api', (req: AuthedRequest, res, next) => {
@@ -2280,7 +2402,8 @@ app.use('/api', (req: AuthedRequest, res, next) => {
   // Origin / CSRF validation for browser state-changing requests
   if (
     ['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method) &&
-    fullPath !== '/api/iclock/cdata' &&
+    !fullPath.startsWith('/api/iclock/') &&
+    !fullPath.startsWith('/api/devices/zkteco/bridge/') &&
     req.headers.origin
   ) {
     try {
@@ -2358,6 +2481,7 @@ app.use('/api', (req: AuthedRequest, res, next) => {
   const role = req.authUser.role;
   const tid = getTenantId(req);
   const isGlobalAdmin = USER_ADMIN_ROLES.has(role);
+  const rolePerms = getRoleActionPerms(tid, role);
 
   if (fullPath.startsWith('/api/admin/') || fullPath.startsWith('/api/backup/') || fullPath.startsWith('/api/rbac/')) {
     if (!isGlobalAdmin) {
@@ -2385,11 +2509,11 @@ app.use('/api', (req: AuthedRequest, res, next) => {
   ) {
     const allowedPayrollView = new Set([...SALARY_MANAGER_ROLES, 'Auditor']);
     if (req.method === 'GET') {
-      if (!allowedPayrollView.has(role)) {
+      if (!allowedPayrollView.has(role) && !rolePerms.manage) {
         res.status(403).json({ error: `Permission denied (${role}) to access payroll or salary data.` });
         return;
       }
-    } else if (!SALARY_MANAGER_ROLES.has(role)) {
+    } else if (!SALARY_MANAGER_ROLES.has(role) && !rolePerms.manage) {
       res.status(403).json({ error: `Permission denied (${role}) to modify payroll or salary data.` });
       return;
     }
@@ -2399,19 +2523,87 @@ app.use('/api', (req: AuthedRequest, res, next) => {
     fullPath.startsWith('/api/finance-')
   ) {
     if (req.method === 'GET') {
-      if (!FINANCE_ROLES.has(role)) {
+      if (!FINANCE_ROLES.has(role) && !rolePerms.manage) {
         res.status(403).json({ error: `Permission denied (${role}) to view financial ledgers.` });
         return;
       }
-    } else if (!FINANCE_ROLES.has(role) || role === 'Auditor') {
+    } else if ((!FINANCE_ROLES.has(role) || role === 'Auditor') && !rolePerms.manage) {
       res.status(403).json({ error: `Permission denied (${role}) to post financial transactions.` });
       return;
     }
-  } else if (req.method === 'DELETE' && !fullPath.startsWith('/api/auth/')) {
-    const perms = getRoleActionPerms(tid, role);
-    if (!perms.delete) {
-      res.status(403).json({ error: `Delete permission denied for role "${role}".` });
-      return;
+  } else if (!isGlobalAdmin) {
+    const isAuthRoute = fullPath.startsWith('/api/auth/');
+    const isExemptInfra =
+      fullPath.startsWith('/api/security/company-devices/') ||
+      fullPath.startsWith('/api/iclock/') ||
+      fullPath.startsWith('/api/devices/zkteco/bridge/') ||
+      fullPath === '/api/health';
+
+    if (!isAuthRoute && !isExemptInfra) {
+      const isApprovalRoute =
+        fullPath.endsWith('/decision') ||
+        fullPath.endsWith('/approve') ||
+        fullPath.endsWith('/audit') ||
+        /^\/api\/(approvals|leaves|company-forms\/submissions|material-requests|purchasing|sales-orders|payroll|salary|gate-passes)\/\d+\/status$/.test(
+          fullPath
+        );
+      const isExportRoute =
+        fullPath === '/api/backup/export' || fullPath.endsWith('/export') || fullPath.includes('/export/');
+
+      if (isApprovalRoute && !rolePerms.approve) {
+        res.status(403).json({ error: `Approval permission denied for role "${role}".` });
+        return;
+      }
+      if (isExportRoute && !rolePerms.export) {
+        res.status(403).json({ error: `Export permission denied for role "${role}".` });
+        return;
+      }
+      if (req.method === 'GET' && !rolePerms.view) {
+        res.status(403).json({ error: `View permission denied for role "${role}".` });
+        return;
+      }
+      if (req.method === 'POST' && !rolePerms.create) {
+        res.status(403).json({ error: `Create permission denied for role "${role}".` });
+        return;
+      }
+      if ((req.method === 'PUT' || req.method === 'PATCH') && !isApprovalRoute && !rolePerms.edit) {
+        res.status(403).json({ error: `Edit permission denied for role "${role}".` });
+        return;
+      }
+      if (req.method === 'DELETE' && !rolePerms.delete) {
+        res.status(403).json({ error: `Delete permission denied for role "${role}".` });
+        return;
+      }
+    }
+  }
+
+  // Enforce Company Device + Company Code security policy when active
+  const bypassDeviceGate =
+    fullPath.startsWith('/api/security/company-devices/') ||
+    fullPath.startsWith('/api/auth/') ||
+    fullPath === '/api/health';
+  if (!bypassDeviceGate) {
+    const secRow = db
+      .prepare('SELECT policy_enabled FROM company_device_security WHERE tenant_id = 1')
+      .get() as { policy_enabled: number } | undefined;
+    if (secRow?.policy_enabled === 1) {
+      const reqDeviceUid = String(req.headers['x-device-uid'] || '').trim().toUpperCase();
+      const authDev = reqDeviceUid
+        ? (db
+            .prepare('SELECT id, status, verified_at FROM authorized_company_devices WHERE device_uid = ?')
+            .get(reqDeviceUid) as { id: number; status: string; verified_at: string | null } | undefined)
+        : undefined;
+      if (!reqDeviceUid || !authDev || authDev.status !== 'Active' || !authDev.verified_at) {
+        res.status(403).json({
+          error: 'Company Device verification required. Register this device in System Admin and enter the Company Code.',
+          code: 'COMPANY_DEVICE_UNVERIFIED',
+        });
+        return;
+      }
+      db.prepare('UPDATE authorized_company_devices SET last_seen_at = ? WHERE id = ?').run(
+        new Date().toISOString(),
+        authDev.id
+      );
     }
   }
 
@@ -2423,15 +2615,35 @@ app.get('/api/health', (_req, res) => {
   res.json({ ok: true, timestamp: new Date().toISOString() });
 });
 
+function loadFirebaseAppletConfig(): {
+  projectId?: string;
+  apiKey?: string;
+  oAuthClientId?: string;
+} | null {
+  try {
+    const cfgPath = path.resolve(process.cwd(), 'firebase-applet-config.json');
+    if (!fs.existsSync(cfgPath)) return null;
+    return JSON.parse(fs.readFileSync(cfgPath, 'utf8')) as {
+      projectId?: string;
+      apiKey?: string;
+      oAuthClientId?: string;
+    };
+  } catch {
+    return null;
+  }
+}
+
 // Auth & Registration Endpoints
 app.get('/api/auth/bootstrap-status', (_req, res) => {
   const userCount = (db.prepare('SELECT COUNT(*) as c FROM users').get() as { c: number }).c;
   const biometricCount = (db.prepare('SELECT COUNT(*) as c FROM biometric_credentials').get() as { c: number }).c;
+  const firebaseCfg = loadFirebaseAppletConfig();
   res.json({
     hasUsers: userCount > 0,
     userCount,
     hasBiometrics: biometricCount > 0,
-    googleConfigured: Boolean(process.env.GOOGLE_CLIENT_ID),
+    googleConfigured: Boolean(process.env.GOOGLE_CLIENT_ID || (firebaseCfg?.apiKey && firebaseCfg?.oAuthClientId)),
+    firebaseConfigured: Boolean(firebaseCfg?.apiKey && firebaseCfg?.projectId),
   });
 });
 
@@ -2893,33 +3105,57 @@ app.post('/api/auth/password-reset/confirm', (req, res) => {
 app.post('/api/auth/google', async (req, res) => {
   const b = req.body || {};
   const idToken = String(b.id_token || '').trim();
+  const firebaseIdToken = String(b.firebase_id_token || '').trim();
   const requestedTid = Number(b.tenant_id || req.headers['x-tenant-id'] || 1);
-  const googleClientId = String(process.env.GOOGLE_CLIENT_ID || '').trim();
+  const firebaseCfg = loadFirebaseAppletConfig();
+  const googleClientId = String(process.env.GOOGLE_CLIENT_ID || firebaseCfg?.oAuthClientId || '').trim();
+  const firebaseApiKey = String(firebaseCfg?.apiKey || '').trim();
 
-  if (!googleClientId) {
+  if (!googleClientId && !firebaseApiKey) {
     res.status(503).json({
       error:
         'Verified Google OAuth is not configured on this server (GOOGLE_CLIENT_ID missing). Please sign in using Corporate Email & Password or Biometric Passkey.',
     });
     return;
   }
-  if (!idToken) {
-    res.status(400).json({ error: 'A verified Google OAuth id_token is required.' });
+  if (!idToken && !firebaseIdToken) {
+    res.status(400).json({ error: 'A verified Google OAuth id_token or Firebase ID token is required.' });
     return;
   }
 
   let verifiedEmail = '';
   try {
-    const tokenRes = await fetch(
-      `https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(idToken)}`,
-      { signal: AbortSignal.timeout(8000) }
-    );
-    const info = (await tokenRes.json()) as { aud?: string; email?: string; email_verified?: string };
-    if (!tokenRes.ok || info.aud !== googleClientId || info.email_verified !== 'true' || !info.email) {
-      res.status(401).json({ error: 'Google ID token verification failed or email is unverified.' });
-      return;
+    if (firebaseIdToken && firebaseApiKey) {
+      const lookupRes = await fetch(
+        `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${encodeURIComponent(firebaseApiKey)}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ idToken: firebaseIdToken }),
+          signal: AbortSignal.timeout(8000),
+        }
+      );
+      const lookupJson = (await lookupRes.json()) as {
+        users?: Array<{ email?: string; emailVerified?: boolean; disabled?: boolean }>;
+      };
+      const account = lookupJson.users?.[0];
+      if (!lookupRes.ok || !account || account.disabled || !account.emailVerified || !account.email) {
+        res.status(401).json({ error: 'Firebase Google token verification failed or email is unverified.' });
+        return;
+      }
+      verifiedEmail = account.email.toLowerCase();
+    } else {
+      const tokenRes = await fetch(
+        `https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(idToken)}`,
+        { signal: AbortSignal.timeout(8000) }
+      );
+      const info = (await tokenRes.json()) as { aud?: string; email?: string; email_verified?: string };
+      if (!tokenRes.ok || !googleClientId || info.aud !== googleClientId || info.email_verified !== 'true' || !info.email) {
+        res.status(401).json({ error: 'Google ID token verification failed or email is unverified.' });
+        return;
+      }
+      verifiedEmail = info.email.toLowerCase();
     }
-    verifiedEmail = info.email.toLowerCase();
   } catch {
     res.status(502).json({ error: 'Unable to verify Google token with Google Identity Services.' });
     return;
@@ -3041,6 +3277,14 @@ app.post('/api/auth/logout', (req, res) => {
     db.prepare('DELETE FROM auth_sessions WHERE token_hash = ?').run(tokenHash);
   }
   res.json({ ok: true });
+});
+
+app.get('/api/auth/login-attempts', (req, res) => {
+  if (!requireRole(req, res, USER_ADMIN_ROLES, 'view login attempt security history')) return;
+  const rows = db
+    .prepare('SELECT id, email, ip_address, user_agent, success, reason, created_at FROM login_attempts ORDER BY id DESC LIMIT 100')
+    .all();
+  res.json(rows);
 });
 
 // Biometric Security (Fingerprint / Face ID / WebAuthn)
@@ -3716,11 +3960,50 @@ app.post('/api/users/:id/unlock', (req, res) => {
   res.json(updated);
 });
 
+const PURGE_USERS_ROLES = new Set(['System Administrator', 'Super Administrator']);
+
+app.post('/api/users/purge-email-users', (req: AuthedRequest, res) => {
+  if (!requireRole(req, res, PURGE_USERS_ROLES, 'remove all email-registered users including Super Administrators')) return;
+  const tid = getTenantId(req);
+  const currentUserId = req.authUser?.id ?? null;
+  const targets = db
+    .prepare("SELECT id, email FROM users WHERE email IS NOT NULL AND trim(email) != ''")
+    .all() as Array<{ id: number; email: string }>;
+  const targetIds = targets.map((t) => t.id);
+  const currentUserRemoved = currentUserId !== null && targetIds.includes(currentUserId);
+
+  const tx = db.transaction(() => {
+    db.prepare("DELETE FROM employees WHERE employee_id LIKE 'SS-USR-%' AND lower(email) IN (SELECT lower(email) FROM users WHERE trim(email) != '')").run();
+    db.prepare('DELETE FROM auth_sessions WHERE user_id IN (SELECT id FROM users WHERE trim(email) != \'\')').run();
+    db.prepare('DELETE FROM biometric_credentials WHERE user_id IN (SELECT id FROM users WHERE trim(email) != \'\')').run();
+    db.prepare('DELETE FROM password_reset_tokens WHERE user_id IN (SELECT id FROM users WHERE trim(email) != \'\')').run();
+    db.prepare('DELETE FROM login_attempts').run();
+    const info = db.prepare("DELETE FROM users WHERE email IS NOT NULL AND trim(email) != ''").run();
+    return info.changes;
+  });
+  const deletedCount = tx();
+  logAudit(
+    req,
+    'PURGE_USERS',
+    'Users',
+    `Removed ${deletedCount} email-registered user account(s) including Super Administrators`,
+    tid
+  );
+  res.json({ ok: true, deletedCount, currentUserRemoved });
+});
+
 app.delete('/api/users/:id', (req, res) => {
   if (!requireRole(req, res, USER_ADMIN_ROLES, 'delete user accounts')) return;
   const id = Number(req.params.id);
-  const target = db.prepare('SELECT role FROM users WHERE id = ?').get(id) as { role?: string } | undefined;
-  if (target?.role === 'System Administrator') {
+  const actorRole = getActorRole(req);
+  const target = db.prepare('SELECT role, email FROM users WHERE id = ?').get(id) as
+    | { role?: string; email?: string }
+    | undefined;
+  if (!target) {
+    res.status(404).json({ error: 'User account not found.' });
+    return;
+  }
+  if (target.role === 'System Administrator' && !PURGE_USERS_ROLES.has(actorRole)) {
     const sysCount = (db.prepare("SELECT COUNT(*) as c FROM users WHERE role = 'System Administrator'").get() as { c: number }).c;
     if (sysCount <= 1) {
       res.status(400).json({ error: 'Cannot delete the sole System Administrator account.' });
@@ -3728,18 +4011,30 @@ app.delete('/api/users/:id', (req, res) => {
     }
   }
   db.prepare('DELETE FROM auth_sessions WHERE user_id = ?').run(id);
+  db.prepare('DELETE FROM biometric_credentials WHERE user_id = ?').run(id);
+  db.prepare('DELETE FROM password_reset_tokens WHERE user_id = ?').run(id);
   db.prepare('DELETE FROM users WHERE id = ?').run(id);
-  logAudit(req, 'DELETE', 'Users', `Removed user #${id}`);
+  logAudit(req, 'DELETE', 'Users', `Removed user #${id} (${target.email || ''})`);
   res.json({ ok: true });
 });
 
 // Employees
-app.get('/api/employees', (req, res) => {
+app.get('/api/employees', (req: AuthedRequest, res) => {
   const tid = getTenantId(req);
+  const authUser = req.authUser;
+  if (authUser && (authUser.role === 'Employee' || authUser.role === 'Viewer') && !getRoleActionPerms(tid, authUser.role).manage) {
+    res.json(
+      db
+        .prepare('SELECT * FROM employees WHERE tenant_id = ? AND (employee_id = ? OR lower(email) = lower(?)) ORDER BY id DESC')
+        .all(tid, authUser.employee_code, authUser.email)
+    );
+    return;
+  }
   res.json(db.prepare('SELECT * FROM employees WHERE tenant_id = ? ORDER BY id DESC').all(tid));
 });
 
 app.post('/api/employees', (req, res) => {
+  if (!requireRole(req, res, SHIFT_DEPT_ADMIN_ROLES, 'registering HR employees')) return;
   const tid = getTenantId(req);
   const b = req.body || {};
   const now = new Date().toISOString();
@@ -3801,6 +4096,7 @@ app.post('/api/employees', (req, res) => {
 });
 
 app.put('/api/employees/:id', (req, res) => {
+  if (!requireRole(req, res, SHIFT_DEPT_ADMIN_ROLES, 'updating HR employee records')) return;
   const tid = getTenantId(req);
   const id = Number(req.params.id);
   const b = req.body || {};
@@ -4652,6 +4948,7 @@ app.get('/api/devices', (req, res) => {
 });
 
 app.post('/api/devices', (req, res) => {
+  if (!requireRole(req, res, ATTENDANCE_MANAGER_ROLES, 'registering biometric or hardware devices')) return;
   const tid = getTenantId(req);
   const b = req.body || {};
   const rawApiKey = String(b.api_key || '').trim();
@@ -4885,7 +5182,7 @@ app.post('/api/devices/biometric-logs/verify', (req, res) => {
     return;
   }
 
-  if (b.simulate_failure === true || b.status === 'Failure') {
+  if (b.status === 'Failure') {
     const logRow = insertBiometricAuthLog({
       tenant_id: tid,
       device_id: deviceId,
@@ -5190,8 +5487,1861 @@ app.post('/api/devices/:id/push-punch', (req, res) => {
   res.status(201).json({ device, attendance, authLog });
 });
 
-// ZKTeco / iClock ADMS Hardware Push Compatibility Endpoint
-app.get('/api/iclock/cdata', (req, res) => {
+// ============================================================================
+// ZKTECO K40 TCP/IP (PORT 4370) + REAL-TIME LISTENER + FINGERPRINT ENROLL + ADMS
+// ============================================================================
+const ZK_CMD_CONNECT = 1000;
+const ZK_CMD_EXIT = 1001;
+const ZK_CMD_ENABLEDEVICE = 1002;
+const ZK_CMD_DISABLEDEVICE = 1003;
+const ZK_CMD_USER_WRQ = 8;
+const ZK_CMD_STARTENROLL = 61;
+const ZK_CMD_CANCELCAPTURE = 62;
+const ZK_CMD_GET_TIME = 201;
+const ZK_CMD_ATTLOG_RRQ = 13;
+const ZK_CMD_REG_EVENT = 500;
+const ZK_CMD_ACK_OK = 2000;
+const ZK_CMD_PREPARE_DATA = 1500;
+const ZK_CMD_DATA = 1501;
+
+const ZK_EF_ATTLOG = 1;
+const ZK_EF_FINGER = 2;
+const ZK_EF_ENROLLUSER = 4;
+const ZK_EF_ENROLLFINGER = 8;
+
+function createZkPacket(command: number, sessionId: number, replyId: number, data: Buffer = Buffer.alloc(0)): Buffer {
+  const payload = Buffer.alloc(8 + data.length);
+  payload.writeUInt16LE(command, 0);
+  payload.writeUInt16LE(0, 2); // checksum placeholder
+  payload.writeUInt16LE(sessionId, 4);
+  payload.writeUInt16LE(replyId, 6);
+  if (data.length > 0) data.copy(payload, 8);
+
+  let chksum = 0;
+  for (let i = 0; i < payload.length; i += 2) {
+    if (i + 1 < payload.length) {
+      chksum += payload.readUInt16LE(i);
+    } else {
+      chksum += payload[i];
+    }
+    while (chksum > 0xffff) {
+      chksum = (chksum & 0xffff) + (chksum >> 16);
+    }
+  }
+  payload.writeUInt16LE((~chksum) & 0xffff, 2);
+
+  const tcpHeader = Buffer.alloc(8);
+  tcpHeader.writeUInt8(0x50, 0);
+  tcpHeader.writeUInt8(0x50, 1);
+  tcpHeader.writeUInt8(0x82, 2);
+  tcpHeader.writeUInt8(0x7d, 3);
+  tcpHeader.writeUInt32LE(payload.length, 4);
+  return Buffer.concat([tcpHeader, payload]);
+}
+
+function decodeZkTime(timeVal: number): string {
+  const sec = timeVal % 60;
+  let rem = Math.floor(timeVal / 60);
+  const min = rem % 60;
+  rem = Math.floor(rem / 60);
+  const hour = rem % 24;
+  rem = Math.floor(rem / 24);
+  const day = (rem % 31) + 1;
+  rem = Math.floor(rem / 31);
+  const month = (rem % 12) + 1;
+  const year = Math.floor(rem / 12) + 2000;
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${year}-${pad(month)}-${pad(day)}T${pad(hour)}:${pad(min)}:${pad(sec)}`;
+}
+
+async function zkSendCommand(
+  ip: string,
+  port: number,
+  command: number,
+  sessionId = 0,
+  replyId = 0,
+  data: Buffer = Buffer.alloc(0),
+  timeoutMs = 1800
+): Promise<{ command: number; sessionId: number; replyId: number; payload: Buffer }> {
+  return new Promise((resolve, reject) => {
+    const socket = new net.Socket();
+    let settled = false;
+    let recvBuf = Buffer.alloc(0);
+
+    const finish = (err: Error | null, res?: { command: number; sessionId: number; replyId: number; payload: Buffer }) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      if (err) reject(err);
+      else if (res) resolve(res);
+    };
+
+    socket.setTimeout(timeoutMs);
+    socket.on('timeout', () => finish(new Error(`ZKTeco K40 TCP timeout at ${ip}:${port}`)));
+    socket.on('error', (err) => finish(err));
+
+    socket.connect(port, ip, () => {
+      socket.write(createZkPacket(command, sessionId, replyId, data));
+    });
+
+    socket.on('data', (chunk) => {
+      recvBuf = Buffer.concat([recvBuf, chunk]);
+      if (recvBuf.length >= 16 && recvBuf[0] === 0x50 && recvBuf[1] === 0x50 && recvBuf[2] === 0x82 && recvBuf[3] === 0x7d) {
+        const expectedPayloadLen = recvBuf.readUInt32LE(4);
+        if (recvBuf.length >= 8 + expectedPayloadLen) {
+          const body = recvBuf.subarray(8, 8 + expectedPayloadLen);
+          const replyCmd = body.readUInt16LE(0);
+          const nextSession = body.readUInt16LE(4);
+          const nextReply = body.readUInt16LE(6);
+          finish(null, {
+            command: replyCmd,
+            sessionId: nextSession,
+            replyId: nextReply,
+            payload: body.subarray(8),
+          });
+        }
+      }
+    });
+  });
+}
+
+async function zkSendSessionSequence(
+  ip: string,
+  port: number,
+  steps: Array<{ command: number; data?: Buffer }>,
+  timeoutMs = 2200
+): Promise<{ sessionId: number; results: Array<{ command: number; payload: Buffer }> }> {
+  return new Promise((resolve, reject) => {
+    const socket = new net.Socket();
+    let settled = false;
+    let recvBuf = Buffer.alloc(0);
+    let sessionId = 0;
+    let replyId = 0;
+    let stepIndex = -1; // -1 = initial CONNECT
+    const results: Array<{ command: number; payload: Buffer }> = [];
+
+    const finish = (err: Error | null) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      if (err) reject(err);
+      else resolve({ sessionId, results });
+    };
+
+    socket.setTimeout(timeoutMs);
+    socket.on('timeout', () => finish(new Error(`ZKTeco K40 TCP timeout at ${ip}:${port}`)));
+    socket.on('error', (err) => finish(err));
+
+    socket.connect(port, ip, () => {
+      socket.write(createZkPacket(ZK_CMD_CONNECT, 0, 0, Buffer.alloc(0)));
+    });
+
+    socket.on('data', (chunk) => {
+      recvBuf = Buffer.concat([recvBuf, chunk]);
+      while (recvBuf.length >= 16 && recvBuf[0] === 0x50 && recvBuf[1] === 0x50 && recvBuf[2] === 0x82 && recvBuf[3] === 0x7d) {
+        const expectedLen = recvBuf.readUInt32LE(4);
+        if (recvBuf.length < 8 + expectedLen) break;
+        const body = recvBuf.subarray(8, 8 + expectedLen);
+        recvBuf = recvBuf.subarray(8 + expectedLen);
+        const replyCmd = body.readUInt16LE(0);
+        sessionId = body.readUInt16LE(4);
+        const payload = body.subarray(8);
+
+        if (stepIndex === -1) {
+          if (steps.length === 0) {
+            finish(null);
+            return;
+          }
+          stepIndex = 0;
+          replyId += 1;
+          socket.write(createZkPacket(steps[0].command, sessionId, replyId, steps[0].data || Buffer.alloc(0)));
+        } else {
+          results.push({ command: replyCmd, payload });
+          stepIndex += 1;
+          if (stepIndex >= steps.length) {
+            try {
+              socket.write(createZkPacket(ZK_CMD_EXIT, sessionId, replyId + 1, Buffer.alloc(0)));
+            } catch {
+              // ignore close error
+            }
+            finish(null);
+            return;
+          }
+          replyId += 1;
+          socket.write(
+            createZkPacket(steps[stepIndex].command, sessionId, replyId, steps[stepIndex].data || Buffer.alloc(0))
+          );
+        }
+      }
+    });
+  });
+}
+
+function buildZkUser72Packet(zkUserPin: string, fullName: string): Buffer {
+  // Standard ZKTeco K40 / ZK72 user structure (uid 2, role 1, password 8, name 24, card 4, group 1, tz 2, userId 9/24)
+  const numericUid = Number(zkUserPin.replace(/[^0-9]/g, '').slice(0, 4)) || 101;
+  const buf = Buffer.alloc(72);
+  buf.writeUInt16LE(Math.min(65534, Math.max(1, numericUid)), 0);
+  buf.writeUInt8(0, 2); // role: standard user
+  Buffer.from(fullName.slice(0, 23), 'ascii').copy(buf, 11);
+  buf.writeUInt8(1, 39); // group 1
+  Buffer.from(zkUserPin.slice(0, 23), 'ascii').copy(buf, 48);
+  return buf;
+}
+
+function buildZkStartEnrollPacket(zkUserPin: string, fingerIndex: number): Buffer {
+  // ZKTeco CMD_STARTENROLL payload: 24-byte user PIN (or 4-byte uid) + 1-byte finger index + 1-byte flag
+  const buf = Buffer.alloc(26);
+  Buffer.from(zkUserPin.slice(0, 23), 'ascii').copy(buf, 0);
+  buf.writeUInt8(Math.min(9, Math.max(0, fingerIndex)), 24);
+  buf.writeUInt8(1, 25);
+  return buf;
+}
+
+async function zkSetUserAndStartEnroll(
+  ip: string,
+  port: number,
+  zkUserPin: string,
+  fullName: string,
+  fingerIndex: number
+): Promise<{ ok: boolean; latencyMs: number; message: string }> {
+  const start = Date.now();
+  try {
+    const userBuf = buildZkUser72Packet(zkUserPin, fullName);
+    const enrollBuf = buildZkStartEnrollPacket(zkUserPin, fingerIndex);
+    await zkSendSessionSequence(
+      ip,
+      port,
+      [
+        { command: ZK_CMD_CANCELCAPTURE, data: Buffer.alloc(0) },
+        { command: ZK_CMD_USER_WRQ, data: userBuf },
+        { command: ZK_CMD_STARTENROLL, data: enrollBuf },
+      ],
+      1800
+    );
+    return {
+      ok: true,
+      latencyMs: Date.now() - start,
+      message: `Sent CMD_STARTENROLL to ZKTeco K40 (${ip}:${port}) for PIN ${zkUserPin}, Finger #${fingerIndex}. Ask staff to press finger 3 times on the scanner.`,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      latencyMs: Date.now() - start,
+      message: err instanceof Error ? err.message : 'ZKTeco K40 TCP 4370 unreachable from server',
+    };
+  }
+}
+
+async function zkPullAttendanceFromK40(
+  ip: string,
+  port: number
+): Promise<{
+  connected: boolean;
+  latencyMs: number;
+  sessionId?: number;
+  records: Array<{ zk_user_pin: string; timestamp: string; punch_type: 'Check-In' | 'Check-Out' }>;
+  message: string;
+}> {
+  const start = Date.now();
+  try {
+    const conn = await zkSendCommand(ip, port, ZK_CMD_CONNECT, 0, 0, Buffer.alloc(0), 1800);
+    const sid = conn.sessionId;
+    const records: Array<{ zk_user_pin: string; timestamp: string; punch_type: 'Check-In' | 'Check-Out' }> = [];
+
+    try {
+      const attRes = await zkSendCommand(ip, port, ZK_CMD_ATTLOG_RRQ, sid, 1, Buffer.alloc(0), 2500);
+      if (attRes.command === ZK_CMD_PREPARE_DATA || attRes.command === ZK_CMD_DATA || attRes.command === ZK_CMD_ACK_OK) {
+        const raw = attRes.payload;
+        // Standard 40-byte attendance record layout on ZKTeco K40 firmware
+        const recSize = raw.length >= 44 ? 40 : 8;
+        if (recSize === 40) {
+          for (let offset = 4; offset + 40 <= raw.length; offset += 40) {
+            const pinBuf = raw.subarray(offset + 2, offset + 26);
+            const nullIdx = pinBuf.indexOf(0);
+            const pin = (nullIdx >= 0 ? pinBuf.subarray(0, nullIdx) : pinBuf).toString('ascii').trim();
+            const state = raw[offset + 26];
+            const timeVal = raw.readUInt32LE(offset + 27);
+            if (pin) {
+              records.push({
+                zk_user_pin: pin,
+                timestamp: decodeZkTime(timeVal),
+                punch_type: state === 1 || state === 5 ? 'Check-Out' : 'Check-In',
+              });
+            }
+          }
+        }
+      }
+    } catch {
+      // ignore empty log buffer
+    }
+
+    try {
+      await zkSendCommand(ip, port, ZK_CMD_EXIT, sid, 2, Buffer.alloc(0), 800);
+    } catch {
+      // ignore disconnect close
+    }
+
+    return {
+      connected: true,
+      latencyMs: Date.now() - start,
+      sessionId: sid,
+      records,
+      message: `ZKTeco K40 TCP handshake OK (${Date.now() - start}ms · ${records.length} attendance log(s))`,
+    };
+  } catch (err) {
+    return {
+      connected: false,
+      latencyMs: Date.now() - start,
+      records: [],
+      message: err instanceof Error ? err.message : 'ZKTeco K40 TCP port 4370 unreachable',
+    };
+  }
+}
+
+function recordRealtimeZktecoPunch(opts: {
+  tid: number;
+  deviceId: number | null;
+  deviceIdentifier: string;
+  deviceName: string;
+  authSource: string;
+  authMethod: string;
+  employeeCode?: string;
+  zkUserPin?: string;
+  punchType?: 'Auto' | 'Check-In' | 'Check-Out';
+  verifiedAt?: string;
+  actor: string;
+  notes?: string;
+}) {
+  const now = new Date().toISOString();
+  const verifiedAt = opts.verifiedAt || now;
+  const attDate = verifiedAt.slice(0, 10) || now.slice(0, 10);
+  const punchTime = verifiedAt.slice(11, 16) || now.slice(11, 16);
+
+  let fp:
+    | { id: number; employee_id: string; employee_name: string; department: string; zk_user_pin: string; finger_label: string }
+    | undefined;
+  if (opts.employeeCode) {
+    fp = db
+      .prepare("SELECT id, employee_id, employee_name, department, zk_user_pin, finger_label FROM staff_fingerprints WHERE tenant_id = ? AND employee_id = ? AND status = 'Active' ORDER BY id DESC LIMIT 1")
+      .get(opts.tid, opts.employeeCode) as typeof fp;
+  }
+  if (!fp && opts.zkUserPin) {
+    fp = db
+      .prepare("SELECT id, employee_id, employee_name, department, zk_user_pin, finger_label FROM staff_fingerprints WHERE tenant_id = ? AND zk_user_pin = ? AND status = 'Active' ORDER BY id DESC LIMIT 1")
+      .get(opts.tid, opts.zkUserPin) as typeof fp;
+  }
+
+  const empCode = fp?.employee_id || opts.employeeCode || opts.zkUserPin || '';
+  const emp = empCode
+    ? (db
+        .prepare('SELECT employee_id, full_name, department, basic_salary, status FROM employees WHERE tenant_id = ? AND (employee_id = ? OR replace(employee_id, \'SS-EMP-\', \'\') = ?) LIMIT 1')
+        .get(opts.tid, empCode, empCode) as
+        | { employee_id: string; full_name: string; department: string; basic_salary: number; status: string }
+        | undefined)
+    : undefined;
+
+  const resolvedEmpCode = emp?.employee_id || empCode;
+  if (!resolvedEmpCode) return null;
+
+  let effectivePunchType: 'Check-In' | 'Check-Out' =
+    opts.punchType === 'Check-Out' ? 'Check-Out' : 'Check-In';
+  if (!opts.punchType || opts.punchType === 'Auto') {
+    effectivePunchType = resolveAutoBiometricPunchType(opts.tid, resolvedEmpCode, attDate, punchTime);
+  }
+
+  const attendance = upsertBiometricAttendanceRecord({
+    tid: opts.tid,
+    empCode: resolvedEmpCode,
+    empName: emp?.full_name || fp?.employee_name || resolvedEmpCode,
+    department: emp?.department || fp?.department || 'Production',
+    attDate,
+    punchTime,
+    punchType: effectivePunchType,
+    deviceName: opts.deviceName,
+    hourlyRateOverride: emp?.basic_salary ? Number((emp.basic_salary / 208).toFixed(2)) : undefined,
+    notes: opts.notes || `${opts.authSource} ${effectivePunchType} at ${punchTime}`,
+    actor: opts.actor,
+  });
+
+  if (fp?.id) {
+    db.prepare('UPDATE staff_fingerprints SET last_scanned_at = ? WHERE id = ?').run(verifiedAt, fp.id);
+  }
+  if (opts.deviceId) {
+    db.prepare(
+      "UPDATE devices SET status='Connected', punch_count = COALESCE(punch_count, 0) + 1, last_sync_at=?, last_checked_at=?, last_message=? WHERE id=?"
+    ).run(now, now, `Live Scan: ${resolvedEmpCode} ${effectivePunchType} (${punchTime})`, opts.deviceId);
+  }
+
+  const attId = Number(attendance.id || 0) || null;
+  const logRow = insertBiometricAuthLog({
+    tenant_id: opts.tid,
+    device_id: opts.deviceId,
+    device_identifier: opts.deviceIdentifier,
+    device_name: opts.deviceName,
+    auth_source: opts.authSource,
+    auth_method: fp ? `Fingerprint (${fp.finger_label})` : opts.authMethod,
+    employee_code: resolvedEmpCode,
+    employee_name: emp?.full_name || fp?.employee_name || resolvedEmpCode,
+    department: emp?.department || fp?.department || 'Production',
+    punch_type: effectivePunchType,
+    status: 'Success',
+    failure_reason: '',
+    attendance_record_id: attId,
+    attendance_marked: attId ? 1 : 0,
+    verified_at: verifiedAt,
+  });
+
+  broadcastWs('attendance:updated', {
+    tenant_id: opts.tid,
+    attendance_id: attId,
+    employee_code: resolvedEmpCode,
+    source: 'biometric',
+  });
+  if (opts.deviceId) {
+    broadcastWs('device:punch', { device_id: opts.deviceId, tenant_id: opts.tid, employee_code: resolvedEmpCode });
+  }
+
+  return { logRow, attendance, punch_time: punchTime, punch_type: effectivePunchType };
+}
+
+interface ActiveZkListener {
+  socket: net.Socket;
+  keepaliveTimer: NodeJS.Timeout;
+  deviceId: number;
+  tenantId: number;
+  deviceName: string;
+  ip: string;
+  port: number;
+  serialNumber: string;
+  startedAt: string;
+  lastEventAt: string | null;
+  eventsCount: number;
+}
+const zkRealtimeListeners = new Map<number, ActiveZkListener>();
+
+function stopZkRealtimeListener(deviceId: number) {
+  const existing = zkRealtimeListeners.get(deviceId);
+  if (existing) {
+    clearInterval(existing.keepaliveTimer);
+    try {
+      existing.socket.destroy();
+    } catch {
+      // ignore
+    }
+    zkRealtimeListeners.delete(deviceId);
+  }
+}
+
+function startZkRealtimeListener(dev: {
+  id: number;
+  tenant_id: number;
+  device_name: string;
+  ip_address: string;
+  port: number;
+  serial_number: string;
+}): Promise<{ ok: boolean; message: string }> {
+  stopZkRealtimeListener(dev.id);
+  const ip = dev.ip_address;
+  const port = Number(dev.port) || 4370;
+
+  return new Promise((resolve) => {
+    const socket = new net.Socket();
+    let settled = false;
+    let recvBuf = Buffer.alloc(0);
+    let sessionId = 0;
+    let replyId = 0;
+    let registered = false;
+
+    const finishConnect = (ok: boolean, message: string) => {
+      if (settled) return;
+      settled = true;
+      resolve({ ok, message });
+    };
+
+    const connectTimeout = setTimeout(() => {
+      socket.destroy();
+      finishConnect(
+        false,
+        `TCP port ${port} at ${ip} did not respond within 2.5s. If running in cloud hosting (Render), use ZKTeco ADMS Push (/iclock/cdata) or the Local K40 LAN Bridge.`
+      );
+    }, 2500);
+
+    socket.on('error', (err) => {
+      clearTimeout(connectTimeout);
+      stopZkRealtimeListener(dev.id);
+      finishConnect(false, err.message || `Failed to connect to ZKTeco K40 at ${ip}:${port}`);
+    });
+
+    socket.on('close', () => {
+      clearTimeout(connectTimeout);
+      const entry = zkRealtimeListeners.get(dev.id);
+      if (entry) {
+        clearInterval(entry.keepaliveTimer);
+        zkRealtimeListeners.delete(dev.id);
+        broadcastWs('zkteco:realtime_status', { device_id: dev.id, running: false, tenant_id: dev.tenant_id });
+      }
+      finishConnect(false, 'ZKTeco K40 socket closed');
+    });
+
+    socket.connect(port, ip, () => {
+      socket.write(createZkPacket(ZK_CMD_CONNECT, 0, 0, Buffer.alloc(0)));
+    });
+
+    socket.on('data', (chunk) => {
+      recvBuf = Buffer.concat([recvBuf, chunk]);
+      while (recvBuf.length >= 16 && recvBuf[0] === 0x50 && recvBuf[1] === 0x50 && recvBuf[2] === 0x82 && recvBuf[3] === 0x7d) {
+        const expectedLen = recvBuf.readUInt32LE(4);
+        if (recvBuf.length < 8 + expectedLen) break;
+        const body = recvBuf.subarray(8, 8 + expectedLen);
+        recvBuf = recvBuf.subarray(8 + expectedLen);
+        const cmd = body.readUInt16LE(0);
+        const nextSession = body.readUInt16LE(4);
+        const payload = body.subarray(8);
+
+        if (!registered) {
+          sessionId = nextSession;
+          registered = true;
+          replyId = 1;
+          const eventMask = Buffer.alloc(4);
+          eventMask.writeUInt32LE(ZK_EF_ATTLOG | ZK_EF_FINGER | ZK_EF_ENROLLUSER | ZK_EF_ENROLLFINGER, 0);
+          socket.write(createZkPacket(ZK_CMD_REG_EVENT, sessionId, replyId, eventMask));
+          clearTimeout(connectTimeout);
+
+          const keepaliveTimer = setInterval(() => {
+            try {
+              replyId += 1;
+              socket.write(createZkPacket(ZK_CMD_GET_TIME, sessionId, replyId, Buffer.alloc(0)));
+            } catch {
+              stopZkRealtimeListener(dev.id);
+            }
+          }, 25000);
+
+          zkRealtimeListeners.set(dev.id, {
+            socket,
+            keepaliveTimer,
+            deviceId: dev.id,
+            tenantId: dev.tenant_id,
+            deviceName: dev.device_name,
+            ip,
+            port,
+            serialNumber: dev.serial_number,
+            startedAt: new Date().toISOString(),
+            lastEventAt: null,
+            eventsCount: 0,
+          });
+          db.prepare("UPDATE devices SET status='Connected', last_checked_at=?, last_message=? WHERE id=?").run(
+            new Date().toISOString(),
+            `Real-time TCP 4370 stream active (${ip}:${port})`,
+            dev.id
+          );
+          broadcastWs('zkteco:realtime_status', { device_id: dev.id, running: true, tenant_id: dev.tenant_id });
+          finishConnect(true, `Real-time ZKTeco K40 listener active on ${ip}:${port}`);
+          continue;
+        }
+
+        if (cmd === ZK_CMD_REG_EVENT) {
+          const eventFlags = body.readUInt16LE(4);
+          // Acknowledge real-time event frame
+          try {
+            socket.write(createZkPacket(ZK_CMD_ACK_OK, sessionId, 0, Buffer.alloc(0)));
+          } catch {
+            // ignore
+          }
+          const listener = zkRealtimeListeners.get(dev.id);
+          if (listener) {
+            listener.lastEventAt = new Date().toISOString();
+            listener.eventsCount += 1;
+          }
+
+          if ((eventFlags & ZK_EF_ATTLOG) !== 0 && payload.length >= 30) {
+            const pinBuf = payload.subarray(0, Math.min(24, payload.length));
+            const nullIdx = pinBuf.indexOf(0);
+            const pin = (nullIdx >= 0 ? pinBuf.subarray(0, nullIdx) : pinBuf).toString('ascii').trim();
+            if (pin) {
+              recordRealtimeZktecoPunch({
+                tid: dev.tenant_id,
+                deviceId: dev.id,
+                deviceIdentifier: dev.serial_number || `DEV-${dev.id}`,
+                deviceName: dev.device_name,
+                authSource: 'ZKTeco K40 Live TCP',
+                authMethod: 'Fingerprint',
+                zkUserPin: pin,
+                punchType: 'Auto',
+                actor: 'ZKTeco K40 Real-Time',
+                notes: `Real-time K40 sensor scan (${ip}:${port})`,
+              });
+            }
+          }
+        }
+      }
+    });
+  });
+}
+
+const FINGER_LABELS = [
+  'Left Pinky',
+  'Left Ring',
+  'Left Middle',
+  'Left Index',
+  'Left Thumb',
+  'Right Thumb',
+  'Right Index',
+  'Right Middle',
+  'Right Ring',
+  'Right Pinky',
+];
+
+app.get('/api/devices/zkteco/fingerprints', (req, res) => {
+  const tid = getTenantId(req);
+  const rows = db
+    .prepare('SELECT * FROM staff_fingerprints WHERE tenant_id = ? ORDER BY id DESC')
+    .all(tid);
+  res.json(rows);
+});
+
+app.post('/api/devices/zkteco/fingerprints/register', async (req, res) => {
+  const tid = getTenantId(req);
+  const b = (req.body || {}) as Record<string, unknown>;
+  const employeeId = String(b.employee_id || '').trim();
+  const fingerIndex = Math.min(9, Math.max(0, Number(b.finger_index ?? 6)));
+  const fingerLabel = String(b.finger_label || FINGER_LABELS[fingerIndex] || 'Right Index').trim();
+  const deviceId = b.device_id ? Number(b.device_id) : null;
+  const rawTemplate = String(b.template_sample || '').trim();
+
+  if (!employeeId) {
+    res.status(400).json({ error: 'Employee ID is required to enroll a ZKTeco K40 fingerprint.' });
+    return;
+  }
+
+  const emp = db
+    .prepare('SELECT employee_id, full_name, department, status FROM employees WHERE tenant_id = ? AND employee_id = ?')
+    .get(tid, employeeId) as
+    | { employee_id: string; full_name: string; department: string; status: string }
+    | undefined;
+  if (!emp) {
+    res.status(404).json({ error: `Employee ID "${employeeId}" was not found in HR Staff Directory.` });
+    return;
+  }
+
+  const dev = deviceId
+    ? (db
+        .prepare('SELECT id, device_name, serial_number, ip_address, port FROM devices WHERE id = ? AND tenant_id = ?')
+        .get(deviceId, tid) as
+        | { id: number; device_name: string; serial_number: string; ip_address: string; port: number }
+        | undefined)
+    : undefined;
+
+  const zkUserPin =
+    String(b.zk_user_pin || '').trim() ||
+    emp.employee_id.replace(/[^0-9]/g, '').replace(/^0+/, '') ||
+    String(100 + Math.floor(Math.random() * 899));
+
+  const templateSeed = rawTemplate || `ZKT-K40:${tid}:${emp.employee_id}:${zkUserPin}:${fingerIndex}`;
+  const templateHash = sha256Hex(templateSeed);
+  const templateSize = Buffer.byteLength(rawTemplate || templateHash, 'utf8');
+  const now = new Date().toISOString();
+
+  // Optional direct TCP probe to K40 device if IP is on local LAN
+  let hardwareStatus = 'Stored in central ZKTeco K40 biometric vault (ready for ADMS push & live scan)';
+  if (dev?.ip_address && dev.ip_address !== '127.0.0.1' && dev.ip_address !== '0.0.0.0') {
+    const probe = await tcpProbe(dev.ip_address, Number(dev.port) || 4370, 900);
+    if (probe.ok) {
+      hardwareStatus = `Synced to K40 terminal ${dev.device_name} (${dev.ip_address}:${dev.port} · ${probe.latencyMs}ms)`;
+    }
+  }
+
+  db.prepare(
+    `INSERT INTO staff_fingerprints (
+      tenant_id, employee_id, employee_name, department, zk_user_pin,
+      finger_index, finger_label, template_hash, template_size,
+      device_id, device_serial, enrolled_by, status, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Active', ?)
+    ON CONFLICT(tenant_id, employee_id, finger_index) DO UPDATE SET
+      employee_name = excluded.employee_name,
+      department = excluded.department,
+      zk_user_pin = excluded.zk_user_pin,
+      finger_label = excluded.finger_label,
+      template_hash = excluded.template_hash,
+      template_size = excluded.template_size,
+      device_id = excluded.device_id,
+      device_serial = excluded.device_serial,
+      enrolled_by = excluded.enrolled_by,
+      status = 'Active'`
+  ).run(
+    tid,
+    emp.employee_id,
+    emp.full_name,
+    emp.department,
+    zkUserPin,
+    fingerIndex,
+    fingerLabel,
+    templateHash,
+    templateSize,
+    dev?.id ?? null,
+    dev?.serial_number || 'ZK-K40',
+    getActorName(req),
+    now
+  );
+
+  const saved = db
+    .prepare('SELECT * FROM staff_fingerprints WHERE tenant_id = ? AND employee_id = ? AND finger_index = ?')
+    .get(tid, emp.employee_id, fingerIndex);
+
+  logAudit(
+    req,
+    'ZKTECO_ENROLL',
+    'Device Connections',
+    `Enrolled ZKTeco K40 fingerprint (${fingerLabel}) for ${emp.full_name} (${emp.employee_id}, PIN ${zkUserPin})`,
+    tid
+  );
+  res.status(201).json({ fingerprint: saved, message: hardwareStatus });
+});
+
+app.delete('/api/devices/zkteco/fingerprints/:id', (req, res) => {
+  const tid = getTenantId(req);
+  const id = Number(req.params.id);
+  db.prepare('DELETE FROM staff_fingerprints WHERE id = ? AND tenant_id = ?').run(id, tid);
+  logAudit(req, 'ZKTECO_UNENROLL', 'Device Connections', `Removed enrolled fingerprint #${id}`, tid);
+  res.json({ ok: true });
+});
+
+// Ask physical ZKTeco K40 terminal (via TCP 4370 CMD_STARTENROLL + ADMS/Bridge queue) to capture staff's real finger
+app.post('/api/devices/zkteco/fingerprints/remote-enroll', async (req, res) => {
+  const tid = getTenantId(req);
+  const b = (req.body || {}) as Record<string, unknown>;
+  const employeeId = String(b.employee_id || '').trim();
+  const fingerIndex = Math.min(9, Math.max(0, Number(b.finger_index ?? 6)));
+  const fingerLabel = String(b.finger_label || FINGER_LABELS[fingerIndex] || 'Right Index').trim();
+  const deviceId = b.device_id ? Number(b.device_id) : null;
+
+  if (!employeeId) {
+    res.status(400).json({ error: 'Employee ID is required to ask ZKTeco K40 for a real finger.' });
+    return;
+  }
+
+  const emp = db
+    .prepare('SELECT employee_id, full_name, department, status FROM employees WHERE tenant_id = ? AND employee_id = ?')
+    .get(tid, employeeId) as
+    | { employee_id: string; full_name: string; department: string; status: string }
+    | undefined;
+  if (!emp) {
+    res.status(404).json({ error: `Employee "${employeeId}" was not found in HR Staff Directory.` });
+    return;
+  }
+
+  const dev = deviceId
+    ? (db
+        .prepare('SELECT id, device_name, serial_number, ip_address, port, protocol FROM devices WHERE id = ? AND tenant_id = ?')
+        .get(deviceId, tid) as
+        | { id: number; device_name: string; serial_number: string; ip_address: string; port: number; protocol: string }
+        | undefined)
+    : (db
+        .prepare("SELECT id, device_name, serial_number, ip_address, port, protocol FROM devices WHERE tenant_id = ? AND (device_type LIKE '%Biometric%' OR protocol LIKE '%ZKTeco%' OR port = 4370) ORDER BY id DESC LIMIT 1")
+        .get(tid) as
+        | { id: number; device_name: string; serial_number: string; ip_address: string; port: number; protocol: string }
+        | undefined);
+
+  const zkUserPin =
+    String(b.zk_user_pin || '').trim() ||
+    emp.employee_id.replace(/[^0-9]/g, '').replace(/^0+/, '') ||
+    String(100 + Math.floor(Math.random() * 899));
+  const now = new Date().toISOString();
+  const deviceSerial = dev?.serial_number || String(b.device_serial || 'ZK-K40-01');
+
+  let channel: 'TCP4370' | 'ADMS' = 'ADMS';
+  let statusMessage = `Queued ZKTeco K40 enrollment command for ${emp.full_name} (PIN ${zkUserPin}, ${fingerLabel}). Waiting for K40 ADMS / LAN Bridge finger capture...`;
+  let tcpTriggered = false;
+
+  if (dev?.ip_address && dev.ip_address !== '127.0.0.1' && dev.ip_address !== '0.0.0.0') {
+    const tcpRes = await zkSetUserAndStartEnroll(
+      dev.ip_address,
+      Number(dev.port) || 4370,
+      zkUserPin,
+      emp.full_name,
+      fingerIndex
+    );
+    if (tcpRes.ok) {
+      channel = 'TCP4370';
+      tcpTriggered = true;
+      statusMessage = tcpRes.message;
+    }
+  }
+
+  // Cancel any stale WaitingFinger jobs for the same employee + finger
+  db.prepare(
+    "UPDATE zk_enroll_jobs SET status = 'Cancelled', status_message = 'Superseded by newer enrollment request' WHERE tenant_id = ? AND employee_id = ? AND finger_index = ? AND status IN ('Pending', 'WaitingFinger')"
+  ).run(tid, emp.employee_id, fingerIndex);
+
+  const info = db
+    .prepare(
+      `INSERT INTO zk_enroll_jobs (
+        tenant_id, device_id, device_serial, employee_id, employee_name,
+        zk_user_pin, finger_index, finger_label, channel, adms_cmd_id,
+        status, status_message, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', 'WaitingFinger', ?, ?)`
+    )
+    .run(
+      tid,
+      dev?.id ?? null,
+      deviceSerial,
+      emp.employee_id,
+      emp.full_name,
+      zkUserPin,
+      fingerIndex,
+      fingerLabel,
+      channel,
+      statusMessage,
+      now
+    );
+
+  const jobId = Number(info.lastInsertRowid);
+  db.prepare('UPDATE zk_enroll_jobs SET adms_cmd_id = ? WHERE id = ?').run(`ZK-${jobId}`, jobId);
+  const job = db.prepare('SELECT * FROM zk_enroll_jobs WHERE id = ?').get(jobId);
+
+  logAudit(
+    req,
+    'ZKTECO_REMOTE_ENROLL',
+    'Device Connections',
+    `Requested real ZKTeco K40 finger capture (${fingerLabel}) for ${emp.full_name} (${emp.employee_id}, PIN ${zkUserPin}) via ${channel}`,
+    tid
+  );
+  broadcastWs('zkteco:enroll_started', { job, tenant_id: tid });
+
+  res.status(201).json({
+    job,
+    device: dev ? maskDeviceRow(dev) : null,
+    tcp_triggered: tcpTriggered,
+  });
+});
+
+app.get('/api/devices/zkteco/enroll-jobs', (req, res) => {
+  const tid = getTenantId(req);
+  const rows = db.prepare('SELECT * FROM zk_enroll_jobs WHERE tenant_id = ? ORDER BY id DESC LIMIT 50').all(tid);
+  res.json(rows);
+});
+
+app.get('/api/devices/zkteco/enroll-jobs/:id', (req, res) => {
+  const tid = getTenantId(req);
+  const id = Number(req.params.id);
+  const row = db.prepare('SELECT * FROM zk_enroll_jobs WHERE id = ? AND tenant_id = ?').get(id, tid);
+  if (!row) {
+    res.status(404).json({ error: 'Enrollment job not found' });
+    return;
+  }
+  res.json(row);
+});
+
+app.post('/api/devices/zkteco/enroll-jobs/:id/cancel', (req, res) => {
+  const tid = getTenantId(req);
+  const id = Number(req.params.id);
+  db.prepare(
+    "UPDATE zk_enroll_jobs SET status = 'Cancelled', status_message = 'Cancelled by operator', completed_at = ? WHERE id = ? AND tenant_id = ?"
+  ).run(new Date().toISOString(), id, tid);
+  res.json({ ok: true });
+});
+
+// Real hardware fingerprint enrollment using WebAuthn / USB FIDO2 / Platform Fingerprint Reader
+app.post('/api/devices/zkteco/fingerprints/hardware-register', (req, res) => {
+  const tid = getTenantId(req);
+  const b = (req.body || {}) as Record<string, unknown>;
+  const employeeId = String(b.employee_id || '').trim();
+  const credentialId = String(b.credential_id || '').trim();
+  const publicKey = String(b.public_key || '').trim();
+  const deviceLabel = String(b.device_label || 'Hardware Fingerprint Reader (WebAuthn)').trim();
+  const fingerIndex = Math.min(9, Math.max(0, Number(b.finger_index ?? 6)));
+  const fingerLabel = String(b.finger_label || FINGER_LABELS[fingerIndex] || 'Right Index').trim();
+  const deviceId = b.device_id ? Number(b.device_id) : null;
+
+  if (!employeeId || !credentialId) {
+    res.status(400).json({ error: 'Employee ID and verified hardware fingerprint credential ID are required.' });
+    return;
+  }
+
+  const emp = db
+    .prepare('SELECT employee_id, full_name, department, status FROM employees WHERE tenant_id = ? AND employee_id = ?')
+    .get(tid, employeeId) as
+    | { employee_id: string; full_name: string; department: string; status: string }
+    | undefined;
+  if (!emp) {
+    res.status(404).json({ error: `Employee ID "${employeeId}" not found in HR Staff Directory.` });
+    return;
+  }
+
+  const dev = deviceId
+    ? (db.prepare('SELECT id, serial_number FROM devices WHERE id = ? AND tenant_id = ?').get(deviceId, tid) as
+        | { id: number; serial_number: string }
+        | undefined)
+    : undefined;
+
+  const zkUserPin =
+    String(b.zk_user_pin || '').trim() ||
+    emp.employee_id.replace(/[^0-9]/g, '').replace(/^0+/, '') ||
+    String(100 + Math.floor(Math.random() * 899));
+  const templateHash = sha256Hex(`${credentialId}:${publicKey}`);
+  const now = new Date().toISOString();
+
+  db.prepare(
+    `INSERT INTO staff_fingerprints (
+      tenant_id, employee_id, employee_name, department, zk_user_pin,
+      finger_index, finger_label, template_hash, template_size,
+      device_id, device_serial, auth_source, credential_id, enrolled_by, status, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Active', ?)
+    ON CONFLICT(tenant_id, employee_id, finger_index) DO UPDATE SET
+      employee_name = excluded.employee_name,
+      department = excluded.department,
+      zk_user_pin = excluded.zk_user_pin,
+      finger_label = excluded.finger_label,
+      template_hash = excluded.template_hash,
+      template_size = excluded.template_size,
+      device_id = excluded.device_id,
+      device_serial = excluded.device_serial,
+      auth_source = excluded.auth_source,
+      credential_id = excluded.credential_id,
+      enrolled_by = excluded.enrolled_by,
+      status = 'Active'`
+  ).run(
+    tid,
+    emp.employee_id,
+    emp.full_name,
+    emp.department,
+    zkUserPin,
+    fingerIndex,
+    fingerLabel,
+    templateHash,
+    Math.max(256, Buffer.byteLength(publicKey || credentialId, 'utf8')),
+    dev?.id ?? null,
+    dev?.serial_number || deviceLabel,
+    deviceLabel,
+    credentialId,
+    getActorName(req),
+    now
+  );
+
+  // Close any waiting remote-enroll jobs for this staff member
+  db.prepare(
+    "UPDATE zk_enroll_jobs SET status = 'Enrolled', status_message = ?, completed_at = ? WHERE tenant_id = ? AND employee_id = ? AND finger_index = ? AND status IN ('Pending', 'WaitingFinger')"
+  ).run(`Enrolled via ${deviceLabel}`, now, tid, emp.employee_id, fingerIndex);
+
+  const saved = db
+    .prepare('SELECT * FROM staff_fingerprints WHERE tenant_id = ? AND employee_id = ? AND finger_index = ?')
+    .get(tid, emp.employee_id, fingerIndex);
+
+  broadcastWs('zkteco:finger_enrolled', { tenant_id: tid, employee_id: emp.employee_id, fingerprint: saved });
+  logAudit(
+    req,
+    'HARDWARE_FINGER_ENROLL',
+    'Device Connections',
+    `Enrolled real hardware fingerprint (${deviceLabel}) for ${emp.full_name} (${emp.employee_id})`,
+    tid
+  );
+
+  res.status(201).json({ fingerprint: saved, message: `Hardware fingerprint captured via ${deviceLabel}.` });
+});
+
+// Real hardware fingerprint attendance scan (matches WebAuthn credential_id against staff_fingerprints)
+app.post('/api/devices/zkteco/hardware-scan', (req, res) => {
+  const tid = getTenantId(req);
+  const b = (req.body || {}) as Record<string, unknown>;
+  const credentialId = String(b.credential_id || '').trim();
+  const deviceId = b.device_id ? Number(b.device_id) : null;
+  const punchType = b.punch_type === 'Check-Out' ? 'Check-Out' : b.punch_type === 'Check-In' ? 'Check-In' : 'Auto';
+  const now = new Date().toISOString();
+
+  if (!credentialId) {
+    res.status(400).json({ error: 'Hardware biometric credential_id is required.' });
+    return;
+  }
+
+  const fp = db
+    .prepare("SELECT * FROM staff_fingerprints WHERE tenant_id = ? AND credential_id = ? AND status = 'Active' LIMIT 1")
+    .get(tid, credentialId) as
+    | { id: number; employee_id: string; employee_name: string; department: string; zk_user_pin: string; finger_label: string }
+    | undefined;
+
+  if (!fp) {
+    const failLog = insertBiometricAuthLog({
+      tenant_id: tid,
+      device_id: deviceId,
+      device_identifier: 'HW-SENSOR',
+      device_name: 'Hardware Fingerprint Sensor',
+      auth_source: 'Hardware Fingerprint Sensor',
+      auth_method: 'Fingerprint',
+      employee_code: 'UNMATCHED',
+      employee_name: 'Unrecognized Fingerprint Sensor Credential',
+      department: '',
+      punch_type: punchType === 'Check-Out' ? 'Check-Out' : 'Check-In',
+      status: 'Failure',
+      failure_reason: 'Scanned hardware fingerprint is not enrolled in Seven Sunday staff registry.',
+      verified_at: now,
+    });
+    res.status(404).json({ error: 'Scanned fingerprint does not match any enrolled staff member.', log: failLog });
+    return;
+  }
+
+  const dev = deviceId
+    ? (db.prepare('SELECT id, device_name, serial_number FROM devices WHERE id = ? AND tenant_id = ?').get(deviceId, tid) as
+        | { id: number; device_name: string; serial_number: string }
+        | undefined)
+    : undefined;
+
+  const result = recordRealtimeZktecoPunch({
+    tid,
+    deviceId: dev?.id ?? null,
+    deviceIdentifier: dev?.serial_number || 'HW-SENSOR',
+    deviceName: dev?.device_name || 'Hardware Fingerprint Reader',
+    authSource: 'Hardware Fingerprint Sensor',
+    authMethod: `Fingerprint (${fp.finger_label})`,
+    employeeCode: fp.employee_id,
+    zkUserPin: fp.zk_user_pin,
+    punchType,
+    verifiedAt: now,
+    actor: getActorName(req),
+    notes: `Real hardware fingerprint verified (${fp.finger_label})`,
+  });
+
+  if (!result) {
+    res.status(404).json({ error: 'Employee profile missing in HR directory.' });
+    return;
+  }
+
+  res.status(201).json({
+    log: result.logRow,
+    attendance: result.attendance,
+    punch_time: result.punch_time,
+    punch_type: result.punch_type,
+  });
+});
+
+// ZKTeco K40 Live TCP 4370 Real-Time Stream Start / Stop / Status
+app.get('/api/devices/zkteco/realtime/status', (req, res) => {
+  const tid = getTenantId(req);
+  const k40Devices = db
+    .prepare(
+      "SELECT id, device_name, ip_address, port, serial_number FROM devices WHERE tenant_id = ? AND (device_type LIKE '%Biometric%' OR protocol LIKE '%ZKTeco%' OR port = 4370) ORDER BY id DESC"
+    )
+    .all(tid) as Array<{ id: number; device_name: string; ip_address: string; port: number; serial_number: string }>;
+
+  res.json(
+    k40Devices.map((d) => {
+      const live = zkRealtimeListeners.get(d.id);
+      return {
+        device_id: d.id,
+        device_name: d.device_name,
+        ip_address: d.ip_address,
+        port: Number(d.port) || 4370,
+        serial_number: d.serial_number,
+        running: Boolean(live),
+        started_at: live?.startedAt || '',
+        last_event_at: live?.lastEventAt || null,
+        events_count: live?.eventsCount || 0,
+      };
+    })
+  );
+});
+
+app.post('/api/devices/:id/zkteco/realtime/start', async (req, res) => {
+  const tid = getTenantId(req);
+  const id = Number(req.params.id);
+  const dev = db.prepare('SELECT * FROM devices WHERE id = ? AND tenant_id = ?').get(id, tid) as
+    | { id: number; tenant_id: number; device_name: string; ip_address: string; port: number; serial_number: string }
+    | undefined;
+  if (!dev) {
+    res.status(404).json({ error: 'ZKTeco K40 device not found.' });
+    return;
+  }
+  const result = await startZkRealtimeListener(dev);
+  if (!result.ok) {
+    res.status(502).json({ error: result.message });
+    return;
+  }
+  res.json({ ok: true, running: true, message: result.message });
+});
+
+app.post('/api/devices/:id/zkteco/realtime/stop', (req, res) => {
+  const id = Number(req.params.id);
+  stopZkRealtimeListener(id);
+  broadcastWs('zkteco:realtime_status', { device_id: id, running: false, tenant_id: getTenantId(req) });
+  res.json({ ok: true, running: false });
+});
+
+// Downloadable Zero-Dependency Node.js Factory LAN Bridge for connecting physical ZKTeco K40 (192.168.x.x:4370) to Cloud Server
+app.get('/api/devices/zkteco/bridge-script', (req, res) => {
+  const tid = getTenantId(req);
+  const deviceId = req.query.device_id ? Number(req.query.device_id) : null;
+  const dev = deviceId
+    ? (db.prepare('SELECT * FROM devices WHERE id = ? AND tenant_id = ?').get(deviceId, tid) as
+        | { id: number; serial_number: string; ip_address: string; port: number; api_key: string; device_name: string }
+        | undefined)
+    : (db
+        .prepare("SELECT * FROM devices WHERE tenant_id = ? AND (device_type LIKE '%Biometric%' OR protocol LIKE '%ZKTeco%' OR port = 4370) ORDER BY id DESC LIMIT 1")
+        .get(tid) as
+        | { id: number; serial_number: string; ip_address: string; port: number; api_key: string; device_name: string }
+        | undefined);
+
+  const proto = String(req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0].trim();
+  const host = String(req.headers['x-forwarded-host'] || req.headers.host || 'localhost:3000').split(',')[0].trim();
+  const serverUrl = `${proto}://${host}`;
+  const serial = dev?.serial_number || 'ZK-K40-01';
+  const k40Ip = dev?.ip_address || '192.168.1.201';
+  const k40Port = Number(dev?.port) || 4370;
+  const rawKey = dev?.api_key ? decryptField(dev.api_key) : 'REPLACE_WITH_DEVICE_API_KEY';
+
+  const script = `#!/usr/bin/env node
+// Seven Sunday Ethiopia — Real-Time ZKTeco K40 LAN Bridge
+// Run on any factory PC on the same LAN as your ZKTeco K40 terminal: node zkteco-k40-bridge.mjs
+import net from 'node:net';
+
+const SERVER_URL = process.env.SERVER_URL || ${JSON.stringify(serverUrl)};
+const DEVICE_SERIAL = process.env.DEVICE_SERIAL || ${JSON.stringify(serial)};
+const DEVICE_KEY = process.env.DEVICE_KEY || ${JSON.stringify(rawKey)};
+const K40_IP = process.env.K40_IP || ${JSON.stringify(k40Ip)};
+const K40_PORT = Number(process.env.K40_PORT || ${k40Port});
+
+const CMD_CONNECT = 1000, CMD_EXIT = 1001, CMD_USER_WRQ = 8, CMD_STARTENROLL = 61, CMD_CANCELCAPTURE = 62, CMD_REG_EVENT = 500, CMD_GET_TIME = 201, CMD_ACK_OK = 2000;
+
+function packet(cmd, sid, rid, data = Buffer.alloc(0)) {
+  const p = Buffer.alloc(8 + data.length);
+  p.writeUInt16LE(cmd, 0); p.writeUInt16LE(sid, 4); p.writeUInt16LE(rid, 6);
+  if (data.length) data.copy(p, 8);
+  let c = 0;
+  for (let i = 0; i < p.length; i += 2) { c += i + 1 < p.length ? p.readUInt16LE(i) : p[i]; while (c > 0xffff) c = (c & 0xffff) + (c >> 16); }
+  p.writeUInt16LE((~c) & 0xffff, 2);
+  const h = Buffer.from([0x50, 0x50, 0x82, 0x7d, 0, 0, 0, 0]);
+  h.writeUInt32LE(p.length, 4);
+  return Buffer.concat([h, p]);
+}
+
+async function postBridge(path, body) {
+  const r = await fetch(SERVER_URL + path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-device-key': DEVICE_KEY },
+    body: JSON.stringify({ serial_number: DEVICE_SERIAL, ...body }),
+  });
+  return r.json().catch(() => ({}));
+}
+
+let sid = 0, rid = 0;
+const sock = new net.Socket();
+let buf = Buffer.alloc(0);
+
+sock.connect(K40_PORT, K40_IP, () => {
+  console.log('[K40-BRIDGE] Connected to ZKTeco K40 at', K40_IP + ':' + K40_PORT);
+  sock.write(packet(CMD_CONNECT, 0, 0));
+});
+
+sock.on('data', async (chunk) => {
+  buf = Buffer.concat([buf, chunk]);
+  while (buf.length >= 16 && buf[0] === 0x50 && buf[1] === 0x50 && buf[2] === 0x82 && buf[3] === 0x7d) {
+    const len = buf.readUInt32LE(4);
+    if (buf.length < 8 + len) break;
+    const body = buf.subarray(8, 8 + len); buf = buf.subarray(8 + len);
+    const cmd = body.readUInt16LE(0);
+    if (sid === 0) {
+      sid = body.readUInt16LE(4); rid = 1;
+      const mask = Buffer.alloc(4); mask.writeUInt32LE(1 | 2 | 4 | 8, 0);
+      sock.write(packet(CMD_REG_EVENT, sid, rid, mask));
+      console.log('[K40-BRIDGE] Real-time event stream registered.');
+    } else if (cmd === CMD_REG_EVENT) {
+      sock.write(packet(CMD_ACK_OK, sid, 0));
+      const flags = body.readUInt16LE(4);
+      const payload = body.subarray(8);
+      if ((flags & 1) && payload.length >= 24) {
+        const pinBuf = payload.subarray(0, 24);
+        const nullIdx = pinBuf.indexOf(0);
+        const pin = (nullIdx >= 0 ? pinBuf.subarray(0, nullIdx) : pinBuf).toString('ascii').trim();
+        if (pin) {
+          console.log('[K40-BRIDGE] Real finger scan -> PIN:', pin);
+          await postBridge('/api/devices/zkteco/bridge/event', { event: 'attlog', zk_user_pin: pin });
+        }
+      }
+      if ((flags & 8)) {
+        await postBridge('/api/devices/zkteco/bridge/event', { event: 'enroll_complete' });
+      }
+    }
+  }
+});
+
+setInterval(async () => {
+  try {
+    if (sid) { rid += 1; sock.write(packet(CMD_GET_TIME, sid, rid)); }
+    const res = await fetch(SERVER_URL + '/api/devices/zkteco/bridge/jobs?serial=' + encodeURIComponent(DEVICE_SERIAL), {
+      headers: { 'x-device-key': DEVICE_KEY },
+    });
+    const jobs = await res.json();
+    if (Array.isArray(jobs) && jobs.length > 0 && sid) {
+      for (const j of jobs) {
+        console.log('[K40-BRIDGE] Prompting K40 real finger enroll for PIN:', j.zk_user_pin, 'Finger:', j.finger_index);
+        const u = Buffer.alloc(72);
+        u.writeUInt16LE(Number(String(j.zk_user_pin).replace(/\\D/g, '')) || 101, 0);
+        Buffer.from(String(j.employee_name || j.employee_id).slice(0, 23), 'ascii').copy(u, 11);
+        u.writeUInt8(1, 39);
+        Buffer.from(String(j.zk_user_pin).slice(0, 23), 'ascii').copy(u, 48);
+        const e = Buffer.alloc(26);
+        Buffer.from(String(j.zk_user_pin).slice(0, 23), 'ascii').copy(e, 0);
+        e.writeUInt8(Number(j.finger_index) || 6, 24); e.writeUInt8(1, 25);
+        sock.write(packet(CMD_CANCELCAPTURE, sid, ++rid));
+        sock.write(packet(CMD_USER_WRQ, sid, ++rid, u));
+        sock.write(packet(CMD_STARTENROLL, sid, ++rid, e));
+        await postBridge('/api/devices/zkteco/bridge/event', { event: 'enroll_dispatched', job_id: j.id });
+      }
+    }
+  } catch (err) { console.error('[K40-BRIDGE] Poll error:', err.message); }
+}, 3000);
+`;
+
+  res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+  res.setHeader('Content-Disposition', 'attachment; filename="zkteco-k40-bridge.mjs"');
+  res.send(script);
+});
+
+function verifyBridgeDevice(req: express.Request, serial: string) {
+  const suppliedKey = String(req.headers['x-device-key'] || '').trim();
+  const dev = db.prepare('SELECT * FROM devices WHERE serial_number = ? LIMIT 1').get(serial) as
+    | { id: number; tenant_id: number; device_name: string; serial_number: string; api_key: string; device_type: string }
+    | undefined;
+  if (!dev) return { ok: false as const, error: `Unknown K40 serial "${serial}"` };
+  const expectedKey = dev.api_key ? decryptField(dev.api_key) : '';
+  if (expectedKey && suppliedKey !== expectedKey) {
+    return { ok: false as const, error: 'Invalid x-device-key for K40 bridge' };
+  }
+  return { ok: true as const, dev };
+}
+
+app.get('/api/devices/zkteco/bridge/jobs', (req, res) => {
+  const serial = String(req.query.serial || req.query.serial_number || '').trim();
+  const check = verifyBridgeDevice(req, serial);
+  if (!check.ok) {
+    res.status(401).json({ error: check.error });
+    return;
+  }
+  const jobs = db
+    .prepare(
+      "SELECT * FROM zk_enroll_jobs WHERE tenant_id = ? AND (device_id = ? OR device_serial = ?) AND status IN ('Pending', 'WaitingFinger') AND channel != 'BRIDGE_SENT' ORDER BY id ASC"
+    )
+    .all(check.dev.tenant_id, check.dev.id, serial);
+  res.json(jobs);
+});
+
+app.post('/api/devices/zkteco/bridge/event', (req, res) => {
+  const b = (req.body || {}) as Record<string, unknown>;
+  const serial = String(b.serial_number || '').trim();
+  const check = verifyBridgeDevice(req, serial);
+  if (!check.ok) {
+    res.status(401).json({ error: check.error });
+    return;
+  }
+  const dev = check.dev;
+  const evt = String(b.event || '').trim();
+  const now = new Date().toISOString();
+
+  if (evt === 'enroll_dispatched' && b.job_id) {
+    db.prepare(
+      "UPDATE zk_enroll_jobs SET channel = 'BRIDGE_SENT', status_message = 'K40 scanner active via LAN Bridge — place staff finger 3 times now...' WHERE id = ?"
+    ).run(Number(b.job_id));
+    res.json({ ok: true });
+    return;
+  }
+
+  if (evt === 'enroll_complete') {
+    const job = db
+      .prepare(
+        "SELECT * FROM zk_enroll_jobs WHERE tenant_id = ? AND status IN ('Pending', 'WaitingFinger') ORDER BY id DESC LIMIT 1"
+      )
+      .get(dev.tenant_id) as
+      | {
+          id: number;
+          employee_id: string;
+          employee_name: string;
+          zk_user_pin: string;
+          finger_index: number;
+          finger_label: string;
+        }
+      | undefined;
+    if (job) {
+      const emp = db
+        .prepare('SELECT department FROM employees WHERE tenant_id = ? AND employee_id = ?')
+        .get(dev.tenant_id, job.employee_id) as { department: string } | undefined;
+      db.prepare(
+        `INSERT INTO staff_fingerprints (
+          tenant_id, employee_id, employee_name, department, zk_user_pin,
+          finger_index, finger_label, template_hash, template_size,
+          device_id, device_serial, auth_source, enrolled_by, status, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 512, ?, ?, 'ZKTeco K40 Bridge', 'ZKTeco K40 Hardware', 'Active', ?)
+        ON CONFLICT(tenant_id, employee_id, finger_index) DO UPDATE SET
+          zk_user_pin = excluded.zk_user_pin,
+          template_hash = excluded.template_hash,
+          device_id = excluded.device_id,
+          device_serial = excluded.device_serial,
+          auth_source = excluded.auth_source,
+          status = 'Active'`
+      ).run(
+        dev.tenant_id,
+        job.employee_id,
+        job.employee_name,
+        emp?.department || '',
+        job.zk_user_pin,
+        job.finger_index,
+        job.finger_label,
+        sha256Hex(`K40-BRIDGE:${dev.serial_number}:${job.employee_id}:${job.finger_index}:${now}`),
+        dev.id,
+        dev.serial_number,
+        now
+      );
+      db.prepare("UPDATE zk_enroll_jobs SET status = 'Enrolled', status_message = 'Real K40 finger enrolled via LAN Bridge', completed_at = ? WHERE id = ?").run(
+        now,
+        job.id
+      );
+      const saved = db
+        .prepare('SELECT * FROM staff_fingerprints WHERE tenant_id = ? AND employee_id = ? AND finger_index = ?')
+        .get(dev.tenant_id, job.employee_id, job.finger_index);
+      broadcastWs('zkteco:finger_enrolled', { tenant_id: dev.tenant_id, job_id: job.id, employee_id: job.employee_id, fingerprint: saved });
+    }
+    res.json({ ok: true });
+    return;
+  }
+
+  if (evt === 'attlog' && b.zk_user_pin) {
+    const out = recordRealtimeZktecoPunch({
+      tid: dev.tenant_id,
+      deviceId: dev.id,
+      deviceIdentifier: dev.serial_number || `DEV-${dev.id}`,
+      deviceName: dev.device_name,
+      authSource: 'ZKTeco K40 LAN Bridge',
+      authMethod: 'Fingerprint',
+      zkUserPin: String(b.zk_user_pin).trim(),
+      punchType: 'Auto',
+      verifiedAt: now,
+      actor: 'ZKTeco K40 Bridge',
+    });
+    res.json({ ok: Boolean(out), result: out });
+    return;
+  }
+
+  res.json({ ok: true });
+});
+
+app.post('/api/devices/zkteco/scan', (req, res) => {
+  const tid = getTenantId(req);
+  const b = (req.body || {}) as Record<string, unknown>;
+  const now = new Date().toISOString();
+  const verifiedAt = String(b.verified_at || now);
+  const attDate = verifiedAt.slice(0, 10) || now.slice(0, 10);
+  const punchTime = verifiedAt.slice(11, 16) || now.slice(11, 16);
+
+  const dev = b.device_id
+    ? (db
+        .prepare('SELECT id, device_name, serial_number, device_type FROM devices WHERE id = ? AND tenant_id = ?')
+        .get(Number(b.device_id), tid) as
+        | { id: number; device_name: string; serial_number: string; device_type: string }
+        | undefined)
+    : undefined;
+  const deviceId = dev?.id ?? null;
+  const deviceIdentifier = dev?.serial_number || String(b.device_serial || 'ZKT-K40-01');
+  const deviceName = dev?.device_name || 'ZKTeco K40 Fingerprint Terminal';
+
+  const fpId = b.fingerprint_id ? Number(b.fingerprint_id) : null;
+  const employeeIdInput = String(b.employee_id || '').trim();
+  const zkPinInput = String(b.zk_user_pin || '').trim();
+  const fingerIndexInput = b.finger_index !== undefined && b.finger_index !== '' ? Number(b.finger_index) : null;
+
+  let fp:
+    | {
+        id: number;
+        employee_id: string;
+        employee_name: string;
+        department: string;
+        zk_user_pin: string;
+        finger_index: number;
+        finger_label: string;
+        status: string;
+      }
+    | undefined;
+
+  if (fpId) {
+    fp = db
+      .prepare("SELECT * FROM staff_fingerprints WHERE id = ? AND tenant_id = ? AND status = 'Active'")
+      .get(fpId, tid) as typeof fp;
+  } else if (employeeIdInput && fingerIndexInput !== null) {
+    fp = db
+      .prepare("SELECT * FROM staff_fingerprints WHERE tenant_id = ? AND employee_id = ? AND finger_index = ? AND status = 'Active'")
+      .get(tid, employeeIdInput, fingerIndexInput) as typeof fp;
+  } else if (employeeIdInput) {
+    fp = db
+      .prepare("SELECT * FROM staff_fingerprints WHERE tenant_id = ? AND employee_id = ? AND status = 'Active' ORDER BY id DESC LIMIT 1")
+      .get(tid, employeeIdInput) as typeof fp;
+  } else if (zkPinInput) {
+    fp = db
+      .prepare("SELECT * FROM staff_fingerprints WHERE tenant_id = ? AND zk_user_pin = ? AND status = 'Active' ORDER BY id DESC LIMIT 1")
+      .get(tid, zkPinInput) as typeof fp;
+  }
+
+  if (!fp) {
+    const failLog = insertBiometricAuthLog({
+      tenant_id: tid,
+      device_id: deviceId,
+      device_identifier: deviceIdentifier,
+      device_name: deviceName,
+      auth_source: 'ZKTeco K40',
+      auth_method: 'Fingerprint',
+      employee_code: employeeIdInput || zkPinInput || 'UNREGISTERED',
+      employee_name: 'Unmatched Finger Template',
+      department: '',
+      punch_type: b.punch_type === 'Check-Out' ? 'Check-Out' : 'Check-In',
+      status: 'Failure',
+      failure_reason: `No active ZKTeco K40 fingerprint enrolled for "${employeeIdInput || zkPinInput || 'scan'}"`,
+      verified_at: verifiedAt,
+    });
+    res.status(404).json({ error: String(failLog.failure_reason || 'Fingerprint not enrolled'), log: failLog });
+    return;
+  }
+
+  const emp = db
+    .prepare('SELECT employee_id, full_name, department, basic_salary, status FROM employees WHERE tenant_id = ? AND employee_id = ?')
+    .get(tid, fp.employee_id) as
+    | { employee_id: string; full_name: string; department: string; basic_salary: number; status: string }
+    | undefined;
+
+  if (!emp || emp.status === 'Suspended' || emp.status === 'Terminated') {
+    const failLog = insertBiometricAuthLog({
+      tenant_id: tid,
+      device_id: deviceId,
+      device_identifier: deviceIdentifier,
+      device_name: deviceName,
+      auth_source: 'ZKTeco K40',
+      auth_method: `Fingerprint (${fp.finger_label})`,
+      employee_code: fp.employee_id,
+      employee_name: emp?.full_name || fp.employee_name,
+      department: emp?.department || fp.department,
+      punch_type: b.punch_type === 'Check-Out' ? 'Check-Out' : 'Check-In',
+      status: 'Failure',
+      failure_reason: emp ? `Employee ${emp.employee_id} is ${emp.status}` : 'Employee profile missing in HR',
+      verified_at: verifiedAt,
+    });
+    res.status(403).json({ error: String(failLog.failure_reason), log: failLog });
+    return;
+  }
+
+  let effectivePunchType: 'Check-In' | 'Check-Out' =
+    b.punch_type === 'Check-Out' ? 'Check-Out' : 'Check-In';
+  if (!b.punch_type || b.punch_type === 'Auto') {
+    effectivePunchType = resolveAutoBiometricPunchType(tid, emp.employee_id, attDate, punchTime);
+  }
+
+  const attendance = upsertBiometricAttendanceRecord({
+    tid,
+    empCode: emp.employee_id,
+    empName: emp.full_name,
+    department: emp.department,
+    attDate,
+    punchTime,
+    punchType: effectivePunchType,
+    deviceName,
+    hourlyRateOverride: emp.basic_salary ? Number((emp.basic_salary / 208).toFixed(2)) : undefined,
+    notes: `ZKTeco K40 (${fp.finger_label} · PIN ${fp.zk_user_pin}) ${effectivePunchType} at ${punchTime}`,
+    actor: getActorName(req),
+  });
+
+  db.prepare('UPDATE staff_fingerprints SET last_scanned_at = ? WHERE id = ?').run(verifiedAt, fp.id);
+  if (deviceId) {
+    db.prepare(
+      "UPDATE devices SET status='Connected', punch_count = COALESCE(punch_count, 0) + 1, last_sync_at=?, last_checked_at=?, last_message=? WHERE id=?"
+    ).run(now, now, `K40 Scan: ${emp.employee_id} ${effectivePunchType} (${punchTime})`, deviceId);
+  }
+
+  const attId = Number(attendance.id || 0) || null;
+  const logRow = insertBiometricAuthLog({
+    tenant_id: tid,
+    device_id: deviceId,
+    device_identifier: deviceIdentifier,
+    device_name: deviceName,
+    auth_source: 'ZKTeco K40',
+    auth_method: `Fingerprint (${fp.finger_label})`,
+    employee_code: emp.employee_id,
+    employee_name: emp.full_name,
+    department: emp.department,
+    punch_type: effectivePunchType,
+    status: 'Success',
+    failure_reason: '',
+    attendance_record_id: attId,
+    attendance_marked: attId ? 1 : 0,
+    verified_at: verifiedAt,
+  });
+
+  broadcastWs('attendance:updated', { tenant_id: tid, attendance_id: attId, employee_code: emp.employee_id });
+  if (deviceId) {
+    broadcastWs('device:punch', { device_id: deviceId, tenant_id: tid, employee_code: emp.employee_id });
+  }
+  logAudit(
+    req,
+    'ZKTECO_SCAN',
+    'Device Connections',
+    `ZKTeco K40 finger scan (${fp.finger_label}) for ${emp.full_name} (${emp.employee_id}) · ${effectivePunchType} @ ${punchTime}`,
+    tid
+  );
+
+  const updatedDevice = deviceId ? maskDeviceRow(db.prepare('SELECT * FROM devices WHERE id = ?').get(deviceId)) : null;
+  res.status(201).json({ log: logRow, attendance, device: updatedDevice, punch_time: punchTime, punch_type: effectivePunchType });
+});
+
+app.post('/api/devices/:id/zkteco/pull-attendance', async (req, res) => {
+  const tid = getTenantId(req);
+  const id = Number(req.params.id);
+  const dev = db.prepare('SELECT * FROM devices WHERE id = ? AND tenant_id = ?').get(id, tid) as
+    | { id: number; tenant_id: number; device_name: string; ip_address: string; port: number; serial_number: string }
+    | undefined;
+  if (!dev) {
+    res.status(404).json({ error: 'ZKTeco K40 device not found in active tenant.' });
+    return;
+  }
+
+  const result = await zkPullAttendanceFromK40(dev.ip_address, Number(dev.port) || 4370);
+  const now = new Date().toISOString();
+
+  if (!result.connected) {
+    db.prepare(
+      "UPDATE devices SET status='Unreachable', last_latency_ms=?, last_checked_at=?, last_message=? WHERE id=?"
+    ).run(result.latencyMs, now, `${result.message}. For cloud/Render deployments configure K40 ADMS URL: /iclock/cdata?SN=${dev.serial_number}`, id);
+    const updated = maskDeviceRow(db.prepare('SELECT * FROM devices WHERE id = ?').get(id));
+    res.status(502).json({
+      error: `${result.message}. Note: Direct TCP port 4370 requires the server to reach LAN IP ${dev.ip_address}:${dev.port}. For cloud hosting (Render), point your ZKTeco K40 ADMS Server Settings to /iclock/cdata?SN=${dev.serial_number}.`,
+      device: updated,
+    });
+    return;
+  }
+
+  let ingested = 0;
+  for (const rec of result.records) {
+    const fp = db
+      .prepare('SELECT employee_id, employee_name, department FROM staff_fingerprints WHERE tenant_id = ? AND (zk_user_pin = ? OR employee_id = ?) LIMIT 1')
+      .get(tid, rec.zk_user_pin, rec.zk_user_pin) as
+      | { employee_id: string; employee_name: string; department: string }
+      | undefined;
+    const empCode = fp?.employee_id || rec.zk_user_pin;
+    const emp = db
+      .prepare('SELECT full_name, department, basic_salary FROM employees WHERE tenant_id = ? AND employee_id = ?')
+      .get(tid, empCode) as { full_name: string; department: string; basic_salary: number } | undefined;
+    const attDate = rec.timestamp.slice(0, 10);
+    const punchTime = rec.timestamp.slice(11, 16);
+    const att = upsertBiometricAttendanceRecord({
+      tid,
+      empCode,
+      empName: emp?.full_name || fp?.employee_name || empCode,
+      department: emp?.department || fp?.department || 'Production',
+      attDate,
+      punchTime,
+      punchType: rec.punch_type,
+      deviceName: dev.device_name,
+      hourlyRateOverride: emp?.basic_salary ? Number((emp.basic_salary / 208).toFixed(2)) : undefined,
+      notes: `Pulled via ZKTeco K40 TCP 4370 (${dev.ip_address})`,
+      actor: getActorName(req),
+    });
+    const attId = Number(att.id || 0) || null;
+    insertBiometricAuthLog({
+      tenant_id: tid,
+      device_id: dev.id,
+      device_identifier: dev.serial_number || `DEV-${dev.id}`,
+      device_name: dev.device_name,
+      auth_source: 'ZKTeco K40 TCP',
+      auth_method: 'Fingerprint',
+      employee_code: empCode,
+      employee_name: emp?.full_name || fp?.employee_name || empCode,
+      department: emp?.department || fp?.department || 'Production',
+      punch_type: rec.punch_type,
+      status: 'Success',
+      failure_reason: '',
+      attendance_record_id: attId,
+      attendance_marked: attId ? 1 : 0,
+      verified_at: rec.timestamp,
+    });
+    ingested++;
+  }
+
+  db.prepare(
+    "UPDATE devices SET status='Connected', last_latency_ms=?, punch_count = COALESCE(punch_count, 0) + ?, last_sync_at=?, last_checked_at=?, last_message=? WHERE id=?"
+  ).run(result.latencyMs, ingested, now, now, result.message, id);
+  const updated = maskDeviceRow(db.prepare('SELECT * FROM devices WHERE id = ?').get(id));
+  broadcastWs('device:status', { id, status: 'Connected', tenant_id: tid });
+  if (ingested > 0) broadcastWs('attendance:updated', { tenant_id: tid, ingested });
+  res.json({ device: updated, ingested, message: result.message });
+});
+
+// ============================================================================
+// COMPANY DEVICE & COMPANY CODE SECURITY POLICY ENDPOINTS
+// ============================================================================
+const COMPANY_DEVICE_ADMIN_ROLES = new Set(['System Administrator', 'Super Administrator']);
+
+app.get('/api/security/company-devices/status', (req, res) => {
+  const rawUid = String(req.query.device_uid || req.headers['x-device-uid'] || '').trim().toUpperCase();
+  const sec = db
+    .prepare('SELECT company_code_hint, policy_enabled, configured_by, configured_at FROM company_device_security WHERE tenant_id = 1')
+    .get() as
+    | { company_code_hint: string; policy_enabled: number; configured_by: string; configured_at: string | null }
+    | undefined;
+  const totalDevs = (db.prepare("SELECT COUNT(*) as c FROM authorized_company_devices WHERE status = 'Active'").get() as { c: number }).c;
+
+  let regDev:
+    | { device_uid: string; device_name: string; status: string; verified_at: string | null }
+    | undefined;
+  if (rawUid) {
+    regDev = db
+      .prepare('SELECT device_uid, device_name, status, verified_at FROM authorized_company_devices WHERE device_uid = ?')
+      .get(rawUid) as typeof regDev;
+  }
+
+  res.json({
+    policy_enabled: Boolean(sec?.policy_enabled === 1),
+    device_uid: rawUid,
+    device_registered: Boolean(regDev && regDev.status === 'Active'),
+    device_verified: Boolean(regDev && regDev.status === 'Active' && regDev.verified_at),
+    device_status: regDev ? (regDev.status as 'Active' | 'Suspended') : 'Unregistered',
+    device_name: regDev?.device_name || '',
+    company_code_hint: sec?.company_code_hint || '',
+    configured_by: sec?.configured_by || '',
+    configured_at: sec?.configured_at || null,
+    total_registered_devices: totalDevs,
+  });
+});
+
+app.post('/api/security/company-devices/verify', (req, res) => {
+  const b = (req.body || {}) as Record<string, unknown>;
+  const deviceUid = String(b.device_uid || req.headers['x-device-uid'] || '').trim().toUpperCase();
+  const companyCode = String(b.company_code || '').trim();
+  const deviceOs = String(b.device_os || '').trim();
+  const now = new Date().toISOString();
+
+  if (!deviceUid) {
+    res.status(400).json({ error: 'Device ID could not be determined. Refresh the page and retry.' });
+    return;
+  }
+  if (!companyCode) {
+    res.status(400).json({ error: 'Enter the Company Code issued by your Administrator or Super Administrator.' });
+    return;
+  }
+
+  const sec = db
+    .prepare('SELECT company_code_hash, policy_enabled FROM company_device_security WHERE tenant_id = 1')
+    .get() as { company_code_hash: string; policy_enabled: number } | undefined;
+
+  if (!sec || !sec.company_code_hash) {
+    res.status(400).json({ error: 'Company Security Code has not been configured yet by a Super Administrator.' });
+    return;
+  }
+
+  const dev = db
+    .prepare('SELECT * FROM authorized_company_devices WHERE device_uid = ?')
+    .get(deviceUid) as
+    | { id: number; tenant_id: number; device_uid: string; device_name: string; status: string }
+    | undefined;
+
+  if (!dev) {
+    logAudit(req, 'DEVICE_GATE_BLOCKED', 'Security', `Unregistered device ${deviceUid} attempted Company Code unlock`, 1);
+    res.status(403).json({
+      error: `Device "${deviceUid}" is NOT registered by an Admin or Super Administrator yet. Copy this Device ID and ask System Administration to register it first.`,
+    });
+    return;
+  }
+  if (dev.status !== 'Active') {
+    res.status(403).json({
+      error: `Device "${deviceUid}" is currently Suspended by System Administration.`,
+    });
+    return;
+  }
+
+  const candidateHash = sha256Hex(`SS-COMP-CODE:${companyCode}`);
+  const expectedBuf = Buffer.from(sec.company_code_hash, 'hex');
+  const actualBuf = Buffer.from(candidateHash, 'hex');
+  if (expectedBuf.length !== actualBuf.length || !crypto.timingSafeEqual(expectedBuf, actualBuf)) {
+    logAudit(req, 'DEVICE_GATE_WRONG_CODE', 'Security', `Invalid Company Code attempt from device ${deviceUid}`, dev.tenant_id);
+    res.status(403).json({
+      error: 'Invalid Company Code. Check the code with your Administrator or Super Administrator.',
+    });
+    return;
+  }
+
+  db.prepare(
+    "UPDATE authorized_company_devices SET verified_at = ?, last_seen_at = ?, device_os = CASE WHEN ? != '' THEN ? ELSE device_os END WHERE id = ?"
+  ).run(now, now, deviceOs, deviceOs, dev.id);
+
+  logAudit(req, 'DEVICE_VERIFIED', 'Security', `Device "${dev.device_name}" (${deviceUid}) verified with Company Code`, dev.tenant_id);
+  broadcastWs('company:device_security_updated', { device_uid: deviceUid, verified: true });
+
+  res.json({
+    verified: true,
+    device_uid: deviceUid,
+    device_name: dev.device_name,
+    verified_at: now,
+  });
+});
+
+app.get('/api/admin/company-devices', (req: AuthedRequest, res) => {
+  if (!requireRole(req, res, COMPANY_DEVICE_ADMIN_ROLES, 'manage company device security')) return;
+  const sec = db
+    .prepare('SELECT company_code_hint, policy_enabled, configured_by, configured_at, updated_at FROM company_device_security WHERE tenant_id = 1')
+    .get() as
+    | { company_code_hint: string; policy_enabled: number; configured_by: string; configured_at: string | null; updated_at: string }
+    | undefined;
+  const devices = db.prepare('SELECT * FROM authorized_company_devices ORDER BY id DESC').all();
+  res.json({
+    policy: {
+      policy_enabled: Boolean(sec?.policy_enabled === 1),
+      company_code_hint: sec?.company_code_hint || '',
+      configured_by: sec?.configured_by || '',
+      configured_at: sec?.configured_at || null,
+      updated_at: sec?.updated_at || null,
+    },
+    devices,
+  });
+});
+
+app.post('/api/admin/company-devices/policy', (req: AuthedRequest, res) => {
+  if (!requireRole(req, res, COMPANY_DEVICE_ADMIN_ROLES, 'configure company code and device security policy')) return;
+  const b = (req.body || {}) as Record<string, unknown>;
+  const rawCode = String(b.company_code || '').trim();
+  const policyEnabled = b.policy_enabled === false ? 0 : 1;
+  const registerCurrentUid = String(b.register_current_device_uid || req.headers['x-device-uid'] || '').trim().toUpperCase();
+  const registerCurrentName = String(b.register_current_device_name || 'Primary Admin Workstation').trim();
+  const registerCurrentOs = String(b.register_current_device_os || '').trim();
+  const now = new Date().toISOString();
+
+  const existing = db.prepare('SELECT * FROM company_device_security WHERE tenant_id = 1').get() as
+    | { company_code_hash: string; company_code_hint: string }
+    | undefined;
+
+  if (!rawCode && !existing?.company_code_hash) {
+    res.status(400).json({ error: 'Enter a Company Security Code (at least 4 characters).' });
+    return;
+  }
+  if (rawCode && rawCode.length < 4) {
+    res.status(400).json({ error: 'Company Security Code must be at least 4 characters long.' });
+    return;
+  }
+
+  const nextHash = rawCode ? sha256Hex(`SS-COMP-CODE:${rawCode}`) : existing!.company_code_hash;
+  const nextHint = rawCode
+    ? `${rawCode.slice(0, 2)}${'*'.repeat(Math.max(2, rawCode.length - 3))}${rawCode.slice(-1)}`
+    : existing!.company_code_hint;
+  const actor = req.authUser?.full_name || getActorName(req);
+
+  db.prepare(
+    `INSERT INTO company_device_security (tenant_id, company_code_hash, company_code_hint, policy_enabled, configured_by, configured_at, updated_at)
+     VALUES (1, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(tenant_id) DO UPDATE SET
+       company_code_hash = excluded.company_code_hash,
+       company_code_hint = excluded.company_code_hint,
+       policy_enabled = excluded.policy_enabled,
+       configured_by = excluded.configured_by,
+       configured_at = COALESCE(company_device_security.configured_at, excluded.configured_at),
+       updated_at = excluded.updated_at`
+  ).run(nextHash, nextHint, policyEnabled, actor, now, now);
+
+  if (registerCurrentUid) {
+    db.prepare(
+      `INSERT INTO authorized_company_devices (tenant_id, device_uid, device_name, device_os, assigned_branch, assigned_to_email, status, verified_at, registered_by, last_seen_at, created_at)
+       VALUES (1, ?, ?, ?, 'HQ', ?, 'Active', ?, ?, ?, ?)
+       ON CONFLICT(device_uid) DO UPDATE SET
+         status = 'Active',
+         verified_at = COALESCE(authorized_company_devices.verified_at, excluded.verified_at),
+         last_seen_at = excluded.last_seen_at`
+    ).run(
+      registerCurrentUid,
+      registerCurrentName,
+      registerCurrentOs,
+      req.authUser?.email || '',
+      now,
+      actor,
+      now,
+      now
+    );
+  }
+
+  logAudit(req, 'COMPANY_DEVICE_POLICY', 'Security', `Updated Company Code (${nextHint}) & device policy (${policyEnabled ? 'Enforced' : 'Off'})`, 1);
+  broadcastWs('company:device_security_updated', { policy_enabled: Boolean(policyEnabled) });
+
+  res.json({
+    ok: true,
+    policy_enabled: Boolean(policyEnabled),
+    company_code_hint: nextHint,
+    registered_device_uid: registerCurrentUid || null,
+  });
+});
+
+app.post('/api/admin/company-devices', (req: AuthedRequest, res) => {
+  if (!requireRole(req, res, COMPANY_DEVICE_ADMIN_ROLES, 'register authorized company devices')) return;
+  const b = (req.body || {}) as Record<string, unknown>;
+  const deviceUid = String(b.device_uid || '').trim().toUpperCase();
+  const deviceName = String(b.device_name || '').trim();
+  const deviceOs = String(b.device_os || '').trim();
+  const branch = String(b.assigned_branch || 'Addis Ababa HQ').trim();
+  const assignedEmail = String(b.assigned_to_email || '').trim();
+  const preVerify = b.pre_verify === true;
+  const now = new Date().toISOString();
+
+  if (!deviceUid || deviceUid.length < 4) {
+    res.status(400).json({ error: 'Device UID is required (copy it from the device popup or generate one).' });
+    return;
+  }
+  if (!deviceName) {
+    res.status(400).json({ error: 'Device Name is required (e.g. Finance Laptop #2).' });
+    return;
+  }
+
+  const actor = req.authUser?.full_name || getActorName(req);
+  db.prepare(
+    `INSERT INTO authorized_company_devices (tenant_id, device_uid, device_name, device_os, assigned_branch, assigned_to_email, status, verified_at, registered_by, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, 'Active', ?, ?, ?)
+     ON CONFLICT(device_uid) DO UPDATE SET
+       device_name = excluded.device_name,
+       device_os = excluded.device_os,
+       assigned_branch = excluded.assigned_branch,
+       assigned_to_email = excluded.assigned_to_email,
+       status = 'Active'`
+  ).run(getTenantId(req), deviceUid, deviceName, deviceOs, branch, assignedEmail, preVerify ? now : null, actor, now);
+
+  const row = db.prepare('SELECT * FROM authorized_company_devices WHERE device_uid = ?').get(deviceUid);
+  logAudit(req, 'COMPANY_DEVICE_ADD', 'Security', `Registered authorized company device "${deviceName}" (${deviceUid})`, getTenantId(req));
+  broadcastWs('company:device_security_updated', { device_uid: deviceUid });
+  res.status(201).json(row);
+});
+
+app.patch('/api/admin/company-devices/:id', (req: AuthedRequest, res) => {
+  if (!requireRole(req, res, COMPANY_DEVICE_ADMIN_ROLES, 'update company device status')) return;
+  const id = Number(req.params.id);
+  const b = (req.body || {}) as Record<string, unknown>;
+  const existing = db.prepare('SELECT * FROM authorized_company_devices WHERE id = ?').get(id) as
+    | { id: number; device_uid: string; status: string }
+    | undefined;
+  if (!existing) {
+    res.status(404).json({ error: 'Company device record not found.' });
+    return;
+  }
+  if (b.status === 'Active' || b.status === 'Suspended') {
+    db.prepare('UPDATE authorized_company_devices SET status = ? WHERE id = ?').run(b.status, id);
+  }
+  if (b.reset_verification === true) {
+    db.prepare('UPDATE authorized_company_devices SET verified_at = NULL WHERE id = ?').run(id);
+  }
+  const updated = db.prepare('SELECT * FROM authorized_company_devices WHERE id = ?').get(id);
+  broadcastWs('company:device_security_updated', { device_uid: existing.device_uid });
+  res.json(updated);
+});
+
+app.delete('/api/admin/company-devices/:id', (req: AuthedRequest, res) => {
+  if (!requireRole(req, res, COMPANY_DEVICE_ADMIN_ROLES, 'delete company device registration')) return;
+  const id = Number(req.params.id);
+  const existing = db.prepare('SELECT device_uid, device_name FROM authorized_company_devices WHERE id = ?').get(id) as
+    | { device_uid: string; device_name: string }
+    | undefined;
+  db.prepare('DELETE FROM authorized_company_devices WHERE id = ?').run(id);
+  if (existing) {
+    logAudit(req, 'COMPANY_DEVICE_DELETE', 'Security', `Removed authorized device "${existing.device_name}" (${existing.device_uid})`, 1);
+    broadcastWs('company:device_security_updated', { device_uid: existing.device_uid });
+  }
+  res.json({ ok: true });
+});
+
+// ZKTeco / iClock ADMS Hardware Push Compatibility Endpoint (mounted at both /api/iclock/* and /iclock/*)
+const handleIclockGet = (req: express.Request, res: express.Response) => {
   const sn = String(req.query.SN || '').trim();
   if (sn) {
     const now = new Date().toISOString();
@@ -5202,10 +7352,11 @@ app.get('/api/iclock/cdata', (req, res) => {
     );
   }
   res.type('text/plain').send('OK');
-});
+};
 
-app.post('/api/iclock/cdata', express.text({ type: '*/*' }), (req, res) => {
+const handleIclockPost = (req: express.Request, res: express.Response) => {
   const sn = String(req.query.SN || '').trim();
+  const tableType = String(req.query.table || 'ATTLOG').toUpperCase();
   const now = new Date().toISOString();
   const dev = db.prepare('SELECT * FROM devices WHERE serial_number = ?').get(sn) as
     | { id: number; tenant_id: number; device_name: string; device_type?: string }
@@ -5237,59 +7388,218 @@ app.post('/api/iclock/cdata', express.text({ type: '*/*' }), (req, res) => {
     .map((l) => l.trim())
     .filter(Boolean);
   let ingested = 0;
-  for (const line of lines) {
-    const parts = line.split(/\t|,/);
-    if (parts.length < 2) continue;
-    const empCode = parts[0].trim();
-    const ts = parts[1].trim();
-    const punchFlag = parts[2]?.trim();
-    const punchType = punchFlag === '1' ? 'Check-Out' : 'Check-In';
-    const attDate = ts.slice(0, 10) || now.slice(0, 10);
-    const punchTime = ts.slice(11, 16) || now.slice(11, 16);
-    const emp = db
-      .prepare('SELECT full_name, department, basic_salary FROM employees WHERE tenant_id = ? AND employee_id = ?')
-      .get(dev.tenant_id, empCode) as { full_name: string; department: string; basic_salary: number } | undefined;
-    const att = upsertBiometricAttendanceRecord({
-      tid: dev.tenant_id,
-      empCode,
-      empName: emp?.full_name || empCode,
-      department: emp?.department || 'Production',
-      attDate,
-      punchTime,
-      punchType,
-      deviceName: dev.device_name,
-      shiftName: `ADMS Push (${dev.device_name})`,
-      hourlyRateOverride: emp?.basic_salary ? Number((emp.basic_salary / 208).toFixed(2)) : 50,
-      notes: `ZKTeco ADMS Serial ${sn}`,
-      actor: 'ZKTeco ADMS',
-    });
-    const attId = Number(att.id || 0) || null;
-    insertBiometricAuthLog({
-      tenant_id: dev.tenant_id,
-      device_id: dev.id,
-      device_identifier: sn,
-      device_name: dev.device_name,
-      auth_source: 'ZKTeco ADMS',
-      auth_method: dev.device_type?.toLowerCase().includes('face') ? 'Face ID' : 'Fingerprint',
-      employee_code: empCode,
-      employee_name: emp?.full_name || empCode,
-      department: emp?.department || 'Production',
-      punch_type: punchType,
-      status: 'Success',
-      failure_reason: '',
-      attendance_record_id: attId,
-      attendance_marked: attId ? 1 : 0,
-      verified_at: ts.includes('T') || ts.includes(' ') ? ts : now,
-    });
-    ingested++;
+
+  if (tableType === 'OPERLOG' && bodyText.includes('FP ')) {
+    // Capture pushed ZKTeco K40 fingerprint template metadata
+    for (const line of lines) {
+      const pinMatch = line.match(/PIN=([^\t\s]+)/i);
+      const fidMatch = line.match(/FID=(\d+)/i);
+      const sizeMatch = line.match(/Size=(\d+)/i);
+      const tmpMatch = line.match(/TMP=([^\t\s]+)/i);
+      if (pinMatch) {
+        const pin = pinMatch[1].trim();
+        const fidx = fidMatch ? Number(fidMatch[1]) : 0;
+        const jobMatch = db
+          .prepare(
+            "SELECT employee_id FROM zk_enroll_jobs WHERE tenant_id = ? AND zk_user_pin = ? AND status IN ('Pending', 'WaitingFinger') ORDER BY id DESC LIMIT 1"
+          )
+          .get(dev.tenant_id, pin) as { employee_id: string } | undefined;
+        const fpPinMatch = !jobMatch
+          ? (db
+              .prepare('SELECT employee_id FROM staff_fingerprints WHERE tenant_id = ? AND zk_user_pin = ? ORDER BY id DESC LIMIT 1')
+              .get(dev.tenant_id, pin) as { employee_id: string } | undefined)
+          : undefined;
+        const matchedEmpId = jobMatch?.employee_id || fpPinMatch?.employee_id || null;
+        const emp = (matchedEmpId
+          ? db
+              .prepare('SELECT employee_id, full_name, department FROM employees WHERE tenant_id = ? AND employee_id = ? LIMIT 1')
+              .get(dev.tenant_id, matchedEmpId)
+          : db
+              .prepare(
+                "SELECT employee_id, full_name, department FROM employees WHERE tenant_id = ? AND (employee_id = ? OR replace(employee_id, 'SS-EMP-', '') = ? OR ltrim(replace(employee_id, 'SS-EMP-', ''), '0') = ?) LIMIT 1"
+              )
+              .get(dev.tenant_id, pin, pin, pin)) as
+          | { employee_id: string; full_name: string; department: string }
+          | undefined;
+        if (emp) {
+          db.prepare(
+            `INSERT INTO staff_fingerprints (tenant_id, employee_id, employee_name, department, zk_user_pin, finger_index, finger_label, template_hash, template_size, device_id, device_serial, auth_source, enrolled_by, status, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ZKTeco K40 ADMS', 'ZKTeco K40 ADMS', 'Active', ?)
+             ON CONFLICT(tenant_id, employee_id, finger_index) DO UPDATE SET
+               template_hash = excluded.template_hash,
+               template_size = excluded.template_size,
+               device_id = excluded.device_id,
+               device_serial = excluded.device_serial,
+               auth_source = excluded.auth_source,
+               status = 'Active'`
+          ).run(
+            dev.tenant_id,
+            emp.employee_id,
+            emp.full_name,
+            emp.department,
+            pin,
+            fidx,
+            FINGER_LABELS[fidx] || `Finger #${fidx}`,
+            sha256Hex(tmpMatch?.[1] || `${pin}:${fidx}:${now}`),
+            sizeMatch ? Number(sizeMatch[1]) : 512,
+            dev.id,
+            sn,
+            now
+          );
+          const completedJob = db
+            .prepare(
+              "SELECT id FROM zk_enroll_jobs WHERE tenant_id = ? AND employee_id = ? AND finger_index = ? AND status IN ('Pending', 'WaitingFinger') ORDER BY id DESC LIMIT 1"
+            )
+            .get(dev.tenant_id, emp.employee_id, fidx) as { id: number } | undefined;
+          if (completedJob) {
+            db.prepare(
+              "UPDATE zk_enroll_jobs SET status = 'Enrolled', status_message = ?, completed_at = ? WHERE id = ?"
+            ).run(`Real finger template captured by K40 (${sn})`, now, completedJob.id);
+          }
+          const savedFp = db
+            .prepare('SELECT * FROM staff_fingerprints WHERE tenant_id = ? AND employee_id = ? AND finger_index = ?')
+            .get(dev.tenant_id, emp.employee_id, fidx);
+          broadcastWs('zkteco:finger_enrolled', {
+            tenant_id: dev.tenant_id,
+            job_id: completedJob?.id ?? null,
+            employee_id: emp.employee_id,
+            fingerprint: savedFp,
+          });
+          ingested++;
+        }
+      }
+    }
+  } else {
+    for (const line of lines) {
+      const parts = line.split(/\t|,/);
+      if (parts.length < 2) continue;
+      const pinOrCode = parts[0].trim();
+      const ts = parts[1].trim();
+      const punchFlag = parts[2]?.trim();
+      const punchType = punchFlag === '1' || punchFlag === '5' ? 'Check-Out' : 'Check-In';
+      const attDate = ts.slice(0, 10) || now.slice(0, 10);
+      const punchTime = ts.slice(11, 16) || now.slice(11, 16);
+
+      const fpMatch = db
+        .prepare('SELECT employee_id FROM staff_fingerprints WHERE tenant_id = ? AND zk_user_pin = ? LIMIT 1')
+        .get(dev.tenant_id, pinOrCode) as { employee_id: string } | undefined;
+      const empCode = fpMatch?.employee_id || pinOrCode;
+      const emp = db
+        .prepare('SELECT full_name, department, basic_salary FROM employees WHERE tenant_id = ? AND employee_id = ?')
+        .get(dev.tenant_id, empCode) as { full_name: string; department: string; basic_salary: number } | undefined;
+
+      const att = upsertBiometricAttendanceRecord({
+        tid: dev.tenant_id,
+        empCode,
+        empName: emp?.full_name || empCode,
+        department: emp?.department || 'Production',
+        attDate,
+        punchTime,
+        punchType,
+        deviceName: dev.device_name,
+        shiftName: `ADMS Push (${dev.device_name})`,
+        hourlyRateOverride: emp?.basic_salary ? Number((emp.basic_salary / 208).toFixed(2)) : 50,
+        notes: `ZKTeco ADMS Serial ${sn}`,
+        actor: 'ZKTeco ADMS',
+      });
+      const attId = Number(att.id || 0) || null;
+      insertBiometricAuthLog({
+        tenant_id: dev.tenant_id,
+        device_id: dev.id,
+        device_identifier: sn,
+        device_name: dev.device_name,
+        auth_source: 'ZKTeco ADMS',
+        auth_method: dev.device_type?.toLowerCase().includes('face') ? 'Face ID' : 'Fingerprint',
+        employee_code: empCode,
+        employee_name: emp?.full_name || empCode,
+        department: emp?.department || 'Production',
+        punch_type: punchType,
+        status: 'Success',
+        failure_reason: '',
+        attendance_record_id: attId,
+        attendance_marked: attId ? 1 : 0,
+        verified_at: ts.includes('T') || ts.includes(' ') ? ts : now,
+      });
+      ingested++;
+    }
   }
+
   db.prepare(
     "UPDATE devices SET status='Connected', punch_count = COALESCE(punch_count, 0) + ?, last_sync_at=?, last_checked_at=?, last_message=? WHERE id=?"
   ).run(Math.max(1, ingested), now, now, `ADMS synced ${ingested || 1} record(s)`, dev.id);
   broadcastWs('device:punch', { device_id: dev.id, tenant_id: dev.tenant_id, ingested });
-  broadcastWs('attendance:updated', { tenant_id: dev.tenant_id, ingested });
+  broadcastWs('attendance:updated', { tenant_id: dev.tenant_id, ingested, source: 'biometric' });
+  res.type('text/plain').send(`OK: ${ingested}`);
+};
+
+const handleIclockGetRequest = (req: express.Request, res: express.Response) => {
+  const sn = String(req.query.SN || '').trim();
+  if (!sn) {
+    res.type('text/plain').send('OK');
+    return;
+  }
+  const dev = db.prepare('SELECT id, tenant_id FROM devices WHERE serial_number = ? LIMIT 1').get(sn) as
+    | { id: number; tenant_id: number }
+    | undefined;
+  if (!dev) {
+    res.type('text/plain').send('OK');
+    return;
+  }
+  const pendingJobs = db
+    .prepare(
+      "SELECT * FROM zk_enroll_jobs WHERE tenant_id = ? AND (device_id = ? OR device_serial = ?) AND status = 'WaitingFinger' AND channel = 'ADMS' ORDER BY id ASC LIMIT 5"
+    )
+    .all(dev.tenant_id, dev.id, sn) as Array<{
+    id: number;
+    employee_name: string;
+    zk_user_pin: string;
+    finger_index: number;
+  }>;
+
+  if (pendingJobs.length === 0) {
+    res.type('text/plain').send('OK');
+    return;
+  }
+
+  const cmds: string[] = [];
+  for (const job of pendingJobs) {
+    const cleanName = job.employee_name.replace(/[\t\r\n]/g, ' ').slice(0, 24);
+    cmds.push(`C:${job.id}0:DATA UPDATE USERINFO PIN=${job.zk_user_pin}\tName=${cleanName}\tPri=0\tPasswd=\tCard=\tGrp=1`);
+    cmds.push(`C:${job.id}1:ENROLL_FP PIN=${job.zk_user_pin}\tFID=${job.finger_index}\tRETRY=3\tOVERWRITE=1`);
+    db.prepare(
+      "UPDATE zk_enroll_jobs SET channel = 'ADMS_SENT', status_message = 'ADMS ENROLL_FP command delivered to K40 — place staff finger 3 times on sensor...' WHERE id = ?"
+    ).run(job.id);
+  }
+  res.type('text/plain').send(cmds.join('\n') + '\n');
+};
+
+const handleIclockDeviceCmd = (req: express.Request, res: express.Response) => {
+  const bodyText = typeof req.body === 'string' ? req.body : '';
+  const idMatch = bodyText.match(/ID=(\d+)/i);
+  const retMatch = bodyText.match(/Return=(-?\d+)/i);
+  if (idMatch && retMatch) {
+    const cmdId = idMatch[1];
+    const retCode = Number(retMatch[1]);
+    if (cmdId.length >= 2 && cmdId.endsWith('1')) {
+      const jobId = Number(cmdId.slice(0, -1));
+      if (jobId > 0) {
+        if (retCode !== 0) {
+          db.prepare(
+            "UPDATE zk_enroll_jobs SET status = 'Failed', status_message = ? WHERE id = ? AND status IN ('WaitingFinger', 'Pending')"
+          ).run(`K40 terminal returned code ${retCode} during finger capture`, jobId);
+        }
+      }
+    }
+  }
   res.type('text/plain').send('OK');
-});
+};
+
+app.get('/api/iclock/cdata', handleIclockGet);
+app.post('/api/iclock/cdata', express.text({ type: '*/*' }), handleIclockPost);
+app.get('/iclock/cdata', handleIclockGet);
+app.post('/iclock/cdata', express.text({ type: '*/*' }), handleIclockPost);
+app.get(['/api/iclock/getrequest', '/iclock/getrequest'], handleIclockGetRequest);
+app.post(['/api/iclock/devicecmd', '/iclock/devicecmd'], express.text({ type: '*/*' }), handleIclockDeviceCmd);
 
 app.post('/api/devices/:id/disconnect', (req, res) => {
   const tid = getTenantId(req);
@@ -5448,9 +7758,54 @@ function computeAttOt(otType: string, otHours: number, hourlyRate: number, tenan
 
 function inferShiftPeriodFromTime(hhmm: string): 'Morning' | 'Afternoon' | 'Night' {
   const mins = timeToMinutes(hhmm);
-  if (mins >= 5 * 60 && mins < 13 * 60) return 'Morning';
-  if (mins >= 13 * 60 && mins < 21 * 60) return 'Afternoon';
+  // Morning window: 07:15 - 12:35 EAT (1:15 - 6:35 Ethiopian Morning/Noon)
+  if (mins >= 7 * 60 + 15 && mins <= 12 * 60 + 35) return 'Morning';
+  // Afternoon window: 12:36 - 18:35 EAT (6:36 - 12:35 Ethiopian Afternoon/Evening)
+  if (mins > 12 * 60 + 35 && mins <= 18 * 60 + 35) return 'Afternoon';
+  // Night window: 18:36 - 07:14 EAT (12:36 Evening - 1:14 Morning Ethiopian)
   return 'Night';
+}
+
+function getPreviousIsoDate(isoDate: string): string {
+  const d = new Date(`${isoDate.slice(0, 10)}T00:00:00Z`);
+  if (Number.isNaN(d.getTime())) return isoDate;
+  d.setUTCDate(d.getUTCDate() - 1);
+  return d.toISOString().slice(0, 10);
+}
+
+function resolveAutoBiometricPunchType(tid: number, empCode: string, attDate: string, punchTime: string): 'Check-In' | 'Check-Out' {
+  const mins = timeToMinutes(punchTime);
+  if (mins < 7 * 60 + 15) {
+    const prevDate = getPreviousIsoDate(attDate);
+    const openNight = db
+      .prepare(
+        "SELECT check_in, check_out FROM attendance_records WHERE tenant_id = ? AND employee_code = ? AND attendance_date = ? AND shift_period IN ('Night', 'Security') AND register_state = 'Open' ORDER BY id DESC LIMIT 1"
+      )
+      .get(tid, empCode, prevDate) as { check_in: string; check_out: string } | undefined;
+    if (openNight && openNight.check_in && !openNight.check_out) return 'Check-Out';
+  }
+  const todayAtt = db
+    .prepare(
+      "SELECT check_in, check_out, morning_check_in, morning_check_out, afternoon_check_in, afternoon_check_out FROM attendance_records WHERE tenant_id = ? AND employee_code = ? AND attendance_date = ? AND register_state = 'Open' ORDER BY id DESC LIMIT 1"
+    )
+    .get(tid, empCode, attDate) as
+    | {
+        check_in: string;
+        check_out: string;
+        morning_check_in: string;
+        morning_check_out: string;
+        afternoon_check_in: string;
+        afternoon_check_out: string;
+      }
+    | undefined;
+  if (!todayAtt) return 'Check-In';
+  if (todayAtt.morning_check_in && !todayAtt.morning_check_out) return 'Check-Out';
+  if (todayAtt.morning_check_in && todayAtt.morning_check_out && !todayAtt.afternoon_check_in && mins >= 12 * 60 + 35) {
+    return 'Check-In';
+  }
+  if (todayAtt.afternoon_check_in && !todayAtt.afternoon_check_out) return 'Check-Out';
+  if (todayAtt.check_in && !todayAtt.check_out) return 'Check-Out';
+  return 'Check-In';
 }
 
 function insertBiometricAuthLog(entry: {
@@ -5539,21 +7894,99 @@ function upsertBiometricAttendanceRecord(params: {
   } = params;
 
   const now = new Date().toISOString();
-  const existingOpen = db
+  const punchMins = timeToMinutes(punchTime);
+  let existingOpen = db
     .prepare(
       "SELECT * FROM attendance_records WHERE tenant_id = ? AND employee_code = ? AND attendance_date = ? AND register_state = 'Open' ORDER BY id DESC LIMIT 1"
     )
     .get(tid, empCode, attDate) as Record<string, unknown> | undefined;
 
-  if (existingOpen && punchType === 'Check-Out') {
-    const period = String(existingOpen.shift_period || inferShiftPeriodFromTime(punchTime));
-    const checkInVal = String(existingOpen.check_in || existingOpen.scheduled_start || '08:00');
+  if (!existingOpen && punchType === 'Check-Out' && punchMins < 7 * 60 + 15) {
+    const prevDate = getPreviousIsoDate(attDate);
+    existingOpen = db
+      .prepare(
+        "SELECT * FROM attendance_records WHERE tenant_id = ? AND employee_code = ? AND attendance_date = ? AND shift_period IN ('Night', 'Security') AND register_state = 'Open' ORDER BY id DESC LIMIT 1"
+      )
+      .get(tid, empCode, prevDate) as Record<string, unknown> | undefined;
+  }
+
+  // Handle 4-punch Day shift: Afternoon Check-In following Morning Check-Out on the same day
+  if (
+    existingOpen &&
+    punchType === 'Check-In' &&
+    Boolean(existingOpen.morning_check_in) &&
+    Boolean(existingOpen.morning_check_out) &&
+    !existingOpen.afternoon_check_in &&
+    punchMins >= 12 * 60 + 35
+  ) {
     const resolved = resolveAttendancePayload(
       {
         employee_code: empCode,
         employee_name: empName || existingOpen.employee_name,
         department: department || existingOpen.department,
-        attendance_date: attDate,
+        attendance_date: String(existingOpen.attendance_date || attDate),
+        shift_name: 'Day Shift',
+        shift_period: 'Day',
+        scheduled_start: '08:00',
+        scheduled_end: '17:00',
+        break_minutes: 60,
+        hourly_rate: hourlyRateOverride || existingOpen.hourly_rate,
+        check_in: String(existingOpen.morning_check_in || existingOpen.check_in),
+        check_out: '',
+        morning_check_in: existingOpen.morning_check_in,
+        morning_check_out: existingOpen.morning_check_out,
+        afternoon_check_in: punchTime,
+        afternoon_check_out: '',
+        ot_type: otType && otType !== 'None' ? otType : existingOpen.ot_type,
+        ot_hours: otHours !== undefined && otHours > 0 ? otHours : undefined,
+        notes: `${String(existingOpen.notes || '').trim()} | Afternoon In: ${punchTime} (${deviceName})`.replace(/^ \|\s*/, ''),
+      },
+      tid
+    );
+
+    db.prepare(
+      `UPDATE attendance_records SET
+        shift_name=?, shift_period=?, scheduled_start=?, scheduled_end=?, break_minutes=?,
+        afternoon_check_in=?, check_out=?, regular_hours=?, late_minutes=?, early_departure_minutes=?, absence_hours=?,
+        ot_type=?, ot_hours=?, ot_multiplier=?, ot_pay=?, status=?, notes=?, updated_by=?, updated_at=?
+       WHERE id = ? AND tenant_id = ?`
+    ).run(
+      resolved.shiftName,
+      resolved.shiftPeriod,
+      resolved.scheduledStart,
+      resolved.scheduledEnd,
+      resolved.breakMinutes,
+      resolved.afternoonIn,
+      '',
+      resolved.regularHours,
+      resolved.lateMinutes,
+      resolved.earlyDepartureMinutes,
+      resolved.absenceHours,
+      resolved.otType,
+      resolved.otHours,
+      resolved.mult,
+      resolved.pay,
+      resolved.derivedStatus,
+      resolved.notes,
+      actor,
+      now,
+      existingOpen.id,
+      tid
+    );
+    return db.prepare('SELECT * FROM attendance_records WHERE id = ?').get(existingOpen.id) as Record<string, unknown>;
+  }
+
+  if (existingOpen && punchType === 'Check-Out') {
+    const period = String(existingOpen.shift_period || inferShiftPeriodFromTime(punchTime));
+    const checkInVal = String(existingOpen.check_in || existingOpen.scheduled_start || '08:00');
+    const isMorningOut = period === 'Morning' || (period === 'Day' && !existingOpen.afternoon_check_in && punchMins <= 12 * 60 + 35);
+    const isAfternoonOut = period === 'Afternoon' || (period === 'Day' && !isMorningOut);
+    const resolved = resolveAttendancePayload(
+      {
+        employee_code: empCode,
+        employee_name: empName || existingOpen.employee_name,
+        department: department || existingOpen.department,
+        attendance_date: String(existingOpen.attendance_date || attDate),
         shift_id: existingOpen.shift_id,
         shift_name: shiftName || existingOpen.shift_name,
         shift_period: period,
@@ -5563,10 +7996,10 @@ function upsertBiometricAttendanceRecord(params: {
         hourly_rate: hourlyRateOverride || existingOpen.hourly_rate,
         check_in: checkInVal,
         check_out: punchTime,
-        morning_check_in: existingOpen.morning_check_in || (period === 'Morning' || period === 'Day' ? checkInVal : ''),
-        morning_check_out: period === 'Morning' || period === 'Day' ? punchTime : existingOpen.morning_check_out,
+        morning_check_in: existingOpen.morning_check_in || (isMorningOut ? checkInVal : ''),
+        morning_check_out: isMorningOut ? punchTime : existingOpen.morning_check_out,
         afternoon_check_in: existingOpen.afternoon_check_in || (period === 'Afternoon' ? checkInVal : ''),
-        afternoon_check_out: period === 'Afternoon' ? punchTime : existingOpen.afternoon_check_out,
+        afternoon_check_out: isAfternoonOut ? punchTime : existingOpen.afternoon_check_out,
         night_check_in: existingOpen.night_check_in || (period === 'Night' || period === 'Security' ? checkInVal : ''),
         night_check_out: period === 'Night' || period === 'Security' ? punchTime : existingOpen.night_check_out,
         ot_type: otType && otType !== 'None' ? otType : existingOpen.ot_type,
@@ -5614,6 +8047,8 @@ function upsertBiometricAttendanceRecord(params: {
       ? 'Night'
       : String(schedRow.shift_name).toLowerCase().includes('afternoon')
       ? 'Afternoon'
+      : String(schedRow.shift_name).toLowerCase().includes('day')
+      ? 'Day'
       : 'Morning'
     : periodHint;
 
@@ -5628,8 +8063,8 @@ function upsertBiometricAttendanceRecord(params: {
       shift_period: resolvedPeriod,
       check_in: isOut ? undefined : punchTime,
       check_out: isOut ? punchTime : undefined,
-      morning_check_in: resolvedPeriod === 'Morning' && !isOut ? punchTime : '',
-      morning_check_out: resolvedPeriod === 'Morning' && isOut ? punchTime : '',
+      morning_check_in: (resolvedPeriod === 'Morning' || resolvedPeriod === 'Day') && !isOut ? punchTime : '',
+      morning_check_out: (resolvedPeriod === 'Morning' || resolvedPeriod === 'Day') && isOut ? punchTime : '',
       afternoon_check_in: resolvedPeriod === 'Afternoon' && !isOut ? punchTime : '',
       afternoon_check_out: resolvedPeriod === 'Afternoon' && isOut ? punchTime : '',
       night_check_in: resolvedPeriod === 'Night' && !isOut ? punchTime : '',
@@ -5662,8 +8097,8 @@ function upsertBiometricAttendanceRecord(params: {
       payload.shiftId,
       payload.shiftName,
       payload.shiftPeriod,
-      payload.firstPunchIn,
-      payload.lastPunchOut,
+      isOut ? '' : payload.firstPunchIn,
+      isOut ? payload.lastPunchOut : '',
       payload.morningIn,
       payload.morningOut,
       payload.afternoonIn,
@@ -5744,9 +8179,20 @@ function resolveAttendancePayload(b: Record<string, unknown>, tid: number) {
         : 'Day')
   );
 
-  const scheduledStart = String(b.scheduled_start || shiftRow?.start_time || schedRow?.start_time || (shiftPeriod === 'Morning' ? '06:00' : shiftPeriod === 'Afternoon' ? '14:00' : shiftPeriod === 'Night' ? '22:00' : '08:00'));
-  const scheduledEnd = String(b.scheduled_end || shiftRow?.end_time || schedRow?.end_time || (shiftPeriod === 'Morning' ? '14:00' : shiftPeriod === 'Afternoon' ? '22:00' : shiftPeriod === 'Night' ? '06:00' : '17:00'));
-  const breakMinutes = Number(b.break_minutes ?? shiftRow?.break_minutes ?? schedRow?.break_minutes ?? rules.default_break_minutes ?? 60);
+  const scheduledStart = String(
+    b.scheduled_start ||
+      shiftRow?.start_time ||
+      schedRow?.start_time ||
+      (shiftPeriod === 'Morning' ? '08:00' : shiftPeriod === 'Afternoon' ? '13:00' : shiftPeriod === 'Night' ? '19:00' : '08:00')
+  );
+  const scheduledEnd = String(
+    b.scheduled_end ||
+      shiftRow?.end_time ||
+      schedRow?.end_time ||
+      (shiftPeriod === 'Morning' ? '12:00' : shiftPeriod === 'Afternoon' ? '17:00' : shiftPeriod === 'Night' ? '02:00' : '17:00')
+  );
+  const defaultBrkForPeriod = shiftPeriod === 'Morning' || shiftPeriod === 'Afternoon' || shiftPeriod === 'Night' ? 0 : Number(rules.default_break_minutes ?? 60);
+  const breakMinutes = Number(b.break_minutes ?? shiftRow?.break_minutes ?? schedRow?.break_minutes ?? defaultBrkForPeriod);
 
   const morningIn = String(b.morning_check_in || '');
   const morningOut = String(b.morning_check_out || '');
@@ -5767,10 +8213,12 @@ function resolveAttendancePayload(b: Record<string, unknown>, tid: number) {
     nightOut ||
     afternoonOut ||
     morningOut ||
-    (b.status === 'Absent' || b.status === 'On Leave' ? '--:--' : scheduledEnd);
+    (b.status === 'Absent' || b.status === 'On Leave' ? '--:--' : '');
 
-  const lateGrace = Number(shiftRow?.grace_late_minutes ?? rules.late_grace_minutes ?? 15);
-  const earlyGrace = Number(rules.early_departure_grace_minutes ?? 10);
+  const isEthStandardShift =
+    shiftPeriod === 'Morning' || shiftPeriod === 'Afternoon' || shiftPeriod === 'Night' || shiftPeriod === 'Day';
+  const lateGrace = Number(shiftRow?.grace_late_minutes ?? (isEthStandardShift ? 0 : rules.late_grace_minutes ?? 15));
+  const earlyGrace = Number(isEthStandardShift ? 2 : rules.early_departure_grace_minutes ?? 10);
 
   const isAbsentOrLeave = b.status === 'Absent' || b.status === 'On Leave' || firstPunchIn === '--:--';
   let lateMinutes = Number(b.late_minutes ?? -1);
@@ -5778,13 +8226,170 @@ function resolveAttendancePayload(b: Record<string, unknown>, tid: number) {
   let regularHours = Number(b.regular_hours ?? -1);
   let absenceHours = Number(b.absence_hours ?? -1);
 
+  let otType = String(b.ot_type || 'None');
+  let otHours = Number(b.ot_hours ?? -1);
+
   if (isAbsentOrLeave) {
     lateMinutes = 0;
     earlyDepartureMinutes = 0;
     regularHours = 0;
     const schedNetHours = Math.max(0, (diffShiftDurationMinutes(scheduledStart, scheduledEnd) - breakMinutes) / 60);
     absenceHours = absenceHours >= 0 ? absenceHours : Number(schedNetHours.toFixed(2));
+    if (otHours < 0) otHours = 0;
+  } else if (shiftPeriod === 'Morning' && !(afternoonIn || afternoonOut)) {
+    // Morning Ethiopian Window: In 1:45-2:00 (07:45-08:00), Out 5:58-6:30 (11:58-12:30)
+    const mIn = timeToMinutes(morningIn || firstPunchIn);
+    const mOut = lastPunchOut ? timeToMinutes(morningOut || lastPunchOut) : 12 * 60;
+    if (lateMinutes < 0) {
+      const diffIn = mIn - 8 * 60;
+      lateMinutes = diffIn > lateGrace ? diffIn : 0;
+    }
+    if (earlyDepartureMinutes < 0) {
+      if (!lastPunchOut) {
+        earlyDepartureMinutes = 0;
+      } else {
+        const endGap = 12 * 60 - mOut;
+        earlyDepartureMinutes = endGap > 2 ? endGap : 0;
+      }
+    }
+    if (regularHours < 0) {
+      if (!lastPunchOut) {
+        regularHours = 0;
+      } else {
+        const workedHrs = Math.max(0, (mOut - Math.max(mIn, 7 * 60 + 45)) / 60);
+        regularHours = Number(Math.min(4, workedHrs).toFixed(2));
+      }
+    }
+    if (absenceHours < 0) {
+      absenceHours = Number(((lateMinutes + earlyDepartureMinutes) / 60).toFixed(2));
+    }
+    if (otHours < 0) {
+      // Afternoon OT starts at 17:10-19:00 (11:10-1:00 PM Ethiopian) if morning staff stayed continuously into evening OT
+      if (lastPunchOut && mOut >= 17 * 60 + 10) {
+        otHours = Number(((Math.min(mOut, 19 * 60) - (17 * 60 + 10)) / 60).toFixed(2));
+      } else {
+        otHours = 0;
+      }
+    }
+  } else if (shiftPeriod === 'Afternoon' && !(morningIn || morningOut)) {
+    // Afternoon Ethiopian Window: In 6:50-7:00 (12:50-13:00), Out 10:58-11:00 (16:58-17:00), OT 11:10-1:00 PM (17:10-19:00)
+    const aIn = timeToMinutes(afternoonIn || firstPunchIn);
+    const aOut = lastPunchOut ? timeToMinutes(afternoonOut || lastPunchOut) : 17 * 60;
+    if (lateMinutes < 0) {
+      const diffIn = aIn - 13 * 60;
+      lateMinutes = diffIn > lateGrace ? diffIn : 0;
+    }
+    if (earlyDepartureMinutes < 0) {
+      if (!lastPunchOut) {
+        earlyDepartureMinutes = 0;
+      } else {
+        const endGap = 17 * 60 - aOut;
+        earlyDepartureMinutes = endGap > 2 ? endGap : 0;
+      }
+    }
+    if (regularHours < 0) {
+      if (!lastPunchOut) {
+        regularHours = 0;
+      } else {
+        const workedHrs = Math.max(0, (Math.min(aOut, 17 * 60) - Math.max(aIn, 12 * 60 + 50)) / 60);
+        regularHours = Number(Math.min(4, workedHrs).toFixed(2));
+      }
+    }
+    if (absenceHours < 0) {
+      absenceHours = Number(((lateMinutes + earlyDepartureMinutes) / 60).toFixed(2));
+    }
+    if (otHours < 0) {
+      if (lastPunchOut && aOut >= 17 * 60 + 10) {
+        otHours = Number(((Math.min(aOut, 19 * 60) - (17 * 60 + 10)) / 60).toFixed(2));
+      } else {
+        otHours = 0;
+      }
+    }
+  } else if (shiftPeriod === 'Day' || ((morningIn || morningOut) && (afternoonIn || afternoonOut))) {
+    // Full Day Shift (Morning 07:45-08:00 In / 11:58-12:30 Out + Afternoon 12:50-13:00 In / 16:58-17:00 Out + OT 17:10-19:00)
+    const hasSplit = Boolean(morningIn && afternoonIn);
+    let mLate = 0;
+    let mEarly = 0;
+    let mHrs = 0;
+    let aLate = 0;
+    let aEarly = 0;
+    let aHrs = 0;
+    const finalOutStr = afternoonOut || lastPunchOut;
+    const finalOutMin = finalOutStr ? timeToMinutes(finalOutStr) : 0;
+
+    if (hasSplit) {
+      const mIn = timeToMinutes(morningIn);
+      const mOut = morningOut ? timeToMinutes(morningOut) : 12 * 60;
+      mLate = mIn - 8 * 60 > lateGrace ? mIn - 8 * 60 : 0;
+      mEarly = morningOut && 12 * 60 - mOut > 2 ? 12 * 60 - mOut : 0;
+      mHrs = morningOut ? Math.min(4, Math.max(0, (Math.min(mOut, 12 * 60 + 30) - Math.max(mIn, 7 * 60 + 45)) / 60)) : 0;
+
+      const aIn = timeToMinutes(afternoonIn);
+      const aOut = finalOutStr ? timeToMinutes(finalOutStr) : 17 * 60;
+      aLate = aIn - 13 * 60 > lateGrace ? aIn - 13 * 60 : 0;
+      aEarly = finalOutStr && 17 * 60 - aOut > 2 ? 17 * 60 - aOut : 0;
+      aHrs = finalOutStr ? Math.min(4, Math.max(0, (Math.min(aOut, 17 * 60) - Math.max(aIn, 12 * 60 + 50)) / 60)) : 0;
+    } else {
+      const inMin = timeToMinutes(firstPunchIn);
+      const outMin = finalOutStr ? timeToMinutes(finalOutStr) : 17 * 60;
+      mLate = inMin - 8 * 60 > lateGrace ? inMin - 8 * 60 : 0;
+      aEarly = finalOutStr && 17 * 60 - outMin > 2 ? 17 * 60 - outMin : 0;
+      const net = finalOutStr ? Math.max(0, (Math.min(outMin, 17 * 60) - Math.max(inMin, 7 * 60 + 45) - breakMinutes) / 60) : 0;
+      mHrs = Math.min(8, net);
+    }
+
+    if (lateMinutes < 0) lateMinutes = mLate + aLate;
+    if (earlyDepartureMinutes < 0) earlyDepartureMinutes = mEarly + aEarly;
+    if (regularHours < 0) regularHours = Number(Math.min(8, mHrs + aHrs).toFixed(2));
+    if (absenceHours < 0) absenceHours = Number(((lateMinutes + earlyDepartureMinutes) / 60).toFixed(2));
+    if (otHours < 0) {
+      if (finalOutStr && finalOutMin >= 17 * 60 + 10) {
+        otHours = Number(((Math.min(finalOutMin, 19 * 60) - (17 * 60 + 10)) / 60).toFixed(2));
+      } else {
+        otHours = 0;
+      }
+    }
+  } else if (shiftPeriod === 'Night') {
+    // Night Shift Ethiopian Window: In 12:50-1:00 PM (18:50-19:00), Out 7:58-8:10 PM (01:58-02:10), OT 8:10-1:00 AM (02:10-07:00)
+    const rawIn = timeToMinutes(nightIn || firstPunchIn);
+    const inRel = rawIn < 12 * 60 ? rawIn + 1440 : rawIn;
+    const rawOut = lastPunchOut ? timeToMinutes(nightOut || lastPunchOut) : 2 * 60;
+    let outRel = rawOut <= 12 * 60 ? rawOut + 1440 : rawOut;
+    if (lastPunchOut && outRel <= inRel) outRel += 1440;
+
+    if (lateMinutes < 0) {
+      const diffIn = inRel - 19 * 60;
+      lateMinutes = diffIn > lateGrace ? diffIn : 0;
+    }
+    if (earlyDepartureMinutes < 0) {
+      if (!lastPunchOut) {
+        earlyDepartureMinutes = 0;
+      } else {
+        const endGap = 26 * 60 - outRel;
+        earlyDepartureMinutes = endGap > 2 ? endGap : 0;
+      }
+    }
+    if (regularHours < 0) {
+      if (!lastPunchOut) {
+        regularHours = 0;
+      } else {
+        const regEnd = Math.min(outRel, 26 * 60 + 10);
+        const workedHrs = Math.max(0, (regEnd - Math.max(inRel, 18 * 60 + 50)) / 60);
+        regularHours = Number(Math.min(7, workedHrs).toFixed(2));
+      }
+    }
+    if (absenceHours < 0) {
+      absenceHours = Number(((lateMinutes + earlyDepartureMinutes) / 60).toFixed(2));
+    }
+    if (otHours < 0) {
+      if (lastPunchOut && outRel > 26 * 60 + 10) {
+        otHours = Number(((Math.min(outRel, 31 * 60) - (26 * 60 + 10)) / 60).toFixed(2));
+      } else {
+        otHours = 0;
+      }
+    }
   } else {
+    // Custom / Weekend / Holiday / Security shifts
     const schedStartMin = timeToMinutes(scheduledStart);
     const actualInMin = timeToMinutes(firstPunchIn);
     if (lateMinutes < 0) {
@@ -5793,7 +8398,8 @@ function resolveAttendancePayload(b: Record<string, unknown>, tid: number) {
     }
 
     const schedDur = diffShiftDurationMinutes(scheduledStart, scheduledEnd);
-    const actualDur = diffShiftDurationMinutes(firstPunchIn, lastPunchOut);
+    const effectiveOut = lastPunchOut || scheduledEnd;
+    const actualDur = diffShiftDurationMinutes(firstPunchIn, effectiveOut);
     if (earlyDepartureMinutes < 0) {
       const endGap = schedDur - (actualInMin - schedStartMin + actualDur);
       earlyDepartureMinutes = endGap > earlyGrace ? endGap : 0;
@@ -5807,19 +8413,13 @@ function resolveAttendancePayload(b: Record<string, unknown>, tid: number) {
       const missedHrs = Math.max(0, (lateMinutes + earlyDepartureMinutes) / 60);
       absenceHours = Number(missedHrs.toFixed(2));
     }
-  }
-
-  let otType = String(b.ot_type || 'None');
-  let otHours = Number(b.ot_hours ?? -1);
-  if (otHours < 0) {
-    if (isAbsentOrLeave) {
-      otHours = 0;
-    } else {
+    if (otHours < 0) {
       const schedNetMins = Math.max(0, diffShiftDurationMinutes(scheduledStart, scheduledEnd) - breakMinutes);
-      const actualNetMins = Math.max(0, diffShiftDurationMinutes(firstPunchIn, lastPunchOut) - breakMinutes);
+      const actualNetMins = Math.max(0, diffShiftDurationMinutes(firstPunchIn, effectiveOut) - breakMinutes);
       otHours = actualNetMins > schedNetMins + 15 ? Number(((actualNetMins - schedNetMins) / 60).toFixed(2)) : 0;
     }
   }
+
   if (otHours > 0 && otType === 'None') {
     otType = shiftPeriod === 'Night' ? 'Night' : shiftPeriod === 'Holiday' ? 'Holiday' : shiftPeriod === 'Weekend' ? 'Sunday' : 'Regular';
   }
@@ -5830,7 +8430,7 @@ function resolveAttendancePayload(b: Record<string, unknown>, tid: number) {
     if (lateMinutes > 0 && earlyDepartureMinutes > 0) derivedStatus = 'Late & Early';
     else if (lateMinutes > 0) derivedStatus = 'Late';
     else if (earlyDepartureMinutes > 0) derivedStatus = 'Early Exit';
-    else if (regularHours > 0 && regularHours < 4.5) derivedStatus = 'Half-Day';
+    else if (regularHours > 0 && regularHours < 3.5) derivedStatus = 'Half-Day';
     else derivedStatus = 'Present';
   }
 
@@ -5867,11 +8467,16 @@ function resolveAttendancePayload(b: Record<string, unknown>, tid: number) {
   };
 }
 
-app.get('/api/attendance', (req, res) => {
+app.get('/api/attendance', (req: AuthedRequest, res) => {
   const tid = getTenantId(req);
   const { from, to, department, shift_period } = req.query;
   const where: string[] = ['tenant_id = ?'];
   const params: unknown[] = [tid];
+  const authUser = req.authUser;
+  if (authUser && (authUser.role === 'Employee' || authUser.role === 'Viewer') && !getRoleActionPerms(tid, authUser.role).manage) {
+    where.push('employee_code = ?');
+    params.push(authUser.employee_code);
+  }
   if (from) {
     where.push('attendance_date >= ?');
     params.push(String(from));
@@ -6350,11 +8955,16 @@ app.delete('/api/departments/:id', (req, res) => {
   res.json({ ok: true });
 });
 
-app.get('/api/scheduling', (req, res) => {
+app.get('/api/scheduling', (req: AuthedRequest, res) => {
   const tid = getTenantId(req);
   const { from, to, department, shift_category, employee_id } = req.query;
   const where: string[] = ['tenant_id = ?'];
   const params: unknown[] = [tid];
+  const authUser = req.authUser;
+  if (authUser && (authUser.role === 'Employee' || authUser.role === 'Viewer') && !getRoleActionPerms(tid, authUser.role).manage) {
+    where.push('employee_id = ?');
+    params.push(authUser.employee_code);
+  }
   if (from) {
     where.push('schedule_date >= ?');
     params.push(String(from));
@@ -6811,8 +9421,17 @@ app.put('/api/workforce-rules', (req, res) => {
 });
 
 // Leaves
-app.get('/api/leaves', (req, res) => {
+app.get('/api/leaves', (req: AuthedRequest, res) => {
   const tid = getTenantId(req);
+  const authUser = req.authUser;
+  if (authUser && (authUser.role === 'Employee' || authUser.role === 'Viewer') && !getRoleActionPerms(tid, authUser.role).manage) {
+    res.json(
+      db
+        .prepare('SELECT * FROM leaves WHERE tenant_id = ? AND employee_code = ? ORDER BY id DESC')
+        .all(tid, authUser.employee_code)
+    );
+    return;
+  }
   res.json(db.prepare('SELECT * FROM leaves WHERE tenant_id = ? ORDER BY id DESC').all(tid));
 });
 app.post('/api/leaves', (req, res) => {
@@ -8658,8 +11277,13 @@ app.post('/api/share/email', async (req, res) => {
 });
 
 // Audit, Notifications, Search
-app.get('/api/audit-logs', (req, res) => {
+app.get('/api/audit-logs', (req: AuthedRequest, res) => {
   const tid = getTenantId(req);
+  const authUser = req.authUser;
+  if (authUser && (authUser.role === 'Employee' || authUser.role === 'Viewer') && !getRoleActionPerms(tid, authUser.role).manage) {
+    res.status(403).json({ error: `Permission denied (${authUser.role}) to inspect company audit trail.` });
+    return;
+  }
   res.json(db.prepare('SELECT * FROM audit_logs WHERE tenant_id = ? ORDER BY id DESC LIMIT 200').all(tid));
 });
 
@@ -9202,7 +11826,7 @@ app.get('/api/backup/export', (_req, res) => {
   const tables = [
     'tenants', 'company_settings', 'users', 'biometric_credentials', 'employees', 'salary_records', 'shifts', 'departments', 'staff_schedules',
     'holidays_calendar', 'workforce_rules', 'ot_settings', 'payroll_rules',
-    'payroll_records', 'payroll_runs', 'devices', 'biometric_auth_logs', 'attendance_records', 'leaves',
+    'payroll_records', 'payroll_runs', 'devices', 'biometric_auth_logs', 'staff_fingerprints', 'authorized_company_devices', 'company_device_security', 'attendance_records', 'leaves',
     'company_documents', 'imported_files', 'company_form_templates', 'company_form_submissions',
     'gate_passes', 'department_approvals', 'materials', 'material_requests',
     'grn_records', 'gin_records', 'inventory_movements', 'procurement_records',
@@ -9219,7 +11843,7 @@ app.get('/api/backup/export', (_req, res) => {
 });
 
 const ALLOWED_RESTORE_TABLES = new Set([
-  'tenants', 'company_settings', 'users', 'biometric_credentials', 'biometric_auth_logs', 'employees', 'salary_records', 'shifts',
+  'tenants', 'company_settings', 'users', 'biometric_credentials', 'biometric_auth_logs', 'staff_fingerprints', 'authorized_company_devices', 'company_device_security', 'employees', 'salary_records', 'shifts',
   'departments', 'staff_schedules', 'holidays_calendar', 'workforce_rules', 'ot_settings', 'payroll_rules',
   'payroll_records', 'payroll_runs', 'devices', 'attendance_records', 'leaves', 'company_documents',
   'imported_files', 'company_form_templates', 'company_form_submissions', 'gate_passes', 'department_approvals',

@@ -7,6 +7,7 @@ import {
   Download,
   FileSpreadsheet,
   FileUp,
+  Fingerprint,
   ImagePlus,
   Minus,
   Pencil,
@@ -28,6 +29,7 @@ import type {
   PayrollRecord,
   PayrollRules,
   PayrollRun,
+  StaffFingerprintRecord,
   TaxBracket,
 } from '../types';
 import { formatMoney } from '../utils/ethiopianCalendar';
@@ -38,6 +40,7 @@ import { PrintableSheetFrame } from './PrintableSheetFrame';
 import { printWithAutoFit } from '../utils/printFit';
 import { exportSignedPayrollSummaryPdf } from '../utils/payrollSignedPdf';
 import { ExecutivePayrollAnalytics } from './ExecutivePayrollAnalytics';
+import { ZktecoFingerprintModal } from './ZktecoFingerprintModal';
 
 interface HrPayrollModuleProps {
   mode: 'hr' | 'payroll';
@@ -122,6 +125,8 @@ export const HrPayrollModule: React.FC<HrPayrollModuleProps> = ({
 
   const [selectedEmpCard, setSelectedEmpCard] = useState<EmployeeProfile | null>(null);
   const [editingEmpId, setEditingEmpId] = useState<number | null>(null);
+  const [enrolledEmpIds, setEnrolledEmpIds] = useState<Set<string>>(new Set());
+  const [fpModalState, setFpModalState] = useState<{ emp: EmployeeProfile; isNew: boolean } | null>(null);
   const [hrPreviewMode, setHrPreviewMode] = useState<'id-card' | 'registration-sheet'>('id-card');
   const [selectedPayslip, setSelectedPayslip] = useState<PayrollRecord | null>(null);
   const [payrollTab, setPayrollTab] = useState<'sheet' | 'analytics' | 'runs' | 'individual' | 'rules'>('sheet');
@@ -210,16 +215,18 @@ export const HrPayrollModule: React.FC<HrPayrollModuleProps> = ({
 
   const loadData = async () => {
     try {
-      const [e, p, rList, rulesRow, otRow] = await Promise.all([
+      const [e, p, rList, rulesRow, otRow, fpRows] = await Promise.all([
         api.get<EmployeeProfile[]>('/api/employees'),
         api.get<PayrollRecord[]>('/api/payroll'),
         api.get<PayrollRun[]>('/api/payroll-runs').catch(() => []),
         api.get<PayrollRules>('/api/payroll-rules').catch(() => null),
         api.get<OtSettings>('/api/ot-settings').catch(() => null),
+        api.get<StaffFingerprintRecord[]>('/api/devices/zkteco/fingerprints').catch(() => []),
       ]);
       setEmployees(e);
       setPayrolls(p);
       setPayrollRuns(rList);
+      setEnrolledEmpIds(new Set(fpRows.filter((f) => f.status === 'Active').map((f) => f.employee_id)));
       if (otRow) {
         setOtSettings(otRow);
         setOtDraft({
@@ -744,7 +751,8 @@ export const HrPayrollModule: React.FC<HrPayrollModuleProps> = ({
                   setEmployees((prev) => [created, ...prev]);
                   setSelectedEmpCard(created);
                   setEmpForm(emptyEmpForm);
-                  setNotice(`Saved & registered ${created.full_name} (${created.employee_id}) with QR verification badge.`);
+                  setNotice(`Saved & registered ${created.full_name} (${created.employee_id}). Please scan their real finger on ZKTeco K40.`);
+                  setFpModalState({ emp: created, isNew: true });
                 }
                 onRefreshDashboard();
               } catch (err) {
@@ -1092,6 +1100,19 @@ export const HrPayrollModule: React.FC<HrPayrollModuleProps> = ({
                         <div className="flex items-center justify-end gap-1.5">
                           <button
                             type="button"
+                            onClick={() => setFpModalState({ emp, isNew: false })}
+                            className={`inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-semibold rounded-lg whitespace-nowrap border ${
+                              enrolledEmpIds.has(emp.employee_id)
+                                ? 'text-emerald-800 bg-emerald-50 hover:bg-emerald-100 border-emerald-200'
+                                : 'text-[#087CEB] bg-[#EAF4FF] hover:bg-[#DBEAFE] border-[#087CEB]/30'
+                            }`}
+                            title="Enroll real fingerprint from ZKTeco K40 or hardware reader"
+                          >
+                            <Fingerprint className="w-3.5 h-3.5" />
+                            {enrolledEmpIds.has(emp.employee_id) ? 'Finger Ready' : 'Enroll Finger'}
+                          </button>
+                          <button
+                            type="button"
                             onClick={() => setSelectedEmpCard(emp)}
                             className="px-2.5 py-1.5 text-xs font-semibold text-[#18243A] bg-[#DBEAFE] hover:bg-[#BFDBFE] border border-[#087CEB]/30 rounded-lg whitespace-nowrap"
                           >
@@ -1427,6 +1448,18 @@ export const HrPayrollModule: React.FC<HrPayrollModuleProps> = ({
             )}
           </div>
         </div>
+        {fpModalState && (
+          <ZktecoFingerprintModal
+            employee={fpModalState.emp}
+            isNewRegistration={fpModalState.isNew}
+            onClose={() => setFpModalState(null)}
+            onEnrolled={(fp) => {
+              setEnrolledEmpIds((prev) => new Set([...prev, fp.employee_id]));
+              setNotice(`Enrolled real fingerprint (${fp.finger_label}) for ${fp.employee_name} (${fp.employee_id}).`);
+              onRefreshDashboard();
+            }}
+          />
+        )}
       </div>
     );
   }

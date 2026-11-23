@@ -278,71 +278,6 @@ export const CompanyFormsModule: React.FC<CompanyFormsModuleProps> = ({
     setError(null);
   };
 
-  const handleLoadSampleData = (openPreview = false) => {
-    const emp = employees.find((e) => e.employee_id === employeeCode) || employees[0];
-    const today = new Date().toISOString().slice(0, 10);
-    setEditingSubId(null);
-    setEditingSubNumber(null);
-    setPreviewSubmission(null);
-    setFormTitleOverride(resolvedForm.name);
-    if (emp) {
-      setEmployeeCode(emp.employee_id);
-      setEmployeeName(emp.full_name);
-    } else {
-      setEmployeeCode('SS-EMP-001');
-      setEmployeeName('Abebe Bikila');
-    }
-    setSubmissionDate(today);
-    setReferenceNo(`SMP-${resolvedForm.code}-${today.replace(/-/g, '').slice(2)}`);
-    setStatus('Submitted');
-    setPreparedBy('HR & Operations Officer');
-    setCheckedBy(emp?.department ? `${emp.department} Supervisor` : 'Department Manager');
-    setApprovedBy('General Manager');
-
-    const sampleVals: Record<string, string> = {};
-    for (const f of resolvedForm.fields) {
-      const lbl = f.label.toLowerCase();
-      if (f.key === 'employee_code') sampleVals[f.key] = emp?.employee_id || 'SS-EMP-001';
-      else if (f.key === 'department') sampleVals[f.key] = emp?.department || resolvedForm.departmentName.replace(' Forms', '');
-      else if (f.key === 'job_title') sampleVals[f.key] = emp?.job_title || 'Senior Specialist';
-      else if (f.type === 'date') sampleVals[f.key] = today;
-      else if (f.type === 'number') sampleVals[f.key] = lbl.includes('amount') || lbl.includes('cost') || lbl.includes('salary') ? '12500' : '5';
-      else if (f.type === 'select' && f.options?.[0]) sampleVals[f.key] = f.options[0];
-      else if (f.type === 'textarea') {
-        sampleVals[f.key] = `Sample entry prepared for ${resolvedForm.name} (${resolvedForm.code}) covering ${resolvedForm.departmentName} operations, compliance verification, and departmental review.`;
-      } else if (lbl.includes('phone')) sampleVals[f.key] = '+251 911 234 567';
-      else if (lbl.includes('email')) sampleVals[f.key] = 'operations@sevensundayethiopia.com';
-      else if (lbl.includes('branch') || lbl.includes('location')) sampleVals[f.key] = 'Addis Ababa HQ / Adama Plant';
-      else sampleVals[f.key] = f.placeholder || `Sample ${f.label}`;
-    }
-    setFieldValues(sampleVals);
-
-    const sampleRows = [1, 2, 3].map((rowNum) =>
-      tableColumns.map((col, cIdx) => {
-        const c = col.toLowerCase();
-        if (c.includes('qty') || c.includes('count') || c.includes('hours')) return String(rowNum * 2);
-        if (c.includes('amount') || c.includes('price') || c.includes('birr') || c.includes('total')) return String(rowNum * 1500);
-        if (c.includes('status')) return rowNum === 3 ? 'Verified' : 'Approved';
-        if (c.includes('date')) return today;
-        if (cIdx === 0) return `Sample Item ${rowNum} (${resolvedForm.code})`;
-        return `Verified ${col} #${rowNum}`;
-      })
-    );
-    setTableRows(sampleRows);
-    setRemarks(`Sample populated for ${resolvedForm.code} (${resolvedForm.name}). All fields, line-items, and evaluation scores remain fully editable before saving or printing.`);
-    setEvaluationPeriod('Q4 2026');
-    setEvaluatorName('Department Manager');
-    setEvaluationRows(
-      DEFAULT_STAFF_EVALUATION_CRITERIA.map((r, i) => ({
-        ...r,
-        rating: i % 2 === 0 ? 5 : 4,
-        comments: i % 2 === 0 ? 'Consistently exceeds operational targets and quality standards.' : 'Strong teamwork and dependable execution.',
-      }))
-    );
-    if (openPreview) setWorkspaceTab('preview');
-    setNotice(`Loaded editable sample data for ${resolvedForm.code} (${resolvedForm.name}). Edit any field or print A4.`);
-  };
-
   const handleLoadLiveAttendanceShiftData = async (openPreview = false) => {
     setError(null);
     setNotice(null);
@@ -835,14 +770,6 @@ export const CompanyFormsModule: React.FC<CompanyFormsModuleProps> = ({
           >
             <Clock className="w-3.5 h-3.5 text-[#38BDF8]" />
             Attendance & Shift Forms (11)
-          </button>
-          <button
-            type="button"
-            onClick={() => handleLoadSampleData(true)}
-            className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-bold text-[#18243A] bg-[#EAF4FF] hover:bg-[#DBEAFE] border border-[#087CEB]/40 rounded-lg whitespace-nowrap"
-          >
-            <Eye className="w-3.5 h-3.5 text-[#087CEB]" />
-            View Sample (A4)
           </button>
           <button
             type="button"
@@ -1533,14 +1460,6 @@ export const CompanyFormsModule: React.FC<CompanyFormsModuleProps> = ({
                   )}
                   <button
                     type="button"
-                    onClick={() => handleLoadSampleData(false)}
-                    className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-[#18243A] bg-[#EAF4FF] hover:bg-[#DBEAFE] border border-[#087CEB]/30 rounded-lg whitespace-nowrap"
-                  >
-                    <Eye className="w-3.5 h-3.5 text-[#087CEB]" />
-                    Load Sample
-                  </button>
-                  <button
-                    type="button"
                     onClick={() => {
                       const emp = employees.find((e) => e.employee_id === employeeCode) || employees[0];
                       initializeFreshForm(resolvedForm, emp);
@@ -1766,14 +1685,6 @@ export const CompanyFormsModule: React.FC<CompanyFormsModuleProps> = ({
                       Load Live Attendance
                     </button>
                   )}
-                  <button
-                    type="button"
-                    onClick={() => handleLoadSampleData(true)}
-                    className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-[#18243A] bg-[#EAF4FF] hover:bg-[#DBEAFE] border border-[#087CEB]/30 rounded-lg whitespace-nowrap"
-                  >
-                    <Eye className="w-3.5 h-3.5 text-[#087CEB]" />
-                    Sample Data
-                  </button>
                   <SendToApproveButton
                     compact
                     sourceModule="company-forms"

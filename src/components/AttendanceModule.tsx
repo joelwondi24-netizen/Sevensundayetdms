@@ -23,7 +23,12 @@ import type {
   UserRole,
   WorkforceRules,
 } from '../types';
-import { formatMoney, toEthiopianDateString } from '../utils/ethiopianCalendar';
+import {
+  ETHIOPIAN_SHIFT_WINDOWS,
+  formatEthiopianLocalTime,
+  formatMoney,
+  toEthiopianDateString,
+} from '../utils/ethiopianCalendar';
 import { printWithAutoFit } from '../utils/printFit';
 import { ShareButton } from './ShareButton';
 
@@ -123,17 +128,17 @@ export const AttendanceModule: React.FC<AttendanceModuleProps> = ({
     shift_id: '',
     shift_name: 'Morning Shift',
     shift_period: 'Morning' as NonNullable<AttendanceRecord['shift_period']>,
-    scheduled_start: '06:00',
-    scheduled_end: '14:00',
-    check_in: '06:00',
-    check_out: '14:00',
-    morning_check_in: '06:00',
-    morning_check_out: '14:00',
+    scheduled_start: '08:00',
+    scheduled_end: '12:00',
+    check_in: '07:45',
+    check_out: '12:00',
+    morning_check_in: '07:45',
+    morning_check_out: '12:00',
     afternoon_check_in: '',
     afternoon_check_out: '',
     night_check_in: '',
     night_check_out: '',
-    break_minutes: '30',
+    break_minutes: '0',
     hourly_rate: '100',
     regular_hours: '',
     ot_type: 'None' as AttendanceRecord['ot_type'],
@@ -156,7 +161,7 @@ export const AttendanceModule: React.FC<AttendanceModuleProps> = ({
     );
     const sh = sched
       ? shiftList.find((x) => x.id === sched.shift_id || x.shift_name === sched.shift_name)
-      : shiftList[0];
+      : shiftList.find((x) => x.shift_code === 'SHF-MRN') || shiftList[0];
 
     const sName = sched?.shift_name || sh?.shift_name || 'Morning Shift';
     const lower = sName.toLowerCase();
@@ -173,9 +178,11 @@ export const AttendanceModule: React.FC<AttendanceModuleProps> = ({
       : lower.includes('holiday')
       ? 'Holiday'
       : 'Day';
-    const sStart = sched?.start_time || sh?.start_time || '06:00';
-    const sEnd = sched?.end_time || sh?.end_time || '14:00';
-    const brk = String(sched?.break_minutes ?? sh?.break_minutes ?? 30);
+    const fallbackStart = period === 'Morning' || period === 'Day' ? '08:00' : period === 'Afternoon' ? '13:00' : period === 'Night' ? '19:00' : '08:00';
+    const fallbackEnd = period === 'Morning' ? '12:00' : period === 'Afternoon' || period === 'Day' ? '17:00' : period === 'Night' ? '02:00' : '17:00';
+    const sStart = sched?.start_time || sh?.start_time || fallbackStart;
+    const sEnd = sched?.end_time || sh?.end_time || fallbackEnd;
+    const brk = String(sched?.break_minutes ?? sh?.break_minutes ?? (period === 'Day' ? 60 : 0));
 
     setForm((prev) => ({
       ...prev,
@@ -191,9 +198,9 @@ export const AttendanceModule: React.FC<AttendanceModuleProps> = ({
       check_in: sStart,
       check_out: sEnd,
       morning_check_in: period === 'Morning' || period === 'Day' ? sStart : '',
-      morning_check_out: period === 'Morning' || period === 'Day' ? sEnd : '',
-      afternoon_check_in: period === 'Afternoon' ? sStart : '',
-      afternoon_check_out: period === 'Afternoon' ? sEnd : '',
+      morning_check_out: period === 'Morning' ? sEnd : period === 'Day' ? '12:00' : '',
+      afternoon_check_in: period === 'Afternoon' ? sStart : period === 'Day' ? '13:00' : '',
+      afternoon_check_out: period === 'Afternoon' || period === 'Day' ? sEnd : '',
       night_check_in: period === 'Night' || period === 'Security' ? sStart : '',
       night_check_out: period === 'Night' || period === 'Security' ? sEnd : '',
       break_minutes: brk,
@@ -294,34 +301,113 @@ export const AttendanceModule: React.FC<AttendanceModuleProps> = ({
       };
     }
 
-    const schedInMin = timeToMin(form.scheduled_start);
-    const actualInMin = timeToMin(firstIn);
-    const rawLate = actualInMin - schedInMin;
-    const lateMins = rawLate > rules.late_grace_minutes ? rawLate : 0;
+    const activeShift = shifts.find((s) => String(s.id) === form.shift_id);
+    const period = form.shift_period;
+    const hasSplit = Boolean(form.morning_check_in && form.afternoon_check_in);
+    const isEthStandard = period === 'Morning' || period === 'Afternoon' || period === 'Night' || period === 'Day';
+    const lateGrace = Number(activeShift?.grace_late_minutes ?? (isEthStandard ? 0 : rules.late_grace_minutes ?? 15));
+    const earlyGrace = isEthStandard ? 2 : Number(rules.early_departure_grace_minutes ?? 10);
 
-    const schedDur = diffMin(form.scheduled_start, form.scheduled_end);
-    const actualDur = diffMin(firstIn, lastOut);
-    const rawEarly = schedDur - (actualInMin - schedInMin + actualDur);
-    const earlyMins = rawEarly > rules.early_departure_grace_minutes ? rawEarly : 0;
+    let lateMins = 0;
+    let earlyMins = 0;
+    let regHours = 0;
+    let autoOtHours = 0;
 
-    const actualNetHrs = Math.max(0, (actualDur - brk) / 60);
-    const schedNetHrs = Math.max(0, (schedDur - brk) / 60);
-    const regHours = form.regular_hours ? Number(form.regular_hours) : Number(Math.min(8, actualNetHrs).toFixed(2));
-    const otHours = form.ot_hours
-      ? Number(form.ot_hours)
-      : actualNetHrs > schedNetHrs + 0.25
-      ? Number((actualNetHrs - schedNetHrs).toFixed(2))
-      : 0;
+    if (period === 'Morning' && !form.afternoon_check_in && !form.afternoon_check_out) {
+      const mIn = timeToMin(form.morning_check_in || firstIn);
+      const mOut = timeToMin(form.morning_check_out || lastOut);
+      lateMins = mIn - 8 * 60 > lateGrace ? mIn - 8 * 60 : 0;
+      earlyMins = 12 * 60 - mOut > 2 ? 12 * 60 - mOut : 0;
+      regHours = Number(Math.min(4, Math.max(0, (mOut - Math.max(mIn, 7 * 60 + 45)) / 60)).toFixed(2));
+      if (mOut >= 17 * 60 + 10) {
+        autoOtHours = Number(((Math.min(mOut, 19 * 60) - (17 * 60 + 10)) / 60).toFixed(2));
+      }
+    } else if (period === 'Afternoon' && !form.morning_check_in && !form.morning_check_out) {
+      const aIn = timeToMin(form.afternoon_check_in || firstIn);
+      const aOut = timeToMin(form.afternoon_check_out || lastOut);
+      lateMins = aIn - 13 * 60 > lateGrace ? aIn - 13 * 60 : 0;
+      earlyMins = 17 * 60 - aOut > 2 ? 17 * 60 - aOut : 0;
+      regHours = Number(Math.min(4, Math.max(0, (Math.min(aOut, 17 * 60) - Math.max(aIn, 12 * 60 + 50)) / 60)).toFixed(2));
+      if (aOut >= 17 * 60 + 10) {
+        autoOtHours = Number(((Math.min(aOut, 19 * 60) - (17 * 60 + 10)) / 60).toFixed(2));
+      }
+    } else if (period === 'Day' || hasSplit) {
+      const finalOut = form.afternoon_check_out || lastOut;
+      const finalOutMin = timeToMin(finalOut);
+      if (hasSplit) {
+        const mIn = timeToMin(form.morning_check_in);
+        const mOut = timeToMin(form.morning_check_out || '12:00');
+        const mLate = mIn - 8 * 60 > lateGrace ? mIn - 8 * 60 : 0;
+        const mEarly = form.morning_check_out && 12 * 60 - mOut > 2 ? 12 * 60 - mOut : 0;
+        const mHrs = form.morning_check_out ? Math.min(4, Math.max(0, (Math.min(mOut, 12 * 60 + 30) - Math.max(mIn, 7 * 60 + 45)) / 60)) : 0;
+
+        const aIn = timeToMin(form.afternoon_check_in);
+        const aOut = timeToMin(finalOut);
+        const aLate = aIn - 13 * 60 > lateGrace ? aIn - 13 * 60 : 0;
+        const aEarly = 17 * 60 - aOut > 2 ? 17 * 60 - aOut : 0;
+        const aHrs = Math.min(4, Math.max(0, (Math.min(aOut, 17 * 60) - Math.max(aIn, 12 * 60 + 50)) / 60));
+
+        lateMins = mLate + aLate;
+        earlyMins = mEarly + aEarly;
+        regHours = Number(Math.min(8, mHrs + aHrs).toFixed(2));
+      } else {
+        const inMin = timeToMin(firstIn);
+        lateMins = inMin - 8 * 60 > lateGrace ? inMin - 8 * 60 : 0;
+        earlyMins = 17 * 60 - finalOutMin > 2 ? 17 * 60 - finalOutMin : 0;
+        regHours = Number(Math.min(8, Math.max(0, (Math.min(finalOutMin, 17 * 60) - Math.max(inMin, 7 * 60 + 45) - brk) / 60)).toFixed(2));
+      }
+      if (finalOutMin >= 17 * 60 + 10) {
+        autoOtHours = Number(((Math.min(finalOutMin, 19 * 60) - (17 * 60 + 10)) / 60).toFixed(2));
+      }
+    } else if (period === 'Night') {
+      const rawIn = timeToMin(form.night_check_in || firstIn);
+      const inRel = rawIn < 12 * 60 ? rawIn + 1440 : rawIn;
+      const rawOut = timeToMin(form.night_check_out || lastOut);
+      let outRel = rawOut <= 12 * 60 ? rawOut + 1440 : rawOut;
+      if (outRel <= inRel) outRel += 1440;
+
+      lateMins = inRel - 19 * 60 > lateGrace ? inRel - 19 * 60 : 0;
+      earlyMins = 26 * 60 - outRel > 2 ? 26 * 60 - outRel : 0;
+      const regEnd = Math.min(outRel, 26 * 60 + 10);
+      regHours = Number(Math.min(7, Math.max(0, (regEnd - Math.max(inRel, 18 * 60 + 50)) / 60)).toFixed(2));
+      if (outRel > 26 * 60 + 10) {
+        autoOtHours = Number(((Math.min(outRel, 31 * 60) - (26 * 60 + 10)) / 60).toFixed(2));
+      }
+    } else {
+      const schedInMin = timeToMin(form.scheduled_start);
+      const actualInMin = timeToMin(firstIn);
+      const rawLate = actualInMin - schedInMin;
+      lateMins = rawLate > lateGrace ? rawLate : 0;
+
+      const schedDur = diffMin(form.scheduled_start, form.scheduled_end);
+      const actualDur = diffMin(firstIn, lastOut);
+      const rawEarly = schedDur - (actualInMin - schedInMin + actualDur);
+      earlyMins = rawEarly > earlyGrace ? rawEarly : 0;
+
+      const actualNetHrs = Math.max(0, (actualDur - brk) / 60);
+      const schedNetHrs = Math.max(0, (schedDur - brk) / 60);
+      regHours = Number(Math.min(8, actualNetHrs).toFixed(2));
+      autoOtHours = actualNetHrs > schedNetHrs + 0.25 ? Number((actualNetHrs - schedNetHrs).toFixed(2)) : 0;
+    }
+
+    const finalRegHours = form.regular_hours ? Number(form.regular_hours) : regHours;
+    const otHours = form.ot_hours ? Number(form.ot_hours) : autoOtHours;
     const absenceHours = Number(((lateMins + earlyMins) / 60).toFixed(2));
     const rate = Number(form.hourly_rate) || 0;
-    const otPay = form.ot_type === 'None' && otHours === 0 ? 0 : otHours * rate * currentMultiplier;
+    const effMult =
+      form.ot_type === 'None' && otHours > 0
+        ? period === 'Night'
+          ? otSettings.ot_night_multiplier
+          : otSettings.ot_regular_multiplier
+        : currentMultiplier;
+    const otPay = form.ot_type === 'None' && otHours === 0 ? 0 : otHours * rate * effMult;
 
     let derivedStatus = form.status;
     if (derivedStatus === 'Auto') {
       if (lateMins > 0 && earlyMins > 0) derivedStatus = 'Late & Early';
       else if (lateMins > 0) derivedStatus = 'Late';
       else if (earlyMins > 0) derivedStatus = 'Early Exit';
-      else if (regHours > 0 && regHours < 4.5) derivedStatus = 'Half-Day';
+      else if (finalRegHours > 0 && finalRegHours < 3.5) derivedStatus = 'Half-Day';
       else derivedStatus = 'Present';
     }
 
@@ -331,12 +417,12 @@ export const AttendanceModule: React.FC<AttendanceModuleProps> = ({
       lateMins,
       earlyMins,
       absenceHours,
-      regHours,
+      regHours: finalRegHours,
       otHours,
       otPay,
       status: derivedStatus,
     };
-  }, [form, rules, currentMultiplier]);
+  }, [form, rules, shifts, otSettings, currentMultiplier]);
 
   const handleSaveMultipliers = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -675,6 +761,18 @@ export const AttendanceModule: React.FC<AttendanceModuleProps> = ({
                       scheduled_start: sh.start_time,
                       scheduled_end: sh.end_time,
                       break_minutes: String(sh.break_minutes),
+                      ...(editingId === null
+                        ? {
+                            check_in: sh.start_time,
+                            check_out: sh.end_time,
+                            morning_check_in: period === 'Morning' || period === 'Day' ? sh.start_time : '',
+                            morning_check_out: period === 'Morning' ? sh.end_time : period === 'Day' ? '12:00' : '',
+                            afternoon_check_in: period === 'Afternoon' ? sh.start_time : period === 'Day' ? '13:00' : '',
+                            afternoon_check_out: period === 'Afternoon' || period === 'Day' ? sh.end_time : '',
+                            night_check_in: period === 'Night' || period === 'Security' ? sh.start_time : '',
+                            night_check_out: period === 'Night' || period === 'Security' ? sh.end_time : '',
+                          }
+                        : {}),
                     }));
                   }
                 }}
@@ -724,12 +822,28 @@ export const AttendanceModule: React.FC<AttendanceModuleProps> = ({
             </div>
           </div>
 
+          {/* Ethiopian Local Time Signed Shift & Overtime Windows Reference */}
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-2.5 rounded-lg border border-sky-200 bg-sky-50/70 px-3 py-2 text-[11px] text-slate-700 dark:border-sky-900/50 dark:bg-sky-950/20 dark:text-slate-300">
+            <div>
+              <span className="font-bold text-sky-900 dark:text-sky-300">Morning (ET):</span>{' '}
+              <span className="font-mono">{ETHIOPIAN_SHIFT_WINDOWS.morning.ethLabel}</span>
+            </div>
+            <div>
+              <span className="font-bold text-amber-900 dark:text-amber-300">Afternoon (ET):</span>{' '}
+              <span className="font-mono">{ETHIOPIAN_SHIFT_WINDOWS.afternoon.ethLabel}</span>
+            </div>
+            <div>
+              <span className="font-bold text-indigo-900 dark:text-indigo-300">Night (ET):</span>{' '}
+              <span className="font-mono">{ETHIOPIAN_SHIFT_WINDOWS.night.ethLabel}</span>
+            </div>
+          </div>
+
           {/* Row 2: Dedicated Morning, Afternoon & Night Check-In / Check-Out Sessions */}
           <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
             {/* Morning Shift */}
             <div className="rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50/70 dark:bg-slate-800/50 p-3">
-              <div className="flex items-center justify-between mb-2">
-                <span className="text-xs font-bold text-slate-800 dark:text-slate-100">Morning Shift</span>
+              <div className="flex items-center justify-between mb-1">
+                <span className="text-xs font-bold text-slate-800 dark:text-slate-100">Morning Shift (1:45–6:30 ET)</span>
                 <button
                   type="button"
                   onClick={() => setForm((p) => ({ ...p, morning_check_in: p.morning_check_in || nowTimeHHMM(), shift_period: 'Morning' }))}
@@ -738,6 +852,7 @@ export const AttendanceModule: React.FC<AttendanceModuleProps> = ({
                   Stamp Now
                 </button>
               </div>
+              <p className="text-[10px] text-slate-500 mb-2">In 07:45–08:00 (1:45–2:00 ET) · Out 11:58–12:30 (5:58–6:30 ET)</p>
               <div className="grid grid-cols-2 gap-2">
                 <div>
                   <label className="block text-[11px] text-slate-500 mb-0.5">Morning Check-In</label>
@@ -747,6 +862,9 @@ export const AttendanceModule: React.FC<AttendanceModuleProps> = ({
                     onChange={(e) => setForm({ ...form, morning_check_in: e.target.value, check_in: e.target.value })}
                     className="w-full px-2 py-1.5 text-xs font-mono tabular-nums bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded"
                   />
+                  {form.morning_check_in && (
+                    <span className="block text-[10px] text-slate-400 font-mono mt-0.5">{formatEthiopianLocalTime(form.morning_check_in)}</span>
+                  )}
                 </div>
                 <div>
                   <label className="block text-[11px] text-slate-500 mb-0.5">Morning Check-Out</label>
@@ -756,14 +874,17 @@ export const AttendanceModule: React.FC<AttendanceModuleProps> = ({
                     onChange={(e) => setForm({ ...form, morning_check_out: e.target.value, check_out: e.target.value })}
                     className="w-full px-2 py-1.5 text-xs font-mono tabular-nums bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded"
                   />
+                  {form.morning_check_out && (
+                    <span className="block text-[10px] text-slate-400 font-mono mt-0.5">{formatEthiopianLocalTime(form.morning_check_out)}</span>
+                  )}
                 </div>
               </div>
             </div>
 
             {/* Afternoon Shift */}
             <div className="rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50/70 dark:bg-slate-800/50 p-3">
-              <div className="flex items-center justify-between mb-2">
-                <span className="text-xs font-bold text-slate-800 dark:text-slate-100">Afternoon Shift</span>
+              <div className="flex items-center justify-between mb-1">
+                <span className="text-xs font-bold text-slate-800 dark:text-slate-100">Afternoon Shift (6:50–11:00 ET)</span>
                 <button
                   type="button"
                   onClick={() => setForm((p) => ({ ...p, afternoon_check_in: p.afternoon_check_in || nowTimeHHMM(), shift_period: 'Afternoon' }))}
@@ -772,6 +893,7 @@ export const AttendanceModule: React.FC<AttendanceModuleProps> = ({
                   Stamp Now
                 </button>
               </div>
+              <p className="text-[10px] text-slate-500 mb-2">In 12:50–13:00 · Out 16:58–17:00 · OT 17:10–19:00 (11:10–1:00 PM ET)</p>
               <div className="grid grid-cols-2 gap-2">
                 <div>
                   <label className="block text-[11px] text-slate-500 mb-0.5">Afternoon Check-In</label>
@@ -781,6 +903,9 @@ export const AttendanceModule: React.FC<AttendanceModuleProps> = ({
                     onChange={(e) => setForm({ ...form, afternoon_check_in: e.target.value, check_in: e.target.value })}
                     className="w-full px-2 py-1.5 text-xs font-mono tabular-nums bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded"
                   />
+                  {form.afternoon_check_in && (
+                    <span className="block text-[10px] text-slate-400 font-mono mt-0.5">{formatEthiopianLocalTime(form.afternoon_check_in)}</span>
+                  )}
                 </div>
                 <div>
                   <label className="block text-[11px] text-slate-500 mb-0.5">Afternoon Check-Out</label>
@@ -790,14 +915,17 @@ export const AttendanceModule: React.FC<AttendanceModuleProps> = ({
                     onChange={(e) => setForm({ ...form, afternoon_check_out: e.target.value, check_out: e.target.value })}
                     className="w-full px-2 py-1.5 text-xs font-mono tabular-nums bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded"
                   />
+                  {form.afternoon_check_out && (
+                    <span className="block text-[10px] text-slate-400 font-mono mt-0.5">{formatEthiopianLocalTime(form.afternoon_check_out)}</span>
+                  )}
                 </div>
               </div>
             </div>
 
             {/* Night Shift */}
             <div className="rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50/70 dark:bg-slate-800/50 p-3">
-              <div className="flex items-center justify-between mb-2">
-                <span className="text-xs font-bold text-slate-800 dark:text-slate-100">Night Shift</span>
+              <div className="flex items-center justify-between mb-1">
+                <span className="text-xs font-bold text-slate-800 dark:text-slate-100">Night Shift (12:50–8:10 ET)</span>
                 <button
                   type="button"
                   onClick={() => setForm((p) => ({ ...p, night_check_in: p.night_check_in || nowTimeHHMM(), shift_period: 'Night' }))}
@@ -806,6 +934,7 @@ export const AttendanceModule: React.FC<AttendanceModuleProps> = ({
                   Stamp Now
                 </button>
               </div>
+              <p className="text-[10px] text-slate-500 mb-2">In 18:50–19:00 · Out 01:58–02:10 · OT 02:10–07:00 (8:10–1:00 AM ET)</p>
               <div className="grid grid-cols-2 gap-2">
                 <div>
                   <label className="block text-[11px] text-slate-500 mb-0.5">Night Check-In</label>
@@ -815,6 +944,9 @@ export const AttendanceModule: React.FC<AttendanceModuleProps> = ({
                     onChange={(e) => setForm({ ...form, night_check_in: e.target.value, check_in: e.target.value })}
                     className="w-full px-2 py-1.5 text-xs font-mono tabular-nums bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded"
                   />
+                  {form.night_check_in && (
+                    <span className="block text-[10px] text-slate-400 font-mono mt-0.5">{formatEthiopianLocalTime(form.night_check_in)}</span>
+                  )}
                 </div>
                 <div>
                   <label className="block text-[11px] text-slate-500 mb-0.5">Night Check-Out</label>
@@ -824,6 +956,9 @@ export const AttendanceModule: React.FC<AttendanceModuleProps> = ({
                     onChange={(e) => setForm({ ...form, night_check_out: e.target.value, check_out: e.target.value })}
                     className="w-full px-2 py-1.5 text-xs font-mono tabular-nums bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded"
                   />
+                  {form.night_check_out && (
+                    <span className="block text-[10px] text-slate-400 font-mono mt-0.5">{formatEthiopianLocalTime(form.night_check_out)}</span>
+                  )}
                 </div>
               </div>
             </div>
@@ -1061,16 +1196,36 @@ export const AttendanceModule: React.FC<AttendanceModuleProps> = ({
                     </td>
                     <td className="py-3 px-4 font-mono tabular-nums space-y-0.5 text-[11px]">
                       {rec.morning_check_in || rec.morning_check_out ? (
-                        <div>M: {rec.morning_check_in || '--'}–{rec.morning_check_out || '--'}</div>
+                        <div>
+                          M: {rec.morning_check_in || '--'}–{rec.morning_check_out || '--'}
+                          <span className="block text-[10px] text-slate-400">
+                            {rec.morning_check_in ? formatEthiopianLocalTime(rec.morning_check_in) : '--'} → {rec.morning_check_out ? formatEthiopianLocalTime(rec.morning_check_out) : '--'}
+                          </span>
+                        </div>
                       ) : null}
                       {rec.afternoon_check_in || rec.afternoon_check_out ? (
-                        <div>A: {rec.afternoon_check_in || '--'}–{rec.afternoon_check_out || '--'}</div>
+                        <div>
+                          A: {rec.afternoon_check_in || '--'}–{rec.afternoon_check_out || '--'}
+                          <span className="block text-[10px] text-slate-400">
+                            {rec.afternoon_check_in ? formatEthiopianLocalTime(rec.afternoon_check_in) : '--'} → {rec.afternoon_check_out ? formatEthiopianLocalTime(rec.afternoon_check_out) : '--'}
+                          </span>
+                        </div>
                       ) : null}
                       {rec.night_check_in || rec.night_check_out ? (
-                        <div>N: {rec.night_check_in || '--'}–{rec.night_check_out || '--'}</div>
+                        <div>
+                          N: {rec.night_check_in || '--'}–{rec.night_check_out || '--'}
+                          <span className="block text-[10px] text-slate-400">
+                            {rec.night_check_in ? formatEthiopianLocalTime(rec.night_check_in) : '--'} → {rec.night_check_out ? formatEthiopianLocalTime(rec.night_check_out) : '--'}
+                          </span>
+                        </div>
                       ) : null}
                       {!rec.morning_check_in && !rec.afternoon_check_in && !rec.night_check_in && (
-                        <div>{rec.check_in} – {rec.check_out}</div>
+                        <div>
+                          {rec.check_in} – {rec.check_out}
+                          <span className="block text-[10px] text-slate-400">
+                            {rec.check_in ? formatEthiopianLocalTime(rec.check_in) : '--'} → {rec.check_out ? formatEthiopianLocalTime(rec.check_out) : '--'}
+                          </span>
+                        </div>
                       )}
                     </td>
                     <td className="py-3 px-4 font-mono tabular-nums text-[11px]">

@@ -26,9 +26,10 @@ import {
   Users,
   X,
 } from 'lucide-react';
-import { api } from '../api';
+import { api, getCompanyDeviceUid, getDetectedDeviceLabel } from '../api';
 import type {
   AuditLogRecord,
+  AuthorizedCompanyDeviceRecord,
   CompanySettings,
   DeviceRecord,
   ModuleKey,
@@ -227,7 +228,7 @@ export const DEFAULT_RBAC_MATRIX: Record<UserRole, ModuleKey[]> = {
   Viewer: ['dashboard', 'chat', 'sync'],
 };
 
-type AdminTab = 'branding' | 'branches' | 'users' | 'rbac' | 'tenants' | 'platform' | 'logins' | 'smtp';
+type AdminTab = 'branding' | 'branches' | 'users' | 'rbac' | 'tenants' | 'platform' | 'logins' | 'device-security' | 'smtp';
 
 interface AdminModuleProps {
   settings: CompanySettings | null;
@@ -302,6 +303,17 @@ export const AdminModule: React.FC<AdminModuleProps> = ({
   const [users, setUsers] = useState<UserAccount[]>([]);
   const [devices, setDevices] = useState<DeviceRecord[]>([]);
   const [auditLogs, setAuditLogs] = useState<AuditLogRecord[]>([]);
+  const [loginAttempts, setLoginAttempts] = useState<
+    Array<{
+      id: number;
+      email: string;
+      ip_address: string;
+      user_agent: string;
+      success: number;
+      reason: string;
+      created_at: string;
+    }>
+  >([]);
   const [localTenants, setLocalTenants] = useState<TenantRecord[]>(propTenants || []);
 
   // Tenant CRUD state
@@ -336,6 +348,8 @@ export const AdminModule: React.FC<AdminModuleProps> = ({
   });
   const [smtpTesting, setSmtpTesting] = useState(false);
   const [smtpResult, setSmtpResult] = useState<string | null>(null);
+  const [confirmPurgeEmailUsers, setConfirmPurgeEmailUsers] = useState(false);
+  const [purgingUsers, setPurgingUsers] = useState(false);
   const [actionPerms, setActionPerms] = useState<Record<string, RbacActionPermissions>>({});
   const [savingActionRole, setSavingActionRole] = useState<string | null>(null);
   const [channelsCfg, setChannelsCfg] = useState<NotificationChannelConfig>({
@@ -358,6 +372,23 @@ export const AdminModule: React.FC<AdminModuleProps> = ({
     updated_at: '',
   });
   const [savingChannels, setSavingChannels] = useState(false);
+  const [companySecPolicy, setCompanySecPolicy] = useState<{
+    policy_enabled: boolean;
+    company_code_hint: string;
+    configured_by: string;
+    configured_at: string | null;
+  }>({ policy_enabled: false, company_code_hint: '', configured_by: '', configured_at: null });
+  const [authorizedDevices, setAuthorizedDevices] = useState<AuthorizedCompanyDeviceRecord[]>([]);
+  const [companyCodeInput, setCompanyCodeInput] = useState('');
+  const [companyPolicyActiveInput, setCompanyPolicyActiveInput] = useState(true);
+  const [savingDevicePolicy, setSavingDevicePolicy] = useState(false);
+  const [newCompanyDeviceForm, setNewCompanyDeviceForm] = useState({
+    device_uid: '',
+    device_name: '',
+    assigned_branch: 'Addis Ababa HQ',
+    assigned_to_email: '',
+    pre_verify: false,
+  });
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -376,23 +407,53 @@ export const AdminModule: React.FC<AdminModuleProps> = ({
 
   const loadAdminData = async () => {
     try {
-      const [uData, dData, aData, tData, pData, cData] = await Promise.all([
+      const [uData, dData, aData, tData, pData, cData, compDevData, attemptData] = await Promise.all([
         api.get<UserAccount[]>('/api/users'),
         api.get<DeviceRecord[]>('/api/devices'),
         api.get<AuditLogRecord[]>('/api/audit-logs'),
         api.get<TenantRecord[]>('/api/tenants'),
         api.get<Record<string, RbacActionPermissions>>('/api/rbac/permissions').catch(() => null),
         api.get<NotificationChannelConfig>('/api/notifications/channels').catch(() => null),
+        api
+          .get<{
+            policy: {
+              policy_enabled: boolean;
+              company_code_hint: string;
+              configured_by: string;
+              configured_at: string | null;
+            };
+            devices: AuthorizedCompanyDeviceRecord[];
+          }>('/api/admin/company-devices')
+          .catch(() => null),
+        api
+          .get<
+            Array<{
+              id: number;
+              email: string;
+              ip_address: string;
+              user_agent: string;
+              success: number;
+              reason: string;
+              created_at: string;
+            }>
+          >('/api/auth/login-attempts')
+          .catch(() => []),
       ]);
       setUsers(uData);
       setDevices(dData);
       setAuditLogs(aData);
+      setLoginAttempts(attemptData);
       setLocalTenants(tData);
       if (pData) {
         setActionPerms(pData);
       }
       if (cData) {
         setChannelsCfg(cData);
+      }
+      if (compDevData) {
+        setCompanySecPolicy(compDevData.policy);
+        setCompanyPolicyActiveInput(compDevData.policy.policy_enabled || !compDevData.policy.configured_at);
+        setAuthorizedDevices(compDevData.devices || []);
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load administration records');
@@ -684,6 +745,28 @@ export const AdminModule: React.FC<AdminModuleProps> = ({
     }
   };
 
+  const handlePurgeAllEmailUsers = async () => {
+    setError(null);
+    setNotice(null);
+    setPurgingUsers(true);
+    try {
+      const res = await api.post<{ ok: boolean; deletedCount: number; currentUserRemoved: boolean }>(
+        '/api/users/purge-email-users'
+      );
+      setConfirmPurgeEmailUsers(false);
+      setUsers([]);
+      setNotice(`Removed ${res.deletedCount} email-registered user account(s) including Super Administrators.`);
+      onRefreshDashboard();
+      if (res.currentUserRemoved) {
+        window.dispatchEvent(new CustomEvent('sevensunday:unauthorized'));
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to remove email-registered users');
+    } finally {
+      setPurgingUsers(false);
+    }
+  };
+
   const handleTestSmtp = async () => {
     setSmtpTesting(true);
     setSmtpResult(null);
@@ -700,8 +783,98 @@ export const AdminModule: React.FC<AdminModuleProps> = ({
     }
   };
 
+  const handleSaveCompanyDevicePolicy = async (e: React.FormEvent, registerThisDevice = true) => {
+    e.preventDefault();
+    setError(null);
+    setNotice(null);
+    setSavingDevicePolicy(true);
+    try {
+      const res = await api.post<{
+        ok: boolean;
+        policy_enabled: boolean;
+        company_code_hint: string;
+        registered_device_uid: string | null;
+      }>('/api/admin/company-devices/policy', {
+        company_code: companyCodeInput.trim() || undefined,
+        policy_enabled: companyPolicyActiveInput,
+        register_current_device_uid: registerThisDevice ? getCompanyDeviceUid() : undefined,
+        register_current_device_name: `Admin Terminal · ${getDetectedDeviceLabel()}`,
+        register_current_device_os: getDetectedDeviceLabel(),
+      });
+      setCompanyCodeInput('');
+      await loadAdminData();
+      window.dispatchEvent(new CustomEvent('sevensunday:device-security-changed'));
+      setNotice(
+        `Company Device Security Policy ${res.policy_enabled ? 'ENFORCED' : 'Paused'} (Code: ${res.company_code_hint}).${
+          res.registered_device_uid ? ` Registered this device (${res.registered_device_uid}).` : ''
+        }`
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to save Company Device Security Policy');
+    } finally {
+      setSavingDevicePolicy(false);
+    }
+  };
+
+  const handleRegisterCompanyDevice = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError(null);
+    setNotice(null);
+    try {
+      const created = await api.post<AuthorizedCompanyDeviceRecord>('/api/admin/company-devices', newCompanyDeviceForm);
+      setAuthorizedDevices((prev) => [created, ...prev.filter((d) => d.id !== created.id)]);
+      setNewCompanyDeviceForm({
+        device_uid: '',
+        device_name: '',
+        assigned_branch: 'Addis Ababa HQ',
+        assigned_to_email: '',
+        pre_verify: false,
+      });
+      setNotice(`Registered authorized company device "${created.device_name}" (${created.device_uid}).`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not register company device');
+    }
+  };
+
+  const handleToggleCompanyDeviceStatus = async (dev: AuthorizedCompanyDeviceRecord) => {
+    setError(null);
+    try {
+      const next = dev.status === 'Active' ? 'Suspended' : 'Active';
+      const updated = await api.patch<AuthorizedCompanyDeviceRecord>(`/api/admin/company-devices/${dev.id}`, {
+        status: next,
+      });
+      setAuthorizedDevices((prev) => prev.map((d) => (d.id === dev.id ? updated : d)));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to update device status');
+    }
+  };
+
+  const handleResetCompanyDeviceVerification = async (dev: AuthorizedCompanyDeviceRecord) => {
+    setError(null);
+    try {
+      const updated = await api.patch<AuthorizedCompanyDeviceRecord>(`/api/admin/company-devices/${dev.id}`, {
+        reset_verification: true,
+      });
+      setAuthorizedDevices((prev) => prev.map((d) => (d.id === dev.id ? updated : d)));
+      setNotice(`Cleared Company Code verification for ${dev.device_uid}. That device will require re-entering the Company Code.`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to reset verification');
+    }
+  };
+
+  const handleDeleteCompanyDevice = async (dev: AuthorizedCompanyDeviceRecord) => {
+    setError(null);
+    try {
+      await api.del(`/api/admin/company-devices/${dev.id}`);
+      setAuthorizedDevices((prev) => prev.filter((d) => d.id !== dev.id));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to delete device');
+    }
+  };
+
   const tabs: Array<{ key: AdminTab; label: string; icon: React.ReactNode }> = [
     { key: 'platform', label: 'System Admin Customizer', icon: <Sliders className="w-3.5 h-3.5" /> },
+    { key: 'device-security', label: 'Company Devices & Code', icon: <Lock className="w-3.5 h-3.5" /> },
     { key: 'tenants', label: 'Tenants (Multi-Tenancy)', icon: <Layers className="w-3.5 h-3.5" /> },
     { key: 'branding', label: 'Company & Branding', icon: <Building2 className="w-3.5 h-3.5" /> },
     { key: 'branches', label: 'Branches & Depts', icon: <GitBranch className="w-3.5 h-3.5" /> },
@@ -1725,12 +1898,49 @@ export const AdminModule: React.FC<AdminModuleProps> = ({
       {/* TAB 3: USER ACCOUNTS */}
       {tab === 'users' && (
         <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-6 space-y-4">
-          <div className="flex items-center gap-2">
-            <Users className="w-4 h-4 text-[#087CEB]" />
-            <h3 className="text-base font-bold text-[#172033] dark:text-white">
-              Ethiopia User Accounts ({users.length})
-            </h3>
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-2">
+              <Users className="w-4 h-4 text-[#087CEB]" />
+              <h3 className="text-base font-bold text-[#172033] dark:text-white">
+                Ethiopia User Accounts ({users.length})
+              </h3>
+            </div>
+            {(currentUserRole === 'Super Administrator' || currentUserRole === 'System Administrator') && users.length > 0 && (
+              <button
+                type="button"
+                onClick={() => setConfirmPurgeEmailUsers((v) => !v)}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-red-700 dark:text-red-300 bg-red-50 dark:bg-red-950/50 border border-red-200 dark:border-red-900 hover:bg-red-100 rounded-lg whitespace-nowrap"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                Remove All Email Users (incl. Super Admin)
+              </button>
+            )}
           </div>
+
+          {confirmPurgeEmailUsers && (
+            <div className="p-3.5 bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-900 rounded-lg flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
+              <div className="text-red-800 dark:text-red-200">
+                <span className="font-bold">Confirm User Purge:</span> This permanently removes all email-registered user accounts (including Super Administrator accounts) and signs out active sessions.
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => setConfirmPurgeEmailUsers(false)}
+                  className="px-3 py-1.5 font-semibold text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-50"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  disabled={purgingUsers}
+                  onClick={handlePurgeAllEmailUsers}
+                  className="px-3 py-1.5 font-bold text-white bg-red-600 hover:bg-red-700 disabled:opacity-60 rounded-lg"
+                >
+                  {purgingUsers ? 'Removing...' : 'Confirm Remove All'}
+                </button>
+              </div>
+            </div>
+          )}
 
           <form onSubmit={handleCreateUser} className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-7 gap-3">
             <input
@@ -2119,6 +2329,305 @@ export const AdminModule: React.FC<AdminModuleProps> = ({
                       </td>
                     </tr>
                   ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div className="lg:col-span-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden">
+            <div className="p-4 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between">
+              <h3 className="text-sm font-bold text-[#172033] dark:text-white">
+                Login Attempt &amp; Brute-Force Security Monitor
+              </h3>
+              <span className="text-xs font-mono text-slate-500">{loginAttempts.length} recorded attempts</span>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-left border-collapse text-xs">
+                <thead>
+                  <tr className="border-b border-slate-200 dark:border-slate-800 bg-[#F8FAFC] dark:bg-slate-800/60 font-semibold text-slate-600 dark:text-slate-300">
+                    <th className="py-2.5 px-4">Timestamp</th>
+                    <th className="py-2.5 px-4">Email</th>
+                    <th className="py-2.5 px-4">Client IP</th>
+                    <th className="py-2.5 px-4">Outcome</th>
+                    <th className="py-2.5 px-4">Reason</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-200 dark:divide-slate-800">
+                  {loginAttempts.length === 0 ? (
+                    <tr>
+                      <td colSpan={5} className="py-6 text-center text-slate-500">
+                        No login attempt events recorded yet.
+                      </td>
+                    </tr>
+                  ) : (
+                    loginAttempts.map((att) => (
+                      <tr key={att.id}>
+                        <td className="py-2.5 px-4 font-mono text-slate-600 dark:text-slate-300 whitespace-nowrap">
+                          {new Date(att.created_at).toLocaleString()}
+                        </td>
+                        <td className="py-2.5 px-4 font-mono font-semibold text-[#172033] dark:text-white">
+                          {att.email}
+                        </td>
+                        <td className="py-2.5 px-4 font-mono text-slate-500">{att.ip_address || '--'}</td>
+                        <td className="py-2.5 px-4 font-bold">
+                          {att.success ? (
+                            <span className="text-emerald-700 dark:text-emerald-400">Success</span>
+                          ) : (
+                            <span className="text-red-700 dark:text-red-400">Blocked / Failed</span>
+                          )}
+                        </td>
+                        <td className="py-2.5 px-4 text-slate-600 dark:text-slate-300">{att.reason}</td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* TAB: COMPANY DEVICES & SECURITY CODE */}
+      {tab === 'device-security' && (
+        <div className="space-y-6">
+          <form
+            onSubmit={(e) => handleSaveCompanyDevicePolicy(e, true)}
+            className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-6 space-y-4"
+          >
+            <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-slate-200 dark:border-slate-800">
+              <div>
+                <h3 className="text-base font-bold text-[#172033] dark:text-white flex items-center gap-2">
+                  <Lock className="w-4 h-4 text-[#087CEB]" />
+                  Company Security Code &amp; Device Authorization Policy
+                </h3>
+                <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                  Configure the Company Code once. Once enforced, any unregistered device sees a blocking 35% security
+                  popup until registered here by an Admin / Super Administrator and unlocked with the Company Code.
+                </p>
+              </div>
+              <div className="text-xs font-mono">
+                {companySecPolicy.policy_enabled ? (
+                  <span className="px-2.5 py-1 bg-emerald-50 text-emerald-700 border border-emerald-200 rounded font-bold">
+                    ENFORCED · Code {companySecPolicy.company_code_hint || 'Set'}
+                  </span>
+                ) : (
+                  <span className="px-2.5 py-1 bg-amber-50 text-amber-800 border border-amber-200 rounded font-bold">
+                    FIRST-TIME SETUP (OPEN)
+                  </span>
+                )}
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4 items-end">
+              <div>
+                <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">
+                  {companySecPolicy.company_code_hint
+                    ? `Update Company Code (Current: ${companySecPolicy.company_code_hint})`
+                    : 'Set New Company Security Code *'}
+                </label>
+                <input
+                  type="text"
+                  placeholder={companySecPolicy.company_code_hint ? 'Leave blank to keep existing code' : 'e.g. SS-ETH-2026'}
+                  value={companyCodeInput}
+                  onChange={(e) => setCompanyCodeInput(e.target.value)}
+                  className="w-full px-3 py-2 text-sm font-mono bg-[#F8FAFC] dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg"
+                />
+              </div>
+
+              <div className="p-2.5 rounded-lg bg-[#F8FAFC] dark:bg-slate-800 border border-slate-200 dark:border-slate-700">
+                <div className="text-[11px] text-slate-500">Current Workstation Device ID</div>
+                <div className="text-xs font-mono font-bold text-[#172033] dark:text-white">
+                  {getCompanyDeviceUid()}
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-3">
+                <label className="inline-flex items-center gap-2 text-xs font-semibold text-[#172033] dark:text-slate-200 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={companyPolicyActiveInput}
+                    onChange={(e) => setCompanyPolicyActiveInput(e.target.checked)}
+                    className="w-4 h-4 accent-[#087CEB]"
+                  />
+                  Enforce Device Gate
+                </label>
+                <button
+                  type="submit"
+                  disabled={savingDevicePolicy}
+                  className="flex-1 inline-flex items-center justify-center gap-1.5 px-4 py-2 text-xs font-bold text-white bg-[#087CEB] hover:bg-[#0265C4] disabled:opacity-60 rounded-lg whitespace-nowrap"
+                >
+                  <Save className="w-3.5 h-3.5" />
+                  {savingDevicePolicy ? 'Saving...' : 'Save Code & Register This Device'}
+                </button>
+              </div>
+            </div>
+          </form>
+
+          {/* Register Additional Company Devices */}
+          <form
+            onSubmit={handleRegisterCompanyDevice}
+            className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-6 space-y-4"
+          >
+            <div>
+              <h4 className="text-sm font-bold text-[#172033] dark:text-white">
+                Register Authorized Company Device
+              </h4>
+              <p className="text-xs text-slate-500 dark:text-slate-400">
+                Copy the Device ID shown on a staff laptop, tablet, or gate kiosk popup and register it here so the
+                user can unlock it using the Company Code.
+              </p>
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-5 gap-3">
+              <div>
+                <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">Device UID *</label>
+                <input
+                  type="text"
+                  required
+                  placeholder="SS-TERM-XXXX-XXXX-XXXX"
+                  value={newCompanyDeviceForm.device_uid}
+                  onChange={(e) =>
+                    setNewCompanyDeviceForm({ ...newCompanyDeviceForm, device_uid: e.target.value.toUpperCase() })
+                  }
+                  className="w-full px-3 py-2 text-xs font-mono bg-[#F8FAFC] dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">Device Name *</label>
+                <input
+                  type="text"
+                  required
+                  placeholder="e.g. HR Reception PC"
+                  value={newCompanyDeviceForm.device_name}
+                  onChange={(e) => setNewCompanyDeviceForm({ ...newCompanyDeviceForm, device_name: e.target.value })}
+                  className="w-full px-3 py-2 text-xs bg-[#F8FAFC] dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">Branch</label>
+                <input
+                  type="text"
+                  placeholder="Addis Ababa HQ"
+                  value={newCompanyDeviceForm.assigned_branch}
+                  onChange={(e) =>
+                    setNewCompanyDeviceForm({ ...newCompanyDeviceForm, assigned_branch: e.target.value })
+                  }
+                  className="w-full px-3 py-2 text-xs bg-[#F8FAFC] dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">
+                  Assigned Staff Email
+                </label>
+                <input
+                  type="email"
+                  placeholder="optional@sevensundayethiopia.com"
+                  value={newCompanyDeviceForm.assigned_to_email}
+                  onChange={(e) =>
+                    setNewCompanyDeviceForm({ ...newCompanyDeviceForm, assigned_to_email: e.target.value })
+                  }
+                  className="w-full px-3 py-2 text-xs bg-[#F8FAFC] dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg"
+                />
+              </div>
+              <div className="flex items-end">
+                <button
+                  type="submit"
+                  className="w-full inline-flex items-center justify-center gap-1.5 px-4 py-2 text-xs font-bold text-white bg-[#18243A] hover:bg-[#172033] rounded-lg whitespace-nowrap"
+                >
+                  <Plus className="w-3.5 h-3.5 text-[#087CEB]" />
+                  Register Device
+                </button>
+              </div>
+            </div>
+          </form>
+
+          {/* Authorized Devices List */}
+          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden">
+            <div className="p-4 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between">
+              <h4 className="text-sm font-bold text-[#172033] dark:text-white">
+                Authorized Company Devices ({authorizedDevices.length})
+              </h4>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-left border-collapse text-xs">
+                <thead>
+                  <tr className="border-b border-slate-200 dark:border-slate-800 bg-[#18243A] text-white">
+                    <th className="py-2.5 px-4">Device UID</th>
+                    <th className="py-2.5 px-4">Device Name &amp; Branch</th>
+                    <th className="py-2.5 px-4">Registered By</th>
+                    <th className="py-2.5 px-4">Company Code Status</th>
+                    <th className="py-2.5 px-4">Access Status</th>
+                    <th className="py-2.5 px-4 text-right">Actions</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-200 dark:divide-slate-800">
+                  {authorizedDevices.length === 0 ? (
+                    <tr>
+                      <td colSpan={6} className="py-6 text-center text-slate-500">
+                        No company devices registered yet. Save a Company Security Code above to register this workstation.
+                      </td>
+                    </tr>
+                  ) : (
+                    authorizedDevices.map((dev) => (
+                      <tr key={dev.id} className="hover:bg-[#F8FAFC] dark:hover:bg-slate-800/40">
+                        <td className="py-2.5 px-4 font-mono font-bold text-[#172033] dark:text-white">
+                          {dev.device_uid}
+                        </td>
+                        <td className="py-2.5 px-4">
+                          <div className="font-semibold text-[#172033] dark:text-white">{dev.device_name}</div>
+                          <div className="text-[11px] text-slate-500">
+                            {dev.assigned_branch}
+                            {dev.assigned_to_email ? ` · ${dev.assigned_to_email}` : ''}
+                          </div>
+                        </td>
+                        <td className="py-2.5 px-4 text-slate-600 dark:text-slate-300">{dev.registered_by || 'Admin'}</td>
+                        <td className="py-2.5 px-4">
+                          {dev.verified_at ? (
+                            <span className="inline-flex items-center gap-1 text-emerald-700 dark:text-emerald-400 font-semibold">
+                              <CheckCircle2 className="w-3.5 h-3.5" />
+                              Code Verified
+                            </span>
+                          ) : (
+                            <span className="text-amber-700 dark:text-amber-400 font-semibold">
+                              Awaiting Code Entry
+                            </span>
+                          )}
+                        </td>
+                        <td className="py-2.5 px-4">
+                          <span
+                            className={`font-bold ${
+                              dev.status === 'Active' ? 'text-emerald-700 dark:text-emerald-400' : 'text-red-600'
+                            }`}
+                          >
+                            {dev.status}
+                          </span>
+                        </td>
+                        <td className="py-2.5 px-4 text-right space-x-1.5 whitespace-nowrap">
+                          <button
+                            type="button"
+                            onClick={() => handleResetCompanyDeviceVerification(dev)}
+                            className="px-2 py-1 text-[11px] font-semibold bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 rounded"
+                            title="Require device to re-enter Company Code"
+                          >
+                            Require Code
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleToggleCompanyDeviceStatus(dev)}
+                            className="px-2 py-1 text-[11px] font-semibold bg-[#EAF4FF] text-[#087CEB] rounded"
+                          >
+                            {dev.status === 'Active' ? 'Suspend' : 'Activate'}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleDeleteCompanyDevice(dev)}
+                            className="px-2 py-1 text-[11px] font-semibold bg-red-50 text-red-700 rounded"
+                          >
+                            Remove
+                          </button>
+                        </td>
+                      </tr>
+                    ))
+                  )}
                 </tbody>
               </table>
             </div>

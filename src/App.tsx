@@ -37,11 +37,12 @@ import {
   Wallet,
   X,
 } from 'lucide-react';
-import { api, getApiActorHeaders, getApiTenantId, setApiActor, setApiTenant, setAuthToken } from './api';
+import { api, getApiActorHeaders, getApiTenantId, getCompanyDeviceUid, setApiActor, setApiTenant, setAuthToken } from './api';
 import { AdminModule, DEFAULT_RBAC_MATRIX } from './components/AdminModule';
 import { AssetsVehiclesModule } from './components/AssetsVehiclesModule';
 import { AttendanceModule } from './components/AttendanceModule';
 import { ChatModule } from './components/ChatModule';
+import { CompanyDeviceGateModal } from './components/CompanyDeviceGateModal';
 import { CompanyFormsModule } from './components/CompanyFormsModule';
 import { DashboardModule } from './components/DashboardModule';
 import { DevicesModule } from './components/DevicesModule';
@@ -64,6 +65,7 @@ import { useRealtimeWS, type WsEventPayload } from './hooks/useRealtimeWS';
 import { getPendingQueue, setOfflineSyncKey, syncQueuedMutations } from './offline/syncEngine';
 import type {
   AuthSessionResponse,
+  CompanyDeviceSecurityStatus,
   CompanySettings,
   DashboardSummary,
   GlobalSearchResult,
@@ -319,6 +321,7 @@ export default function App() {
   const [searchingDb, setSearchingDb] = useState(false);
   const [lastWsEvent, setLastWsEvent] = useState<WsEventPayload | null>(null);
   const [pendingQueueCount, setPendingQueueCount] = useState(0);
+  const [companyDeviceStatus, setCompanyDeviceStatus] = useState<CompanyDeviceSecurityStatus | null>(null);
 
   const isOnline = useOnlineStatus();
 
@@ -430,21 +433,41 @@ export default function App() {
     [currentUser, refreshCompanyAndSummary, refreshDashboard]
   );
 
+  const refreshCompanyDeviceStatus = useCallback(async () => {
+    try {
+      const uid = getCompanyDeviceUid();
+      const status = await api.get<CompanyDeviceSecurityStatus>(
+        `/api/security/company-devices/status?device_uid=${encodeURIComponent(uid)}`
+      );
+      setCompanyDeviceStatus(status);
+    } catch {
+      // ignore transient connectivity errors
+    }
+  }, []);
+
   useEffect(() => {
     const cleanupPrint = installGlobalBeforePrintFit();
     refreshCompanyAndSummary();
+    refreshCompanyDeviceStatus();
     refreshQueueCount();
     const handler = () => {
       refreshQueueCount();
     };
+    const onSecurityChange = () => {
+      void refreshCompanyDeviceStatus();
+    };
     window.addEventListener('sevensunday-sync-queue-updated', handler);
     window.addEventListener('seven-sunday-sync-updated', handler);
+    window.addEventListener('sevensunday:device-unverified', onSecurityChange);
+    window.addEventListener('sevensunday:device-security-changed', onSecurityChange);
     return () => {
       cleanupPrint();
       window.removeEventListener('sevensunday-sync-queue-updated', handler);
       window.removeEventListener('seven-sunday-sync-updated', handler);
+      window.removeEventListener('sevensunday:device-unverified', onSecurityChange);
+      window.removeEventListener('sevensunday:device-security-changed', onSecurityChange);
     };
-  }, [refreshCompanyAndSummary, refreshQueueCount]);
+  }, [refreshCompanyAndSummary, refreshCompanyDeviceStatus, refreshQueueCount]);
 
   useEffect(() => {
     try {
@@ -533,6 +556,10 @@ export default function App() {
 
   const { connected: wsConnected, onlineUsers } = useRealtimeWS((evt) => {
     setLastWsEvent(evt);
+    if (evt.event === 'company:device_security_updated') {
+      void refreshCompanyDeviceStatus();
+      return;
+    }
     if (evt.event === 'tenant:updated') {
       refreshTenants();
       return;
@@ -590,18 +617,31 @@ export default function App() {
     setDbSearchResults([]);
   };
 
+  const deviceGateBlocked = Boolean(
+    companyDeviceStatus?.policy_enabled && !companyDeviceStatus.device_verified
+  );
+
   if (!currentUser) {
     return (
-      <LoginScreen
-        company={company}
-        onLogin={handleLogin}
-        tenants={tenants}
-        activeTenantId={activeTenantId}
-        onSelectTenant={handleSwitchTenant}
-        lang={lang}
-        onChangeLang={handleChangeLang}
-        platformConfig={platformConfig}
-      />
+      <>
+        <LoginScreen
+          company={company}
+          onLogin={handleLogin}
+          tenants={tenants}
+          activeTenantId={activeTenantId}
+          onSelectTenant={handleSwitchTenant}
+          lang={lang}
+          onChangeLang={handleChangeLang}
+          platformConfig={platformConfig}
+        />
+        {deviceGateBlocked && companyDeviceStatus && (
+          <CompanyDeviceGateModal
+            status={companyDeviceStatus}
+            onVerified={refreshCompanyDeviceStatus}
+            onRefreshStatus={refreshCompanyDeviceStatus}
+          />
+        )}
+      </>
     );
   }
 
@@ -1243,6 +1283,13 @@ export default function App() {
         </div>
       )}
 
+      {deviceGateBlocked && companyDeviceStatus && (
+        <CompanyDeviceGateModal
+          status={companyDeviceStatus}
+          onVerified={refreshCompanyDeviceStatus}
+          onRefreshStatus={refreshCompanyDeviceStatus}
+        />
+      )}
     </div>
   );
 }

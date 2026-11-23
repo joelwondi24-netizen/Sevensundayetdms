@@ -1,6 +1,59 @@
 import { cacheGetResponse, enqueueMutation, getCachedResponse } from './offline/syncEngine';
 
 const TENANT_STORAGE_KEY = 'seven_sunday_active_tenant_id';
+const DEVICE_UID_STORAGE_KEY = 'seven_sunday_company_device_uid';
+
+export function getCompanyDeviceUid(): string {
+  try {
+    const existing = localStorage.getItem(DEVICE_UID_STORAGE_KEY);
+    if (existing && /^SS-TERM-[A-Z0-9-]+$/i.test(existing.trim())) {
+      return existing.trim().toUpperCase();
+    }
+    const bytes = new Uint8Array(6);
+    if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
+      crypto.getRandomValues(bytes);
+    } else {
+      for (let i = 0; i < bytes.length; i += 1) {
+        bytes[i] = Math.floor(Math.random() * 256);
+      }
+    }
+    const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, '0'))
+      .join('')
+      .toUpperCase();
+    const generated = `SS-TERM-${hex.slice(0, 4)}-${hex.slice(4, 8)}-${hex.slice(8, 12)}`;
+    localStorage.setItem(DEVICE_UID_STORAGE_KEY, generated);
+    return generated;
+  } catch {
+    return 'SS-TERM-LOCAL-0001';
+  }
+}
+
+export function getDetectedDeviceLabel(): string {
+  if (typeof navigator === 'undefined') return 'Workstation Browser';
+  const ua = navigator.userAgent || '';
+  const platform =
+    ua.includes('Android')
+      ? 'Android'
+      : ua.includes('iPhone') || ua.includes('iPad')
+      ? 'iOS'
+      : ua.includes('Mac')
+      ? 'macOS'
+      : ua.includes('Linux')
+      ? 'Linux'
+      : ua.includes('Windows')
+      ? 'Windows'
+      : 'Desktop';
+  const browser = ua.includes('Edg/')
+    ? 'Edge'
+    : ua.includes('Chrome/')
+    ? 'Chrome'
+    : ua.includes('Firefox/')
+    ? 'Firefox'
+    : ua.includes('Safari/')
+    ? 'Safari'
+    : 'Browser';
+  return `${browser} (${platform})`;
+}
 
 let actorName = 'System Operator';
 let actorRole = 'Employee';
@@ -47,6 +100,7 @@ export function getApiActorHeaders(): Record<string, string> {
     'x-actor-name': actorName,
     'x-actor-role': actorRole,
     'x-tenant-id': String(activeTenantId),
+    'x-device-uid': getCompanyDeviceUid(),
   };
   if (authToken) {
     headers['Authorization'] = `Bearer ${authToken}`;
@@ -63,6 +117,9 @@ function getTenantCacheKey(url: string): string {
 async function parseErrorMessage(res: Response): Promise<string> {
   try {
     const data = await res.json();
+    if (res.status === 403 && data && data.code === 'COMPANY_DEVICE_UNVERIFIED') {
+      window.dispatchEvent(new CustomEvent('sevensunday:device-unverified'));
+    }
     if (data && typeof data.error === 'string') return data.error;
     if (data && typeof data.message === 'string') return data.message;
   } catch {

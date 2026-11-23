@@ -35,7 +35,7 @@ import type {
   UserRole,
   WorkforceRules,
 } from '../types';
-import { toEthiopianDateString } from '../utils/ethiopianCalendar';
+import { formatEthiopianLocalTime, toEthiopianDateString } from '../utils/ethiopianCalendar';
 import { printWithAutoFit } from '../utils/printFit';
 import { SendToApproveButton } from './SendToApproveButton';
 import { ShareButton } from './ShareButton';
@@ -156,9 +156,9 @@ export const SchedulingModule: React.FC<SchedulingModuleProps> = ({
     shift_id: '',
     schedule_date: new Date().toISOString().slice(0, 10),
     end_date: new Date().toISOString().slice(0, 10),
-    start_time: '06:00',
-    end_time: '14:00',
-    break_minutes: 30,
+    start_time: '08:00',
+    end_time: '12:00',
+    break_minutes: 0,
     schedule_type: 'Regular' as StaffScheduleRecord['schedule_type'],
     rotation_group: 'Group-A',
     approval_status: 'Approved' as StaffScheduleRecord['approval_status'],
@@ -207,9 +207,9 @@ export const SchedulingModule: React.FC<SchedulingModuleProps> = ({
     shift_name: '',
     shift_category: 'Morning Shift' as ShiftCategory,
     scheduling_system: '3-Shift' as ShiftDefinition['scheduling_system'],
-    start_time: '06:00',
-    end_time: '14:00',
-    break_minutes: 30,
+    start_time: '08:00',
+    end_time: '12:00',
+    break_minutes: 0,
     working_days: ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'],
     rest_days: ['Sun'],
     min_rest_hours: 11,
@@ -217,7 +217,7 @@ export const SchedulingModule: React.FC<SchedulingModuleProps> = ({
     rotation_pattern: 'Weekly 3-Shift Rotation',
     color_hex: '#0ea5e9',
     ot_multiplier: 1.5,
-    grace_late_minutes: 10,
+    grace_late_minutes: 0,
     status: 'Active' as 'Active' | 'Inactive',
     notes: '',
   });
@@ -1664,6 +1664,9 @@ export const SchedulingModule: React.FC<SchedulingModuleProps> = ({
                     <td className="px-3 py-2.5 tabular-nums">
                       <div>
                         {sh.start_time} – {sh.end_time}
+                      </div>
+                      <div className="text-[10px] text-slate-400 font-mono">
+                        {formatEthiopianLocalTime(sh.start_time)} – {formatEthiopianLocalTime(sh.end_time)}
                       </div>
                       <div className="text-[11px] text-slate-500">{sh.break_minutes} min break</div>
                     </td>

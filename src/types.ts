@@ -1054,3 +1054,82 @@ export interface RbacActionPermissions {
   manage: boolean;
 }
 
+export interface StaffFingerprintRecord {
+  id: number;
+  tenant_id: number;
+  employee_id: string;
+  employee_name: string;
+  department: string;
+  zk_user_pin: string;
+  finger_index: number;
+  finger_label: string;
+  template_hash: string;
+  template_size: number;
+  device_id: number | null;
+  device_serial: string;
+  auth_source?: string;
+  credential_id?: string;
+  enrolled_by: string;
+  status: 'Active' | 'Revoked';
+  last_scanned_at: string | null;
+  created_at: string;
+}
+
+export interface ZkEnrollJobRecord {
+  id: number;
+  tenant_id: number;
+  device_id: number | null;
+  device_serial: string;
+  employee_id: string;
+  employee_name: string;
+  zk_user_pin: string;
+  finger_index: number;
+  finger_label: string;
+  channel: 'TCP4370' | 'ADMS' | 'BRIDGE' | string;
+  adms_cmd_id: string;
+  status: 'Pending' | 'WaitingFinger' | 'Enrolled' | 'Failed' | 'Cancelled';
+  status_message: string;
+  created_at: string;
+  completed_at: string | null;
+}
+
+export interface ZkRealtimeListenerStatus {
+  device_id: number;
+  device_name: string;
+  ip_address: string;
+  port: number;
+  serial_number: string;
+  running: boolean;
+  started_at: string;
+  last_event_at: string | null;
+  events_count: number;
+}
+
+export interface CompanyDeviceSecurityStatus {
+  policy_enabled: boolean;
+  device_uid: string;
+  device_registered: boolean;
+  device_verified: boolean;
+  device_status: 'Active' | 'Suspended' | 'Unregistered';
+  device_name: string;
+  company_code_hint: string;
+  configured_by: string;
+  configured_at: string | null;
+  total_registered_devices: number;
+}
+
+export interface AuthorizedCompanyDeviceRecord {
+  id: number;
+  tenant_id: number;
+  device_uid: string;
+  device_name: string;
+  device_os: string;
+  assigned_branch: string;
+  assigned_to_email: string;
+  status: 'Active' | 'Suspended';
+  verified_at: string | null;
+  registered_by: string;
+  last_seen_at: string | null;
+  created_at: string;
+}
+

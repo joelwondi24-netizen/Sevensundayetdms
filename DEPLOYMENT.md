@@ -54,11 +54,12 @@ server {
 
 ### 5. Security Safeguards Enabled
 - **Password Hashing**: Node `crypto.scryptSync` (N=16384, r=8, p=1) with 16-byte random salt and `crypto.timingSafeEqual`.
-- **Brute-Force Lockout & Rate Limiting**: Sliding-window per-IP rate limits on `/api/auth/*` and `/api/*`; 5 consecutive failed logins trigger a 15-minute account lock with audit & security notification.
+- **Brute-Force Lockout, Monitoring & Rate Limiting**: Sliding-window per-IP rate limits on `/api/auth/*` and `/api/*`; 5 consecutive failed logins trigger a 15-minute account lock with persistent `login_attempts` logging (`/api/auth/login-attempts`), audit trail, and security notification.
 - **MFA (TOTP RFC 6238)**: 6-digit authenticator app verification enrollable in **Synchronization Center → MFA & Session Security**.
 - **At-Rest Field Encryption**: AES-256-GCM encryption for SMTP passwords, device API keys, TOTP MFA secrets, and notification tokens.
-- **Session & Device Control**: SHA-256 hashed Bearer tokens held strictly in client memory, active session listing, and one-click remote session revocation.
-- **Role-Based Access Control (RBAC)**: Server-side role & module/action enforcement across HR, Salary, Payroll, Finance, Backups, and Admin routes.
+- **Session & Device Control**: SHA-256 hashed Bearer tokens held strictly in client memory, active session listing, one-click remote session revocation, and Company Device + Company Code security enforcement.
+- **Granular Role-Based Access Control (RBAC) & Scoping**: Server-side enforcement of role privileges (`view`, `create`, `edit`, `delete`, `approve`, `export`, `manage`) plus self/department scoping on HR, Attendance, Leave, Scheduling, Payroll, Finance, Backups, and Admin routes.
+- **ZKTeco K40 Real-Time Biometric Integration**: Supports direct TCP port `4370` (`CMD_STARTENROLL` / `CMD_REG_EVENT`), ADMS HTTP Push (`/iclock/cdata`), LAN Bridge script, and local hardware WebAuthn fingerprint readers with live scanner status indicators (`connecting` → `scanning` → `success` / `error`) and automated Attendance Check-In / Check-Out recording.
 
 ---
 
@@ -77,3 +78,18 @@ For multi-region or multi-node deployments:
 1. Provision managed PostgreSQL 16+ and Redis 7+.
 2. Export existing tenant data via `/api/backup/export` and import into PostgreSQL tables preserving `tenant_id` partitioning.
 3. Move `auth_sessions` and rate-limiter buckets to Redis (`EX` TTL keys) for shared multi-instance session validation.
+
+---
+
+### 8. Render Deployment & Firebase Authorized Domains
+When hosting the application on **Render** (e.g. `https://<your-service>.onrender.com`):
+1. **Render Environment Variables**:
+   - Set `NODE_ENV=production` and `PORT=3000`.
+   - Attach a Render Persistent Disk (e.g. mounted at `/var/data`) and set `DATA_DIR=/var/data` so `sevensunday.db`, backups, and keys survive redeploys.
+   - Set `APP_ENCRYPTION_KEY` to a 32+ byte secret (`openssl rand -hex 32`).
+   - Set `VITE_RENDER_DOMAIN=<your-service>.onrender.com` before running `npm run build` so `src/lib/firebase.ts` includes your exact Render hostname in `FIREBASE_DOMAIN_WHITELIST`.
+   - Keep `VITE_FIREBASE_AUTH_DOMAIN` unset (defaulting to `gen-lang-client-0397627314.firebaseapp.com`), **or** only set `VITE_FIREBASE_AUTH_DOMAIN=<your-service>.onrender.com` with `VITE_FIREBASE_USE_CUSTOM_AUTH_DOMAIN=true` if Render reverse-proxies `/__/auth/*` to Firebase Hosting.
+2. **Firebase Console → Authorized Domains (Required for Google Sign-In on Render)**:
+   - Open [Firebase Console Authentication Settings](https://console.firebase.google.com/project/gen-lang-client-0397627314/authentication/settings).
+   - Under **Authorized domains**, click **Add domain** and add `<your-service>.onrender.com` (and any custom corporate domain such as `portal.sevensundayethiopia.com`).
+
