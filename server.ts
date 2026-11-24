@@ -1059,6 +1059,10 @@ ensureColumn('devices', 'timezone', "TEXT NOT NULL DEFAULT 'Africa/Addis_Ababa'"
 ensureColumn('devices', 'total_imported_count', 'INTEGER NOT NULL DEFAULT 0');
 ensureColumn('devices', 'failed_sync_count', 'INTEGER NOT NULL DEFAULT 0');
 ensureColumn('devices', 'last_error', "TEXT NOT NULL DEFAULT ''");
+ensureColumn('devices', 'k40_user_count', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('devices', 'k40_fp_count', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('devices', 'k40_attlog_count', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('devices', 'k40_device_time', "TEXT NOT NULL DEFAULT ''");
 
 ensureColumn('staff_fingerprints', 'auth_source', "TEXT NOT NULL DEFAULT 'ZKTeco K40'");
 ensureColumn('staff_fingerprints', 'credential_id', "TEXT NOT NULL DEFAULT ''");
@@ -1138,6 +1142,7 @@ CREATE TABLE IF NOT EXISTS device_sync_logs (
   latency_ms INTEGER NOT NULL DEFAULT 0,
   error_message TEXT NOT NULL DEFAULT '',
   triggered_by TEXT NOT NULL DEFAULT 'Auto-Poller',
+  k40_fp_count INTEGER,
   started_at TEXT NOT NULL,
   completed_at TEXT NOT NULL
 );
@@ -1197,6 +1202,8 @@ CREATE TABLE IF NOT EXISTS i18n_translations (
   UNIQUE(lang_code, translation_key)
 );
 `);
+
+ensureColumn('device_sync_logs', 'k40_fp_count', 'INTEGER');
 
 // Multi-Tenant isolation columns across all operational tables (default 1 = Primary HQ Tenant)
 const TENANT_SCOPED_TABLES = [
@@ -5217,17 +5224,67 @@ async function probeDeviceRecord(dev: {
   port: number;
   protocol?: string;
   endpoint_url?: string;
+  device_type?: string;
+  comm_password_enc?: string;
 }) {
   const useHttp =
     dev.protocol === 'HTTP/HTTPS REST' ||
     (typeof dev.endpoint_url === 'string' && /^https?:\/\//i.test(dev.endpoint_url.trim()));
+  const isK40Tcp =
+    !useHttp &&
+    (Number(dev.port) === 4370 ||
+      String(dev.device_type || '').toLowerCase().includes('biometric') ||
+      String(dev.protocol || '').toLowerCase().includes('zkteco'));
+
+  const now = new Date().toISOString();
+  if (isK40Tcp) {
+    const commPass = dev.comm_password_enc ? decryptField(dev.comm_password_enc) : '';
+    const zkRes = await zkTestConnectionReadOnly(dev.ip_address, Number(dev.port) || 4370, commPass);
+    const status = zkRes.ok ? 'Connected' : 'Unreachable';
+    if (zkRes.ok) {
+      db.prepare(
+        `UPDATE devices SET status=?, last_latency_ms=?, last_error='', last_message=?, last_checked_at=?, last_sync_at=?,
+          k40_user_count=COALESCE(?, k40_user_count),
+          k40_fp_count=COALESCE(?, k40_fp_count),
+          k40_attlog_count=COALESCE(?, k40_attlog_count),
+          k40_device_time=CASE WHEN ? != '' THEN ? ELSE k40_device_time END
+        WHERE id=?`
+      ).run(
+        status,
+        zkRes.latencyMs,
+        zkRes.message,
+        now,
+        now,
+        zkRes.freeSizes?.users ?? null,
+        zkRes.freeSizes?.fingerprints ?? null,
+        zkRes.freeSizes?.attlogs ?? null,
+        zkRes.deviceTime || '',
+        zkRes.deviceTime || '',
+        dev.id
+      );
+    } else {
+      db.prepare('UPDATE devices SET status=?, last_latency_ms=?, last_error=?, last_message=?, last_checked_at=? WHERE id=?').run(
+        status,
+        zkRes.latencyMs,
+        zkRes.message,
+        zkRes.message,
+        now,
+        dev.id
+      );
+    }
+    return {
+      probe: { ok: zkRes.ok, latencyMs: zkRes.latencyMs, message: zkRes.message },
+      status,
+      updated: maskDeviceRow(db.prepare('SELECT * FROM devices WHERE id = ?').get(dev.id)),
+    };
+  }
+
   const probe = useHttp
     ? await httpProbe(dev.endpoint_url?.trim() || `http://${dev.ip_address}:${dev.port}/`, 2200)
     : await tcpProbe(dev.ip_address, Number(dev.port) || 4370, 1800);
   const status = probe.ok ? 'Connected' : 'Unreachable';
-  const now = new Date().toISOString();
   if (probe.ok) {
-    db.prepare('UPDATE devices SET status=?, last_latency_ms=?, last_message=?, last_checked_at=?, last_sync_at=? WHERE id=?').run(
+    db.prepare("UPDATE devices SET status=?, last_latency_ms=?, last_error='', last_message=?, last_checked_at=?, last_sync_at=? WHERE id=?").run(
       status,
       probe.latencyMs,
       probe.message,
@@ -5236,9 +5293,10 @@ async function probeDeviceRecord(dev: {
       dev.id
     );
   } else {
-    db.prepare('UPDATE devices SET status=?, last_latency_ms=?, last_message=?, last_checked_at=? WHERE id=?').run(
+    db.prepare('UPDATE devices SET status=?, last_latency_ms=?, last_error=?, last_message=?, last_checked_at=? WHERE id=?').run(
       status,
       probe.latencyMs,
+      probe.message,
       probe.message,
       now,
       dev.id
@@ -5847,6 +5905,8 @@ const ZK_CMD_DISABLEDEVICE = 1003;
 const ZK_CMD_AUTH = 1102;
 const ZK_CMD_USER_WRQ = 8;
 const ZK_CMD_USER_RRQ = 9;
+const ZK_CMD_OPTIONS_RRQ = 11;
+const ZK_CMD_GET_FREE_SIZES = 50;
 const ZK_CMD_STARTENROLL = 61;
 const ZK_CMD_CANCELCAPTURE = 62;
 const ZK_CMD_GET_TIME = 201;
@@ -5858,6 +5918,7 @@ const ZK_CMD_ACK_UNAUTH = 2005;
 const ZK_CMD_PREPARE_DATA = 1500;
 const ZK_CMD_DATA = 1501;
 const ZK_CMD_FREE_DATA = 1502;
+const ZK_TCP_MAGIC = Buffer.from([0x50, 0x50, 0x82, 0x7d]);
 
 const ZK_EF_ATTLOG = 1;
 const ZK_EF_FINGER = 2;
@@ -6106,70 +6167,180 @@ async function zkSetUserAndStartEnroll(
   }
 }
 
-function parseZkAttlogPayload(raw: Buffer): Array<{ zk_user_pin: string; timestamp: string; punch_type: 'Check-In' | 'Check-Out'; punch_state: number; verify_mode: string }> {
-  const records: Array<{ zk_user_pin: string; timestamp: string; punch_type: 'Check-In' | 'Check-Out'; punch_state: number; verify_mode: string }> = [];
-  if (raw.length < 12) return records;
-  // Standard 40-byte attendance log layout on ZKTeco K40 (starts after optional 4-byte total size header when present)
-  const startOffset = raw.length % 40 === 4 ? 4 : 0;
-  if (raw.length - startOffset >= 40) {
+function consumeNextZkTcpFrame(recvBuf: Buffer): { body: Buffer; rest: Buffer } | null {
+  const magicIdx = recvBuf.indexOf(ZK_TCP_MAGIC);
+  if (magicIdx < 0) {
+    return null;
+  }
+  const aligned = magicIdx > 0 ? recvBuf.subarray(magicIdx) : recvBuf;
+  if (aligned.length < 16) return null;
+  const expectedLen = aligned.readUInt32LE(4);
+  if (expectedLen < 8 || expectedLen > 16 * 1024 * 1024) {
+    return consumeNextZkTcpFrame(aligned.subarray(4));
+  }
+  if (aligned.length < 8 + expectedLen) return null;
+  return {
+    body: aligned.subarray(8, 8 + expectedLen),
+    rest: aligned.subarray(8 + expectedLen),
+  };
+}
+
+function parseZkFreeSizes(payload: Buffer): { users: number; fingerprints: number; attlogs: number } | null {
+  // Standard ZKTeco CMD_GET_FREE_SIZES payload: 16..19=users, 24..27=fingerprints, 32..35=attlogs (or 64+ bytes)
+  if (!payload || payload.length < 36) return null;
+  return {
+    users: payload.readUInt32LE(16),
+    fingerprints: payload.readUInt32LE(24),
+    attlogs: payload.readUInt32LE(32),
+  };
+}
+
+interface ParsedZkUsersMap {
+  byPin: Record<string, string>;
+  byUid: Record<number, { pin: string; name: string }>;
+}
+
+function parseZkUsersPayload(raw: Buffer): ParsedZkUsersMap {
+  const byPin: Record<string, string> = {};
+  const byUid: Record<number, { pin: string; name: string }> = {};
+  if (raw.length < 28) return { byPin, byUid };
+  // Standard 72-byte K40 user format
+  if (raw.length >= 72 && (raw.length % 72 === 4 || raw.length % 72 === 0)) {
+    const startOffset = raw.length % 72 === 4 ? 4 : 0;
+    for (let offset = startOffset; offset + 72 <= raw.length; offset += 72) {
+      const uid = raw.readUInt16LE(offset);
+      const nameBuf = raw.subarray(offset + 11, offset + 35);
+      const nameNull = nameBuf.indexOf(0);
+      const name = (nameNull >= 0 ? nameBuf.subarray(0, nameNull) : nameBuf).toString('utf8').replace(/\0/g, '').trim();
+      const pinBuf = raw.subarray(offset + 48, offset + 72);
+      const pinNull = pinBuf.indexOf(0);
+      const asciiPin = (pinNull >= 0 ? pinBuf.subarray(0, pinNull) : pinBuf).toString('ascii').replace(/\0/g, '').trim();
+      const effectivePin = asciiPin || (uid > 0 ? String(uid) : '');
+      if (effectivePin) {
+        if (name) byPin[effectivePin] = name;
+        if (uid > 0) byUid[uid] = { pin: effectivePin, name };
+      }
+    }
+    return { byPin, byUid };
+  }
+  // Legacy 28-byte user format fallback
+  const startOffset = raw.length % 28 === 4 ? 4 : 0;
+  for (let offset = startOffset; offset + 28 <= raw.length; offset += 28) {
+    const uid = raw.readUInt16LE(offset);
+    const nameBuf = raw.subarray(offset + 8, offset + 20);
+    const nameNull = nameBuf.indexOf(0);
+    const name = (nameNull >= 0 ? nameBuf.subarray(0, nameNull) : nameBuf).toString('utf8').replace(/\0/g, '').trim();
+    const numId = raw.readUInt32LE(offset + 24);
+    const pin = numId > 0 ? String(numId) : uid > 0 ? String(uid) : '';
+    if (pin) {
+      if (name) byPin[pin] = name;
+      if (uid > 0) byUid[uid] = { pin, name };
+    }
+  }
+  return { byPin, byUid };
+}
+
+function mapZkVerifyMode(verifiedByte: number): string {
+  if (verifiedByte === 1 || verifiedByte === 4) return 'Fingerprint';
+  if (verifiedByte === 15) return 'Face ID';
+  if (verifiedByte === 2) return 'RFID Card';
+  if (verifiedByte === 3) return 'Password';
+  return 'Fingerprint';
+}
+
+function parseZkAttlogPayload(
+  raw: Buffer,
+  usersInfo?: ParsedZkUsersMap
+): Array<{ zk_user_pin: string; device_user_name?: string; timestamp: string; punch_type: 'Check-In' | 'Check-Out'; punch_state: number; verify_mode: string }> {
+  const records: Array<{ zk_user_pin: string; device_user_name?: string; timestamp: string; punch_type: 'Check-In' | 'Check-Out'; punch_state: number; verify_mode: string }> = [];
+  if (raw.length < 8) return records;
+
+  // Standard 40-byte TCP attendance log layout on ZKTeco K40 (with optional 4-byte total size header)
+  if (raw.length >= 40 && (raw.length % 40 === 4 || raw.length % 40 === 0)) {
+    const startOffset = raw.length % 40 === 4 ? 4 : 0;
     for (let offset = startOffset; offset + 40 <= raw.length; offset += 40) {
+      const userSn = raw.readUInt16LE(offset);
       const pinBuf = raw.subarray(offset + 2, offset + 26);
       const nullIdx = pinBuf.indexOf(0);
-      const pin = (nullIdx >= 0 ? pinBuf.subarray(0, nullIdx) : pinBuf).toString('ascii').trim();
+      const asciiPin = (nullIdx >= 0 ? pinBuf.subarray(0, nullIdx) : pinBuf).toString('ascii').replace(/\0/g, '').trim();
+      const uidEntry = userSn > 0 ? usersInfo?.byUid[userSn] : undefined;
+      const pin = asciiPin || uidEntry?.pin || (userSn > 0 ? String(userSn) : '');
       const verifiedByte = raw[offset + 26];
       const timeVal = raw.readUInt32LE(offset + 27);
       const punchState = raw.length > offset + 31 ? raw[offset + 31] : 0;
-      const verifyMode =
-        verifiedByte === 1 || verifiedByte === 4
-          ? 'Fingerprint'
-          : verifiedByte === 15
-          ? 'Face ID'
-          : verifiedByte === 3
-          ? 'Password'
-          : 'Fingerprint';
       if (pin && timeVal > 0) {
         records.push({
           zk_user_pin: pin,
+          device_user_name: usersInfo?.byPin[pin] || uidEntry?.name || '',
           timestamp: decodeZkTime(timeVal),
           punch_type: punchState === 1 || punchState === 5 ? 'Check-Out' : 'Check-In',
           punch_state: punchState,
-          verify_mode: verifyMode,
+          verify_mode: mapZkVerifyMode(verifiedByte),
         });
       }
+    }
+    return records;
+  }
+
+  // Fallback 16-byte compact record layout
+  if (raw.length >= 16 && (raw.length % 16 === 4 || raw.length % 16 === 0)) {
+    const startOffset = raw.length % 16 === 4 ? 4 : 0;
+    for (let offset = startOffset; offset + 16 <= raw.length; offset += 16) {
+      const userSn = raw.readUInt32LE(offset);
+      const verifiedByte = raw[offset + 4];
+      const timeVal = raw.readUInt32LE(offset + 8);
+      const punchState = raw[offset + 12];
+      const uidEntry = userSn > 0 ? usersInfo?.byUid[userSn] : undefined;
+      const pin = uidEntry?.pin || (userSn > 0 ? String(userSn) : '');
+      if (pin && timeVal > 0) {
+        records.push({
+          zk_user_pin: pin,
+          device_user_name: uidEntry?.name || usersInfo?.byPin[pin] || '',
+          timestamp: decodeZkTime(timeVal),
+          punch_type: punchState === 1 || punchState === 5 ? 'Check-Out' : 'Check-In',
+          punch_state: punchState,
+          verify_mode: mapZkVerifyMode(verifiedByte),
+        });
+      }
+    }
+    return records;
+  }
+
+  // Fallback 8-byte legacy record layout
+  const startOffset = raw.length % 8 === 4 ? 4 : 0;
+  for (let offset = startOffset; offset + 8 <= raw.length; offset += 8) {
+    const userSn = raw.readUInt16LE(offset);
+    const verifiedByte = raw[offset + 2];
+    const punchState = raw[offset + 3];
+    const timeVal = raw.readUInt32LE(offset + 4);
+    const uidEntry = userSn > 0 ? usersInfo?.byUid[userSn] : undefined;
+    const pin = uidEntry?.pin || (userSn > 0 ? String(userSn) : '');
+    if (pin && timeVal > 0) {
+      records.push({
+        zk_user_pin: pin,
+        device_user_name: uidEntry?.name || usersInfo?.byPin[pin] || '',
+        timestamp: decodeZkTime(timeVal),
+        punch_type: punchState === 1 || punchState === 5 ? 'Check-Out' : 'Check-In',
+        punch_state: punchState,
+        verify_mode: mapZkVerifyMode(verifiedByte),
+      });
     }
   }
   return records;
 }
 
-function parseZkUsersPayload(raw: Buffer): Record<string, string> {
-  const map: Record<string, string> = {};
-  if (raw.length < 72) return map;
-  const startOffset = raw.length % 72 === 4 ? 4 : 0;
-  for (let offset = startOffset; offset + 72 <= raw.length; offset += 72) {
-    const nameBuf = raw.subarray(offset + 11, offset + 35);
-    const nameNull = nameBuf.indexOf(0);
-    const name = (nameNull >= 0 ? nameBuf.subarray(0, nameNull) : nameBuf).toString('utf8').trim();
-    const pinBuf = raw.subarray(offset + 48, offset + 72);
-    const pinNull = pinBuf.indexOf(0);
-    const pin = (pinNull >= 0 ? pinBuf.subarray(0, pinNull) : pinBuf).toString('ascii').trim();
-    if (pin && name) {
-      map[pin] = name;
-    }
-  }
-  return map;
-}
-
-// Strictly READ-ONLY TCP/IP ZKTeco K40 Client (supports CommKey authentication + multi-packet PREPARE_DATA/DATA chunk assembly).
-// NEVER sends clear/delete/write/overwrite/reset commands.
+// Strictly READ-ONLY TCP/IP ZKTeco K40 Client (CommKey auth + chunked PREPARE_DATA/DATA + FREE_DATA + USER_RRQ + GET_FREE_SIZES).
+// NEVER sends clear/delete/write/overwrite/enroll/reset commands.
 async function zkPullAttendanceFromK40(
   ip: string,
   port: number,
   commPassword = '',
-  timeoutMs = 2800
+  timeoutMs = 3500
 ): Promise<{
   connected: boolean;
   latencyMs: number;
   sessionId?: number;
+  freeSizes?: { users: number; fingerprints: number; attlogs: number } | null;
   records: Array<{ zk_user_pin: string; device_user_name?: string; timestamp: string; punch_type: 'Check-In' | 'Check-Out'; punch_state: number; verify_mode: string }>;
   message: string;
 }> {
@@ -6177,37 +6348,55 @@ async function zkPullAttendanceFromK40(
   return new Promise((resolve) => {
     const socket = new net.Socket();
     let settled = false;
-    let recvBuf = Buffer.alloc(0);
+    let recvBuf: Buffer = Buffer.alloc(0);
     let sessionId = 0;
     let replyId = 0;
-    let phase: 'CONNECT' | 'AUTH' | 'READ_ATTLOG' | 'READ_ATTLOG_CHUNKS' | 'FREE_ATTLOG' | 'READ_USERS' | 'READ_USERS_CHUNKS' | 'FREE_USERS' | 'EXIT' = 'CONNECT';
+    let phase:
+      | 'CONNECT'
+      | 'AUTH'
+      | 'READ_ATTLOG'
+      | 'READ_ATTLOG_CHUNKS'
+      | 'FREE_ATTLOG'
+      | 'READ_USERS'
+      | 'READ_USERS_CHUNKS'
+      | 'FREE_USERS'
+      | 'READ_SIZES'
+      | 'EXIT' = 'CONNECT';
     let expectedTotalBytes = 0;
+    let chunkDrainTimer: NodeJS.Timeout | null = null;
     const attChunks: Buffer[] = [];
     const userChunks: Buffer[] = [];
-    let attBuffer = Buffer.alloc(0);
-    let userBuffer = Buffer.alloc(0);
+    let attBuffer: Buffer = Buffer.alloc(0);
+    let userBuffer: Buffer = Buffer.alloc(0);
+    let freeSizes: { users: number; fingerprints: number; attlogs: number } | null = null;
+
+    const clearDrain = () => {
+      if (chunkDrainTimer) {
+        clearTimeout(chunkDrainTimer);
+        chunkDrainTimer = null;
+      }
+    };
 
     const finish = (connected: boolean, message: string) => {
       if (settled) return;
       settled = true;
+      clearDrain();
       try {
         socket.destroy();
       } catch {
         // ignore
       }
       if (!connected) {
-        resolve({ connected: false, latencyMs: Date.now() - start, records: [], message });
+        resolve({ connected: false, latencyMs: Date.now() - start, records: [], freeSizes: null, message });
         return;
       }
-      const userMap = parseZkUsersPayload(userBuffer);
-      const parsed = parseZkAttlogPayload(attBuffer).map((r) => ({
-        ...r,
-        device_user_name: userMap[r.zk_user_pin] || '',
-      }));
+      const usersInfo = parseZkUsersPayload(userBuffer);
+      const parsed = parseZkAttlogPayload(attBuffer, usersInfo);
       resolve({
         connected: true,
         latencyMs: Date.now() - start,
         sessionId,
+        freeSizes,
         records: parsed,
         message: message || `ZKTeco K40 Read-Only sync OK (${Date.now() - start}ms · ${parsed.length} punch record(s))`,
       });
@@ -6215,7 +6404,7 @@ async function zkPullAttendanceFromK40(
 
     socket.setTimeout(timeoutMs);
     socket.on('timeout', () => {
-      if (phase === 'READ_USERS' || phase === 'READ_USERS_CHUNKS' || phase === 'FREE_USERS' || phase === 'EXIT') {
+      if (phase === 'READ_USERS' || phase === 'READ_USERS_CHUNKS' || phase === 'FREE_USERS' || phase === 'READ_SIZES' || phase === 'EXIT') {
         finish(true, `ZKTeco K40 Read-Only sync OK (${Date.now() - start}ms)`);
       } else {
         finish(false, `ZKTeco K40 TCP timeout at ${ip}:${port}`);
@@ -6234,11 +6423,11 @@ async function zkPullAttendanceFromK40(
 
     socket.on('data', (chunk) => {
       recvBuf = Buffer.concat([recvBuf, chunk]);
-      while (recvBuf.length >= 16 && recvBuf[0] === 0x50 && recvBuf[1] === 0x50 && recvBuf[2] === 0x82 && recvBuf[3] === 0x7d) {
-        const expectedLen = recvBuf.readUInt32LE(4);
-        if (recvBuf.length < 8 + expectedLen) break;
-        const body = recvBuf.subarray(8, 8 + expectedLen);
-        recvBuf = recvBuf.subarray(8 + expectedLen);
+      while (true) {
+        const frame = consumeNextZkTcpFrame(recvBuf);
+        if (!frame) break;
+        const { body, rest } = frame;
+        recvBuf = rest;
         const cmd = body.readUInt16LE(0);
         sessionId = body.readUInt16LE(4) || sessionId;
         const payload = body.subarray(8);
@@ -6272,7 +6461,7 @@ async function zkPullAttendanceFromK40(
             phase = 'FREE_ATTLOG';
             sendNext(ZK_CMD_FREE_DATA);
           } else {
-            // Empty attendance log or small ACK_OK
+            // 0 logs (ACK_OK or ACK_ERROR empty) -> still fetch users & read-only sizes
             phase = 'READ_USERS';
             sendNext(ZK_CMD_USER_RRQ);
           }
@@ -6282,16 +6471,24 @@ async function zkPullAttendanceFromK40(
             const totalGot = attChunks.reduce((s, c) => s + c.length, 0);
             if (expectedTotalBytes > 0 && totalGot >= expectedTotalBytes) {
               attBuffer = Buffer.concat(attChunks);
-              phase = 'FREE_ATTLOG';
-              sendNext(ZK_CMD_FREE_DATA);
+              clearDrain();
+              // Allow trailing CMD_ACK_OK from K40 if sent right after final chunk
+              chunkDrainTimer = setTimeout(() => {
+                if (!settled && phase === 'READ_ATTLOG_CHUNKS') {
+                  phase = 'FREE_ATTLOG';
+                  sendNext(ZK_CMD_FREE_DATA);
+                }
+              }, 120);
             }
           } else if (cmd === ZK_CMD_ACK_OK) {
+            clearDrain();
             attBuffer = Buffer.concat(attChunks);
-            phase = 'READ_USERS';
-            sendNext(ZK_CMD_USER_RRQ);
+            phase = 'FREE_ATTLOG';
+            sendNext(ZK_CMD_FREE_DATA);
           }
         } else if (phase === 'FREE_ATTLOG') {
           phase = 'READ_USERS';
+          expectedTotalBytes = 0;
           sendNext(ZK_CMD_USER_RRQ);
         } else if (phase === 'READ_USERS') {
           if (cmd === ZK_CMD_PREPARE_DATA) {
@@ -6302,10 +6499,8 @@ async function zkPullAttendanceFromK40(
             phase = 'FREE_USERS';
             sendNext(ZK_CMD_FREE_DATA);
           } else {
-            phase = 'EXIT';
-            sendNext(ZK_CMD_EXIT);
-            finish(true, `ZKTeco K40 Read-Only sync OK (${Date.now() - start}ms)`);
-            return;
+            phase = 'READ_SIZES';
+            sendNext(ZK_CMD_GET_FREE_SIZES);
           }
         } else if (phase === 'READ_USERS_CHUNKS') {
           if (cmd === ZK_CMD_DATA) {
@@ -6313,17 +6508,27 @@ async function zkPullAttendanceFromK40(
             const totalGot = userChunks.reduce((s, c) => s + c.length, 0);
             if (expectedTotalBytes > 0 && totalGot >= expectedTotalBytes) {
               userBuffer = Buffer.concat(userChunks);
-              phase = 'FREE_USERS';
-              sendNext(ZK_CMD_FREE_DATA);
+              clearDrain();
+              chunkDrainTimer = setTimeout(() => {
+                if (!settled && phase === 'READ_USERS_CHUNKS') {
+                  phase = 'FREE_USERS';
+                  sendNext(ZK_CMD_FREE_DATA);
+                }
+              }, 120);
             }
           } else if (cmd === ZK_CMD_ACK_OK) {
+            clearDrain();
             userBuffer = Buffer.concat(userChunks);
-            phase = 'EXIT';
-            sendNext(ZK_CMD_EXIT);
-            finish(true, `ZKTeco K40 Read-Only sync OK (${Date.now() - start}ms)`);
-            return;
+            phase = 'FREE_USERS';
+            sendNext(ZK_CMD_FREE_DATA);
           }
         } else if (phase === 'FREE_USERS') {
+          phase = 'READ_SIZES';
+          sendNext(ZK_CMD_GET_FREE_SIZES);
+        } else if (phase === 'READ_SIZES') {
+          if (cmd === ZK_CMD_ACK_OK) {
+            freeSizes = parseZkFreeSizes(payload);
+          }
           phase = 'EXIT';
           sendNext(ZK_CMD_EXIT);
           finish(true, `ZKTeco K40 Read-Only sync OK (${Date.now() - start}ms)`);
@@ -6338,14 +6543,23 @@ async function zkTestConnectionReadOnly(
   ip: string,
   port: number,
   commPassword = ''
-): Promise<{ ok: boolean; latencyMs: number; message: string }> {
+): Promise<{
+  ok: boolean;
+  latencyMs: number;
+  freeSizes: { users: number; fingerprints: number; attlogs: number } | null;
+  deviceTime: string;
+  message: string;
+}> {
   const start = Date.now();
   return new Promise((resolve) => {
     const socket = new net.Socket();
     let settled = false;
-    let recvBuf = Buffer.alloc(0);
-    let phase: 'CONNECT' | 'AUTH' = 'CONNECT';
+    let recvBuf: Buffer = Buffer.alloc(0);
+    let phase: 'CONNECT' | 'AUTH' | 'SIZES' | 'TIME' = 'CONNECT';
     let sessionId = 0;
+    let replyId = 0;
+    let freeSizes: { users: number; fingerprints: number; attlogs: number } | null = null;
+    let deviceTime = '';
 
     const done = (ok: boolean, message: string) => {
       if (settled) return;
@@ -6355,11 +6569,22 @@ async function zkTestConnectionReadOnly(
       } catch {
         // ignore
       }
-      resolve({ ok, latencyMs: Date.now() - start, message });
+      resolve({ ok, latencyMs: Date.now() - start, freeSizes, deviceTime, message });
     };
 
-    socket.setTimeout(2200);
-    socket.on('timeout', () => done(false, `ZKTeco K40 TCP timeout at ${ip}:${port}`));
+    const sendNext = (cmd: number, data: Buffer = Buffer.alloc(0)) => {
+      replyId += 1;
+      socket.write(createZkPacket(cmd, sessionId, replyId, data));
+    };
+
+    socket.setTimeout(2500);
+    socket.on('timeout', () => {
+      if (phase === 'SIZES' || phase === 'TIME') {
+        done(true, `ZKTeco K40 Read-Only Handshake OK (${Date.now() - start}ms)`);
+      } else {
+        done(false, `ZKTeco K40 TCP timeout at ${ip}:${port}`);
+      }
+    });
     socket.on('error', (err) => done(false, err.message || `TCP connection failed to ${ip}:${port}`));
 
     socket.connect(port, ip, () => {
@@ -6368,32 +6593,55 @@ async function zkTestConnectionReadOnly(
 
     socket.on('data', (chunk) => {
       recvBuf = Buffer.concat([recvBuf, chunk]);
-      if (recvBuf.length >= 16 && recvBuf[0] === 0x50 && recvBuf[1] === 0x50 && recvBuf[2] === 0x82 && recvBuf[3] === 0x7d) {
-        const expectedLen = recvBuf.readUInt32LE(4);
-        if (recvBuf.length >= 8 + expectedLen) {
-          const body = recvBuf.subarray(8, 8 + expectedLen);
-          recvBuf = recvBuf.subarray(8 + expectedLen);
-          const cmd = body.readUInt16LE(0);
-          sessionId = body.readUInt16LE(4) || sessionId;
-          if (phase === 'CONNECT') {
-            if (cmd === ZK_CMD_ACK_UNAUTH) {
-              const keyNum = Number(String(commPassword || '0').replace(/\D/g, '')) || 0;
-              phase = 'AUTH';
-              socket.write(createZkPacket(ZK_CMD_AUTH, sessionId, 1, zkMakeCommKeyBuffer(keyNum, sessionId)));
-            } else if (cmd === ZK_CMD_ACK_OK) {
-              try { socket.write(createZkPacket(ZK_CMD_EXIT, sessionId, 1, Buffer.alloc(0))); } catch {}
-              done(true, `ZKTeco K40 Read-Only Handshake OK (${Date.now() - start}ms)`);
-            } else {
-              done(false, `ZKTeco K40 rejected handshake (code ${cmd})`);
-            }
+      while (true) {
+        const frame = consumeNextZkTcpFrame(recvBuf);
+        if (!frame) break;
+        const { body, rest } = frame;
+        recvBuf = rest;
+        const cmd = body.readUInt16LE(0);
+        sessionId = body.readUInt16LE(4) || sessionId;
+        const payload = body.subarray(8);
+
+        if (phase === 'CONNECT') {
+          if (cmd === ZK_CMD_ACK_UNAUTH) {
+            const keyNum = Number(String(commPassword || '0').replace(/\D/g, '')) || 0;
+            phase = 'AUTH';
+            sendNext(ZK_CMD_AUTH, zkMakeCommKeyBuffer(keyNum, sessionId));
+          } else if (cmd === ZK_CMD_ACK_OK) {
+            phase = 'SIZES';
+            sendNext(ZK_CMD_GET_FREE_SIZES);
           } else {
-            if (cmd === ZK_CMD_ACK_OK) {
-              try { socket.write(createZkPacket(ZK_CMD_EXIT, sessionId, 2, Buffer.alloc(0))); } catch {}
-              done(true, `ZKTeco K40 CommKey Auth & Handshake OK (${Date.now() - start}ms)`);
-            } else {
-              done(false, 'ZKTeco K40 CommKey authentication failed. Check Communication Password.');
-            }
+            done(false, `ZKTeco K40 rejected handshake (code ${cmd})`);
+            return;
           }
+        } else if (phase === 'AUTH') {
+          if (cmd === ZK_CMD_ACK_OK) {
+            phase = 'SIZES';
+            sendNext(ZK_CMD_GET_FREE_SIZES);
+          } else {
+            done(false, 'ZKTeco K40 CommKey authentication failed. Check Communication Password.');
+            return;
+          }
+        } else if (phase === 'SIZES') {
+          if (cmd === ZK_CMD_ACK_OK) {
+            freeSizes = parseZkFreeSizes(payload);
+          }
+          phase = 'TIME';
+          sendNext(ZK_CMD_GET_TIME);
+        } else if (phase === 'TIME') {
+          if (cmd === ZK_CMD_ACK_OK && payload.length >= 4) {
+            deviceTime = decodeZkTime(payload.readUInt32LE(0));
+          }
+          try {
+            sendNext(ZK_CMD_EXIT);
+          } catch {
+            // ignore
+          }
+          const summary = freeSizes
+            ? ` · ${freeSizes.users} Users · ${freeSizes.fingerprints} Fingerprints (Unchanged) · ${freeSizes.attlogs} Stored Logs`
+            : '';
+          done(true, `ZKTeco K40 Online & Read-Only Verified (${Date.now() - start}ms)${summary}`);
+          return;
         }
       }
     });
@@ -6541,6 +6789,61 @@ function stopZkRealtimeListener(deviceId: number) {
   }
 }
 
+function parseZkRealtimeEventPayload(payload: Buffer): {
+  zk_user_pin: string;
+  punch_type: 'Check-In' | 'Check-Out';
+  punch_state: number;
+  verify_mode: string;
+  machine_timestamp: string;
+} | null {
+  const pad = (n: number) => String(n).padStart(2, '0');
+  // Extended 32+ byte real-time frame (ZKTeco K40 / ZEM800)
+  if (payload.length >= 32) {
+    const pinBuf = payload.subarray(0, 24);
+    const nullIdx = pinBuf.indexOf(0);
+    const pin = (nullIdx >= 0 ? pinBuf.subarray(0, nullIdx) : pinBuf).toString('ascii').replace(/\0/g, '').trim();
+    const attState = payload[24];
+    const verifyByte = payload[25];
+    const y = payload[26] + 2000;
+    const m = payload[27];
+    const d = payload[28];
+    const hh = payload[29];
+    const mm = payload[30];
+    const ss = payload[31];
+    if (pin && m >= 1 && m <= 12 && d >= 1 && d <= 31) {
+      return {
+        zk_user_pin: pin,
+        punch_type: attState === 1 || attState === 5 ? 'Check-Out' : 'Check-In',
+        punch_state: attState,
+        verify_mode: mapZkVerifyMode(verifyByte),
+        machine_timestamp: `${y}-${pad(m)}-${pad(d)} ${pad(hh)}:${pad(mm)}:${pad(ss)}`,
+      };
+    }
+  }
+  // Short 12-byte real-time frame fallback
+  if (payload.length >= 12) {
+    const userSn = payload.readUInt16LE(0);
+    const attState = payload[3];
+    const verifyByte = payload[4];
+    const y = payload[6] + 2000;
+    const m = payload[7];
+    const d = payload[8];
+    const hh = payload[9];
+    const mm = payload[10];
+    const ss = payload[11];
+    if (userSn > 0 && m >= 1 && m <= 12 && d >= 1 && d <= 31) {
+      return {
+        zk_user_pin: String(userSn),
+        punch_type: attState === 1 || attState === 5 ? 'Check-Out' : 'Check-In',
+        punch_state: attState,
+        verify_mode: mapZkVerifyMode(verifyByte),
+        machine_timestamp: `${y}-${pad(m)}-${pad(d)} ${pad(hh)}:${pad(mm)}:${pad(ss)}`,
+      };
+    }
+  }
+  return null;
+}
+
 function startZkRealtimeListener(dev: {
   id: number;
   tenant_id: number;
@@ -6548,18 +6851,20 @@ function startZkRealtimeListener(dev: {
   ip_address: string;
   port: number;
   serial_number: string;
+  comm_password_enc?: string;
 }): Promise<{ ok: boolean; message: string }> {
   stopZkRealtimeListener(dev.id);
   const ip = dev.ip_address;
   const port = Number(dev.port) || 4370;
+  const commPass = dev.comm_password_enc ? decryptField(dev.comm_password_enc) : '';
 
   return new Promise((resolve) => {
     const socket = new net.Socket();
     let settled = false;
-    let recvBuf = Buffer.alloc(0);
+    let recvBuf: Buffer = Buffer.alloc(0);
     let sessionId = 0;
     let replyId = 0;
-    let registered = false;
+    let authState: 'CONNECT' | 'AUTH' | 'REG_SENT' | 'LIVE' = 'CONNECT';
 
     const finishConnect = (ok: boolean, message: string) => {
       if (settled) return;
@@ -6571,7 +6876,7 @@ function startZkRealtimeListener(dev: {
       socket.destroy();
       finishConnect(
         false,
-        `TCP port ${port} at ${ip} did not respond within 2.5s. If running in cloud hosting (Render), use ZKTeco ADMS Push (/iclock/cdata) or the Local K40 LAN Bridge.`
+        `TCP port ${port} at ${ip} did not respond within 2.5s. If running in cloud hosting, use the Local K40 Read-Only LAN Connector or ADMS (/iclock/cdata).`
       );
     }, 2500);
 
@@ -6596,26 +6901,57 @@ function startZkRealtimeListener(dev: {
       socket.write(createZkPacket(ZK_CMD_CONNECT, 0, 0, Buffer.alloc(0)));
     });
 
+    const registerEvents = () => {
+      authState = 'REG_SENT';
+      replyId += 1;
+      const eventMask = Buffer.alloc(4);
+      // Strictly subscribe to attendance log verification events (Read-Only)
+      eventMask.writeUInt32LE(ZK_EF_ATTLOG, 0);
+      socket.write(createZkPacket(ZK_CMD_REG_EVENT, sessionId, replyId, eventMask));
+    };
+
     socket.on('data', (chunk) => {
       recvBuf = Buffer.concat([recvBuf, chunk]);
-      while (recvBuf.length >= 16 && recvBuf[0] === 0x50 && recvBuf[1] === 0x50 && recvBuf[2] === 0x82 && recvBuf[3] === 0x7d) {
-        const expectedLen = recvBuf.readUInt32LE(4);
-        if (recvBuf.length < 8 + expectedLen) break;
-        const body = recvBuf.subarray(8, 8 + expectedLen);
-        recvBuf = recvBuf.subarray(8 + expectedLen);
+      while (true) {
+        const frame = consumeNextZkTcpFrame(recvBuf);
+        if (!frame) break;
+        const { body, rest } = frame;
+        recvBuf = rest;
         const cmd = body.readUInt16LE(0);
-        const nextSession = body.readUInt16LE(4);
+        const headerSid = body.readUInt16LE(4);
         const payload = body.subarray(8);
 
-        if (!registered) {
-          sessionId = nextSession;
-          registered = true;
-          replyId = 1;
-          const eventMask = Buffer.alloc(4);
-          eventMask.writeUInt32LE(ZK_EF_ATTLOG | ZK_EF_FINGER | ZK_EF_ENROLLUSER | ZK_EF_ENROLLFINGER, 0);
-          socket.write(createZkPacket(ZK_CMD_REG_EVENT, sessionId, replyId, eventMask));
-          clearTimeout(connectTimeout);
+        if (authState === 'CONNECT') {
+          sessionId = headerSid || sessionId;
+          if (cmd === ZK_CMD_ACK_UNAUTH) {
+            const keyNum = Number(String(commPass || '0').replace(/\D/g, '')) || 0;
+            authState = 'AUTH';
+            replyId += 1;
+            socket.write(createZkPacket(ZK_CMD_AUTH, sessionId, replyId, zkMakeCommKeyBuffer(keyNum, sessionId)));
+          } else if (cmd === ZK_CMD_ACK_OK) {
+            registerEvents();
+          } else {
+            clearTimeout(connectTimeout);
+            socket.destroy();
+            finishConnect(false, `ZKTeco K40 rejected real-time stream (code ${cmd})`);
+          }
+          continue;
+        }
 
+        if (authState === 'AUTH') {
+          if (cmd === ZK_CMD_ACK_OK) {
+            registerEvents();
+          } else {
+            clearTimeout(connectTimeout);
+            socket.destroy();
+            finishConnect(false, 'ZKTeco K40 CommKey authentication failed for real-time listener.');
+          }
+          continue;
+        }
+
+        if (authState === 'REG_SENT') {
+          clearTimeout(connectTimeout);
+          authState = 'LIVE';
           const keepaliveTimer = setInterval(() => {
             try {
               replyId += 1;
@@ -6638,19 +6974,18 @@ function startZkRealtimeListener(dev: {
             lastEventAt: null,
             eventsCount: 0,
           });
-          db.prepare("UPDATE devices SET status='Connected', last_checked_at=?, last_message=? WHERE id=?").run(
+          db.prepare("UPDATE devices SET status='Connected', last_error='', last_checked_at=?, last_message=? WHERE id=?").run(
             new Date().toISOString(),
-            `Real-time TCP 4370 stream active (${ip}:${port})`,
+            `Real-time TCP 4370 Read-Only stream active (${ip}:${port})`,
             dev.id
           );
           broadcastWs('zkteco:realtime_status', { device_id: dev.id, running: true, tenant_id: dev.tenant_id });
-          finishConnect(true, `Real-time ZKTeco K40 listener active on ${ip}:${port}`);
+          finishConnect(true, `Real-time ZKTeco K40 Read-Only listener active on ${ip}:${port}`);
           continue;
         }
 
         if (cmd === ZK_CMD_REG_EVENT) {
-          const eventFlags = body.readUInt16LE(4);
-          // Acknowledge real-time event frame
+          const eventFlags = headerSid;
           try {
             socket.write(createZkPacket(ZK_CMD_ACK_OK, sessionId, 0, Buffer.alloc(0)));
           } catch {
@@ -6662,22 +6997,29 @@ function startZkRealtimeListener(dev: {
             listener.eventsCount += 1;
           }
 
-          if ((eventFlags & ZK_EF_ATTLOG) !== 0 && payload.length >= 30) {
-            const pinBuf = payload.subarray(0, Math.min(24, payload.length));
-            const nullIdx = pinBuf.indexOf(0);
-            const pin = (nullIdx >= 0 ? pinBuf.subarray(0, nullIdx) : pinBuf).toString('ascii').trim();
-            if (pin) {
-              recordRealtimeZktecoPunch({
-                tid: dev.tenant_id,
-                deviceId: dev.id,
-                deviceIdentifier: dev.serial_number || `DEV-${dev.id}`,
-                deviceName: dev.device_name,
-                authSource: 'ZKTeco K40 Live TCP',
-                authMethod: 'Fingerprint',
-                zkUserPin: pin,
-                punchType: 'Auto',
+          if ((eventFlags & ZK_EF_ATTLOG) !== 0) {
+            const parsedEvt = parseZkRealtimeEventPayload(payload);
+            if (parsedEvt) {
+              ingestReadOnlyK40Punches({
+                dev: {
+                  id: dev.id,
+                  tenant_id: dev.tenant_id,
+                  device_name: dev.device_name,
+                  ip_address: ip,
+                  serial_number: dev.serial_number,
+                },
+                punches: [
+                  {
+                    device_user_id: parsedEvt.zk_user_pin,
+                    machine_timestamp: parsedEvt.machine_timestamp,
+                    punch_type: parsedEvt.punch_type,
+                    punch_state: parsedEvt.punch_state,
+                    verify_mode: parsedEvt.verify_mode,
+                  },
+                ],
+                syncSource: 'ZKTeco K40 Live Event',
                 actor: 'ZKTeco K40 Real-Time',
-                notes: `Real-time K40 sensor scan (${ip}:${port})`,
+                triggeredBy: 'Live TCP Event',
               });
             }
           }
@@ -6840,15 +7182,22 @@ app.post('/api/devices/zkteco/fingerprints/remote-enroll', async (req, res) => {
 
   const dev = deviceId
     ? (db
-        .prepare('SELECT id, device_name, serial_number, ip_address, port, protocol FROM devices WHERE id = ? AND tenant_id = ?')
+        .prepare('SELECT id, device_name, serial_number, ip_address, port, protocol, read_only_mode FROM devices WHERE id = ? AND tenant_id = ?')
         .get(deviceId, tid) as
-        | { id: number; device_name: string; serial_number: string; ip_address: string; port: number; protocol: string }
+        | { id: number; device_name: string; serial_number: string; ip_address: string; port: number; protocol: string; read_only_mode?: number }
         | undefined)
     : (db
-        .prepare("SELECT id, device_name, serial_number, ip_address, port, protocol FROM devices WHERE tenant_id = ? AND (device_type LIKE '%Biometric%' OR protocol LIKE '%ZKTeco%' OR port = 4370) ORDER BY id DESC LIMIT 1")
+        .prepare("SELECT id, device_name, serial_number, ip_address, port, protocol, read_only_mode FROM devices WHERE tenant_id = ? AND (device_type LIKE '%Biometric%' OR protocol LIKE '%ZKTeco%' OR port = 4370) ORDER BY id DESC LIMIT 1")
         .get(tid) as
-        | { id: number; device_name: string; serial_number: string; ip_address: string; port: number; protocol: string }
+        | { id: number; device_name: string; serial_number: string; ip_address: string; port: number; protocol: string; read_only_mode?: number }
         | undefined);
+
+  if (dev && (dev.read_only_mode === undefined || Number(dev.read_only_mode) === 1)) {
+    res.status(403).json({
+      error: `Read-Only Biometric Protection is active on "${dev.device_name}". Enroll or modify fingerprints directly on the physical ZKTeco K40 terminal so existing fingerprint templates are never altered or overwritten.`,
+    });
+    return;
+  }
 
   const zkUserPin =
     String(b.zk_user_pin || '').trim() ||
@@ -7200,7 +7549,7 @@ app.get('/api/devices/zkteco/bridge-script', (req, res) => {
 
   const script = `#!/usr/bin/env node
 // Seven Sunday Ethiopia — Read-Only ZKTeco K40 LAN Connector Service
-// SAFETY GUARANTEE: Strictly READ-ONLY on K40 TCP 4370 (CMD_CONNECT, CMD_AUTH, CMD_ATTLOG_RRQ, CMD_USER_RRQ, CMD_FREE_DATA, CMD_EXIT).
+// SAFETY GUARANTEE: Strictly READ-ONLY on K40 TCP 4370 (CMD_CONNECT, CMD_AUTH, CMD_ATTLOG_RRQ, CMD_USER_RRQ, CMD_GET_FREE_SIZES, CMD_FREE_DATA, CMD_EXIT).
 // NEVER deletes, clears, overwrites, uploads templates, enrolls, or alters settings on your K40 terminal.
 // Run on any PC on the factory LAN: node zkteco-k40-readonly-connector.mjs
 import net from 'node:net';
@@ -7216,7 +7565,8 @@ const K40_COMM_KEY = process.env.K40_COMM_KEY || ${JSON.stringify(commPass)};
 const POLL_MS = Number(process.env.POLL_MS || ${pollMs});
 const QUEUE_FILE = path.resolve(process.cwd(), '.k40-offline-queue-' + DEVICE_SERIAL.replace(/[^a-zA-Z0-9_-]/g, '_') + '.json');
 
-const CMD_CONNECT = 1000, CMD_EXIT = 1001, CMD_AUTH = 1102, CMD_ATTLOG_RRQ = 13, CMD_USER_RRQ = 9, CMD_PREPARE_DATA = 1500, CMD_DATA = 1501, CMD_FREE_DATA = 1502, CMD_ACK_OK = 2000, CMD_ACK_UNAUTH = 2005;
+const CMD_CONNECT = 1000, CMD_EXIT = 1001, CMD_AUTH = 1102, CMD_ATTLOG_RRQ = 13, CMD_USER_RRQ = 9, CMD_GET_FREE_SIZES = 50, CMD_PREPARE_DATA = 1500, CMD_DATA = 1501, CMD_FREE_DATA = 1502, CMD_ACK_OK = 2000, CMD_ACK_UNAUTH = 2005;
+const MAGIC = Buffer.from([0x50, 0x50, 0x82, 0x7d]);
 
 function makeCommKey(keyNum, sid, ticks = 50) {
   let k = 0;
@@ -7241,6 +7591,17 @@ function packet(cmd, sid, rid, data = Buffer.alloc(0)) {
   return Buffer.concat([h, p]);
 }
 
+function nextFrame(buf) {
+  const idx = buf.indexOf(MAGIC);
+  if (idx < 0) return null;
+  const a = idx > 0 ? buf.subarray(idx) : buf;
+  if (a.length < 16) return null;
+  const len = a.readUInt32LE(4);
+  if (len < 8 || len > 16 * 1024 * 1024) return nextFrame(a.subarray(4));
+  if (a.length < 8 + len) return null;
+  return { body: a.subarray(8, 8 + len), rest: a.subarray(8 + len) };
+}
+
 function decodeZkTime(timeVal) {
   const sec = timeVal % 60; let r = Math.floor(timeVal / 60);
   const min = r % 60; r = Math.floor(r / 60);
@@ -7254,21 +7615,25 @@ function decodeZkTime(timeVal) {
 function pullReadOnlyLogs() {
   return new Promise((resolve, reject) => {
     const sock = new net.Socket();
-    let buf = Buffer.alloc(0), sid = 0, rid = 0, phase = 'CONNECT', expLen = 0;
-    const chunks = [];
-    let attRaw = Buffer.alloc(0);
-    const done = (err) => { try { sock.destroy(); } catch {} err ? reject(err) : resolve(attRaw); };
+    let buf = Buffer.alloc(0), sid = 0, rid = 0, phase = 'CONNECT', expLen = 0, drainTimer = null;
+    const chunks = [], userChunks = [];
+    let attRaw = Buffer.alloc(0), userRaw = Buffer.alloc(0), freeSizes = null;
+    const clearDrain = () => { if (drainTimer) { clearTimeout(drainTimer); drainTimer = null; } };
+    const done = (err) => { clearDrain(); try { sock.destroy(); } catch {} err ? reject(err) : resolve({ attRaw, userRaw, freeSizes }); };
     sock.setTimeout(3500);
-    sock.on('timeout', () => done(new Error('K40 TCP timeout')));
+    sock.on('timeout', () => {
+      if (phase === 'USERS' || phase === 'USER_CHUNKS' || phase === 'FREE_USERS' || phase === 'SIZES') done(null);
+      else done(new Error('K40 TCP timeout'));
+    });
     sock.on('error', done);
     sock.connect(K40_PORT, K40_IP, () => sock.write(packet(CMD_CONNECT, 0, 0)));
     const next = (c, d = Buffer.alloc(0)) => sock.write(packet(c, sid, ++rid, d));
     sock.on('data', (chunk) => {
       buf = Buffer.concat([buf, chunk]);
-      while (buf.length >= 16 && buf[0] === 0x50 && buf[1] === 0x50 && buf[2] === 0x82 && buf[3] === 0x7d) {
-        const len = buf.readUInt32LE(4);
-        if (buf.length < 8 + len) break;
-        const body = buf.subarray(8, 8 + len); buf = buf.subarray(8 + len);
+      while (true) {
+        const f = nextFrame(buf);
+        if (!f) break;
+        const body = f.body; buf = f.rest;
         const cmd = body.readUInt16LE(0); sid = body.readUInt16LE(4) || sid;
         const payload = body.subarray(8);
         if (phase === 'CONNECT') {
@@ -7279,15 +7644,39 @@ function pullReadOnlyLogs() {
           if (cmd === CMD_ACK_OK) { phase = 'ATTLOG'; next(CMD_ATTLOG_RRQ); }
           else return done(new Error('CommKey authentication failed'));
         } else if (phase === 'ATTLOG') {
-          if (cmd === CMD_PREPARE_DATA) { expLen = payload.readUInt32LE(0); phase = 'CHUNKS'; }
+          if (cmd === CMD_PREPARE_DATA) { expLen = payload.length >= 4 ? payload.readUInt32LE(0) : 0; phase = 'CHUNKS'; }
           else if (cmd === CMD_DATA) { attRaw = payload; phase = 'FREE'; next(CMD_FREE_DATA); }
-          else { next(CMD_EXIT); return done(null); }
+          else { phase = 'USERS'; next(CMD_USER_RRQ); }
         } else if (phase === 'CHUNKS') {
           if (cmd === CMD_DATA) {
             chunks.push(payload);
-            if (expLen > 0 && chunks.reduce((a, b) => a + b.length, 0) >= expLen) { attRaw = Buffer.concat(chunks); phase = 'FREE'; next(CMD_FREE_DATA); }
-          } else { attRaw = Buffer.concat(chunks); next(CMD_EXIT); return done(null); }
+            if (expLen > 0 && chunks.reduce((a, b) => a + b.length, 0) >= expLen) {
+              attRaw = Buffer.concat(chunks);
+              clearDrain();
+              drainTimer = setTimeout(() => { if (phase === 'CHUNKS') { phase = 'FREE'; next(CMD_FREE_DATA); } }, 120);
+            }
+          } else { clearDrain(); attRaw = Buffer.concat(chunks); phase = 'FREE'; next(CMD_FREE_DATA); }
         } else if (phase === 'FREE') {
+          phase = 'USERS'; expLen = 0; next(CMD_USER_RRQ);
+        } else if (phase === 'USERS') {
+          if (cmd === CMD_PREPARE_DATA) { expLen = payload.length >= 4 ? payload.readUInt32LE(0) : 0; phase = 'USER_CHUNKS'; }
+          else if (cmd === CMD_DATA) { userRaw = payload; phase = 'FREE_USERS'; next(CMD_FREE_DATA); }
+          else { phase = 'SIZES'; next(CMD_GET_FREE_SIZES); }
+        } else if (phase === 'USER_CHUNKS') {
+          if (cmd === CMD_DATA) {
+            userChunks.push(payload);
+            if (expLen > 0 && userChunks.reduce((a, b) => a + b.length, 0) >= expLen) {
+              userRaw = Buffer.concat(userChunks);
+              clearDrain();
+              drainTimer = setTimeout(() => { if (phase === 'USER_CHUNKS') { phase = 'FREE_USERS'; next(CMD_FREE_DATA); } }, 120);
+            }
+          } else { clearDrain(); userRaw = Buffer.concat(userChunks); phase = 'FREE_USERS'; next(CMD_FREE_DATA); }
+        } else if (phase === 'FREE_USERS') {
+          phase = 'SIZES'; next(CMD_GET_FREE_SIZES);
+        } else if (phase === 'SIZES') {
+          if (cmd === CMD_ACK_OK && payload.length >= 36) {
+            freeSizes = { users: payload.readUInt32LE(16), fingerprints: payload.readUInt32LE(24), attlogs: payload.readUInt32LE(32) };
+          }
           next(CMD_EXIT); return done(null);
         }
       }
@@ -7295,15 +7684,34 @@ function pullReadOnlyLogs() {
   });
 }
 
-function parseAttlog(raw) {
+function parseUsers(raw) {
+  const byPin = {}, byUid = {};
+  if (raw.length < 72) return { byPin, byUid };
+  const start = raw.length % 72 === 4 ? 4 : 0;
+  for (let o = start; o + 72 <= raw.length; o += 72) {
+    const uid = raw.readUInt16LE(o);
+    const nb = raw.subarray(o + 11, o + 35), nz = nb.indexOf(0);
+    const name = (nz >= 0 ? nb.subarray(0, nz) : nb).toString('utf8').replace(/\\0/g, '').trim();
+    const pb = raw.subarray(o + 48, o + 72), pz = pb.indexOf(0);
+    const apin = (pz >= 0 ? pb.subarray(0, pz) : pb).toString('ascii').replace(/\\0/g, '').trim();
+    const pin = apin || (uid > 0 ? String(uid) : '');
+    if (pin) { if (name) byPin[pin] = name; if (uid > 0) byUid[uid] = { pin, name }; }
+  }
+  return { byPin, byUid };
+}
+
+function parseAttlog(raw, users) {
   const out = [];
   const start = raw.length % 40 === 4 ? 4 : 0;
   for (let o = start; o + 40 <= raw.length; o += 40) {
+    const userSn = raw.readUInt16LE(o);
     const p = raw.subarray(o + 2, o + 26); const z = p.indexOf(0);
-    const pin = (z >= 0 ? p.subarray(0, z) : p).toString('ascii').trim();
+    const apin = (z >= 0 ? p.subarray(0, z) : p).toString('ascii').replace(/\\0/g, '').trim();
+    const u = userSn > 0 ? users.byUid[userSn] : null;
+    const pin = apin || u?.pin || (userSn > 0 ? String(userSn) : '');
     const state = raw.length > o + 31 ? raw[o + 31] : 0;
     const tv = raw.readUInt32LE(o + 27);
-    if (pin && tv > 0) out.push({ device_user_id: pin, machine_timestamp: decodeZkTime(tv), punch_state: state, verify_mode: 'Fingerprint' });
+    if (pin && tv > 0) out.push({ device_user_id: pin, device_user_name: users.byPin[pin] || u?.name || '', machine_timestamp: decodeZkTime(tv), punch_state: state, verify_mode: 'Fingerprint' });
   }
   return out;
 }
@@ -7318,8 +7726,9 @@ async function pollCycle() {
   syncing = true;
   let queue = loadQueue();
   try {
-    const raw = await pullReadOnlyLogs();
-    const logs = parseAttlog(raw);
+    const { attRaw, userRaw, freeSizes } = await pullReadOnlyLogs();
+    const users = parseUsers(userRaw);
+    const logs = parseAttlog(attRaw, users);
     let added = 0;
     for (const r of logs) {
       const k = r.device_user_id + '|' + r.machine_timestamp;
@@ -7334,7 +7743,7 @@ async function pollCycle() {
       const res = await fetch(SERVER_URL + '/api/devices/zkteco/connector/ingest', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-device-key': DEVICE_KEY },
-        body: JSON.stringify({ serial_number: DEVICE_SERIAL, punches: queue }),
+        body: JSON.stringify({ serial_number: DEVICE_SERIAL, punches: queue, free_sizes: freeSizes }),
       });
       if (res.ok) {
         const body = await res.json();
@@ -7346,7 +7755,7 @@ async function pollCycle() {
       await fetch(SERVER_URL + '/api/devices/zkteco/connector/heartbeat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-device-key': DEVICE_KEY },
-        body: JSON.stringify({ serial_number: DEVICE_SERIAL, status: 'Connected' }),
+        body: JSON.stringify({ serial_number: DEVICE_SERIAL, status: 'Connected', free_sizes: freeSizes }),
       }).catch(() => {});
     }
   } catch (err) {
@@ -7701,6 +8110,7 @@ function ingestReadOnlyK40Punches(opts: {
   actor: string;
   latencyMs?: number;
   triggeredBy?: string;
+  freeSizes?: { users: number; fingerprints: number; attlogs: number } | null;
 }) {
   const { dev, punches, syncSource, actor, latencyMs = 0, triggeredBy = 'Manual' } = opts;
   const tid = dev.tenant_id;
@@ -7868,8 +8278,8 @@ function ingestReadOnlyK40Punches(opts: {
     `INSERT INTO device_sync_logs (
       tenant_id, device_id, device_name, device_ip, sync_mode, status,
       fetched_count, imported_count, skipped_duplicates, unmatched_count, latency_ms,
-      error_message, triggered_by, started_at, completed_at
-    ) VALUES (?, ?, ?, ?, ?, 'Success', ?, ?, ?, ?, ?, '', ?, ?, ?)`
+      error_message, triggered_by, k40_fp_count, started_at, completed_at
+    ) VALUES (?, ?, ?, ?, ?, 'Success', ?, ?, ?, ?, ?, '', ?, ?, ?, ?)`
   ).run(
     tid,
     dev.id,
@@ -7882,12 +8292,18 @@ function ingestReadOnlyK40Punches(opts: {
     unmatchedCount,
     latencyMs,
     triggeredBy,
+    opts.freeSizes?.fingerprints ?? null,
     startedAt,
     completedAt
   );
 
   db.prepare(
-    "UPDATE devices SET status='Connected', last_latency_ms=?, punch_count = COALESCE(punch_count, 0) + ?, total_imported_count = COALESCE(total_imported_count, 0) + ?, last_sync_at=?, last_checked_at=?, last_error='', last_message=? WHERE id=?"
+    `UPDATE devices SET status='Connected', last_latency_ms=?, punch_count = COALESCE(punch_count, 0) + ?,
+      total_imported_count = COALESCE(total_imported_count, 0) + ?, last_sync_at=?, last_checked_at=?, last_error='', last_message=?,
+      k40_user_count = COALESCE(?, k40_user_count),
+      k40_fp_count = COALESCE(?, k40_fp_count),
+      k40_attlog_count = COALESCE(?, k40_attlog_count)
+    WHERE id=?`
   ).run(
     latencyMs,
     imported,
@@ -7895,18 +8311,32 @@ function ingestReadOnlyK40Punches(opts: {
     completedAt,
     completedAt,
     `Read-Only Sync: +${imported} new, ${skippedDuplicates} dup skipped, ${unmatchedCount} unmatched`,
+    opts.freeSizes?.users ?? null,
+    opts.freeSizes?.fingerprints ?? null,
+    opts.freeSizes?.attlogs ?? null,
     dev.id
   );
 
   broadcastWs('device:status', { id: dev.id, status: 'Connected', tenant_id: tid });
+  broadcastWs('zkteco:sync_complete', {
+    device_id: dev.id,
+    tenant_id: tid,
+    imported,
+    skipped_duplicates: skippedDuplicates,
+    unmatched: unmatchedCount,
+  });
   if (imported > 0) {
     broadcastWs('attendance:updated', { tenant_id: tid, ingested: imported, source: syncSource });
+  }
+  if (unmatchedCount > 0) {
+    broadcastWs('zkteco:unmatched_user', { tenant_id: tid, device_id: dev.id, unmatched: unmatchedCount });
   }
 
   return { fetched: punches.length, imported, skipped_duplicates: skippedDuplicates, unmatched: unmatchedCount };
 }
 
 const activeDeviceSyncs = new Set<number>();
+const lastOfflineFailureLoggedAt = new Map<number, number>();
 
 async function syncZktecoDeviceReadOnly(
   dev: {
@@ -7929,17 +8359,23 @@ async function syncZktecoDeviceReadOnly(
   const startedAt = new Date().toISOString();
   try {
     const commPass = dev.comm_password_enc ? decryptField(dev.comm_password_enc) : '';
-    const result = await zkPullAttendanceFromK40(dev.ip_address, Number(dev.port) || 4370, commPass, 2800);
+    const result = await zkPullAttendanceFromK40(dev.ip_address, Number(dev.port) || 4370, commPass, 3200);
     const now = new Date().toISOString();
 
     if (!result.connected) {
-      db.prepare(
-        `INSERT INTO device_sync_logs (
-          tenant_id, device_id, device_name, device_ip, sync_mode, status,
-          fetched_count, imported_count, skipped_duplicates, unmatched_count, latency_ms,
-          error_message, triggered_by, started_at, completed_at
-        ) VALUES (?, ?, ?, ?, 'TCP_READ_ONLY', 'Failed', 0, 0, 0, 0, ?, ?, ?, ?, ?)`
-      ).run(dev.tenant_id, dev.id, dev.device_name, dev.ip_address, result.latencyMs, result.message, triggeredBy, startedAt, now);
+      const nowMs = Date.now();
+      const prevLogged = lastOfflineFailureLoggedAt.get(dev.id) || 0;
+      const shouldWriteFailureLog = triggeredBy !== 'Auto-Poller' || nowMs - prevLogged >= 60000;
+      if (shouldWriteFailureLog) {
+        lastOfflineFailureLoggedAt.set(dev.id, nowMs);
+        db.prepare(
+          `INSERT INTO device_sync_logs (
+            tenant_id, device_id, device_name, device_ip, sync_mode, status,
+            fetched_count, imported_count, skipped_duplicates, unmatched_count, latency_ms,
+            error_message, triggered_by, started_at, completed_at
+          ) VALUES (?, ?, ?, ?, 'TCP_READ_ONLY', 'Failed', 0, 0, 0, 0, ?, ?, ?, ?, ?)`
+        ).run(dev.tenant_id, dev.id, dev.device_name, dev.ip_address, result.latencyMs, result.message, triggeredBy, startedAt, now);
+      }
 
       db.prepare(
         "UPDATE devices SET status='Unreachable', last_latency_ms=?, failed_sync_count = COALESCE(failed_sync_count, 0) + 1, last_error=?, last_checked_at=?, last_message=? WHERE id=?"
@@ -7947,13 +8383,14 @@ async function syncZktecoDeviceReadOnly(
         result.latencyMs,
         result.message,
         now,
-        `${result.message}. Use Local Read-Only LAN Connector or ADMS (/iclock/cdata?SN=${dev.serial_number}) if server is hosted outside factory LAN.`,
+        `${result.message}. Retrying automatically when LAN returns (or use Local Read-Only LAN Connector / ADMS).`,
         dev.id
       );
       broadcastWs('device:status', { id: dev.id, status: 'Unreachable', tenant_id: dev.tenant_id });
       return { ok: false, latencyMs: result.latencyMs, error: result.message };
     }
 
+    lastOfflineFailureLoggedAt.delete(dev.id);
     const summary = ingestReadOnlyK40Punches({
       dev,
       punches: result.records.map((r) => ({
@@ -7968,96 +8405,129 @@ async function syncZktecoDeviceReadOnly(
       actor,
       latencyMs: result.latencyMs,
       triggeredBy,
+      freeSizes: result.freeSizes,
     });
 
-    return { ok: true, latencyMs: result.latencyMs, message: result.message, ...summary };
+    return { ok: true, latencyMs: result.latencyMs, freeSizes: result.freeSizes, message: result.message, ...summary };
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : 'Unexpected K40 sync error';
+    return { ok: false, latencyMs: 0, error: errMsg };
   } finally {
     activeDeviceSyncs.delete(dev.id);
   }
 }
 
 app.post('/api/devices/:id/zkteco/test-connection', async (req, res) => {
-  const tid = getTenantId(req);
-  const id = Number(req.params.id);
-  const dev = db.prepare('SELECT * FROM devices WHERE id = ? AND tenant_id = ?').get(id, tid) as
-    | { id: number; tenant_id: number; device_name: string; ip_address: string; port: number; serial_number: string; comm_password_enc?: string }
-    | undefined;
-  if (!dev) {
-    res.status(404).json({ error: 'ZKTeco K40 device not found in active tenant.' });
-    return;
-  }
-  const commPass = dev.comm_password_enc ? decryptField(dev.comm_password_enc) : '';
-  const testRes = await zkTestConnectionReadOnly(dev.ip_address, Number(dev.port) || 4370, commPass);
-  const now = new Date().toISOString();
-  db.prepare(
-    'UPDATE devices SET status=?, last_latency_ms=?, last_checked_at=?, last_error=?, last_message=? WHERE id=?'
-  ).run(
-    testRes.ok ? 'Connected' : 'Unreachable',
-    testRes.latencyMs,
-    now,
-    testRes.ok ? '' : testRes.message,
-    testRes.message,
-    id
-  );
-  const updated = maskDeviceRow(db.prepare('SELECT * FROM devices WHERE id = ?').get(id));
-  broadcastWs('device:status', { id, status: testRes.ok ? 'Connected' : 'Unreachable', tenant_id: tid });
-  if (!testRes.ok) {
-    res.status(502).json({
-      ok: false,
-      error: `${testRes.message}. Tip: If your app is hosted in the cloud, download and run the Local Read-Only LAN Connector on a factory computer connected to ${dev.ip_address}:${dev.port}.`,
+  try {
+    const tid = getTenantId(req);
+    const id = Number(req.params.id);
+    const dev = db.prepare('SELECT * FROM devices WHERE id = ? AND tenant_id = ?').get(id, tid) as
+      | { id: number; tenant_id: number; device_name: string; ip_address: string; port: number; serial_number: string; comm_password_enc?: string }
+      | undefined;
+    if (!dev) {
+      res.status(404).json({ error: 'ZKTeco K40 device not found in active tenant.' });
+      return;
+    }
+    const commPass = dev.comm_password_enc ? decryptField(dev.comm_password_enc) : '';
+    const testRes = await zkTestConnectionReadOnly(dev.ip_address, Number(dev.port) || 4370, commPass);
+    const now = new Date().toISOString();
+    db.prepare(
+      `UPDATE devices SET status=?, last_latency_ms=?, last_checked_at=?, last_error=?, last_message=?,
+        k40_user_count = COALESCE(?, k40_user_count),
+        k40_fp_count = COALESCE(?, k40_fp_count),
+        k40_attlog_count = COALESCE(?, k40_attlog_count),
+        k40_device_time = CASE WHEN ? != '' THEN ? ELSE k40_device_time END
+      WHERE id=?`
+    ).run(
+      testRes.ok ? 'Connected' : 'Unreachable',
+      testRes.latencyMs,
+      now,
+      testRes.ok ? '' : testRes.message,
+      testRes.message,
+      testRes.freeSizes?.users ?? null,
+      testRes.freeSizes?.fingerprints ?? null,
+      testRes.freeSizes?.attlogs ?? null,
+      testRes.deviceTime || '',
+      testRes.deviceTime || '',
+      id
+    );
+    const updated = maskDeviceRow(db.prepare('SELECT * FROM devices WHERE id = ?').get(id));
+    broadcastWs('device:status', { id, status: testRes.ok ? 'Connected' : 'Unreachable', tenant_id: tid });
+    if (!testRes.ok) {
+      res.status(502).json({
+        ok: false,
+        error: `${testRes.message}. Tip: Verify LAN cable and IP (${dev.ip_address}:${dev.port}). If the ERP server is cloud-hosted, run the Local Read-Only LAN Connector on a factory computer on the same LAN.`,
+        device: updated,
+      });
+      return;
+    }
+    res.json({
+      ok: true,
+      latencyMs: testRes.latencyMs,
+      freeSizes: testRes.freeSizes,
+      deviceTime: testRes.deviceTime,
+      message: testRes.message,
       device: updated,
     });
-    return;
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : 'ZKTeco connection test failed' });
   }
-  res.json({ ok: true, latencyMs: testRes.latencyMs, message: testRes.message, device: updated });
 });
 
 app.post('/api/devices/:id/zkteco/sync-now', async (req, res) => {
-  const tid = getTenantId(req);
-  const id = Number(req.params.id);
-  const dev = db.prepare('SELECT * FROM devices WHERE id = ? AND tenant_id = ?').get(id, tid) as
-    | { id: number; tenant_id: number; device_name: string; ip_address: string; port: number; serial_number: string; device_type?: string; comm_password_enc?: string }
-    | undefined;
-  if (!dev) {
-    res.status(404).json({ error: 'ZKTeco K40 device not found in active tenant.' });
-    return;
+  try {
+    const tid = getTenantId(req);
+    const id = Number(req.params.id);
+    const dev = db.prepare('SELECT * FROM devices WHERE id = ? AND tenant_id = ?').get(id, tid) as
+      | { id: number; tenant_id: number; device_name: string; ip_address: string; port: number; serial_number: string; device_type?: string; comm_password_enc?: string }
+      | undefined;
+    if (!dev) {
+      res.status(404).json({ error: 'ZKTeco K40 device not found in active tenant.' });
+      return;
+    }
+    const outcome = await syncZktecoDeviceReadOnly(dev, getActorName(req), 'Manual Sync');
+    const updated = maskDeviceRow(db.prepare('SELECT * FROM devices WHERE id = ?').get(id));
+    if (!outcome.ok) {
+      res.status(outcome.busy ? 409 : 502).json({
+        error: outcome.busy
+          ? outcome.message
+          : `${outcome.error}. Note: Direct TCP port 4370 requires LAN reachability to ${dev.ip_address}:${dev.port}. For cloud/Render hosting, run the Local Read-Only LAN Connector or set K40 ADMS URL to /iclock/cdata?SN=${dev.serial_number}.`,
+        device: updated,
+      });
+      return;
+    }
+    const importedCount = 'imported' in outcome ? outcome.imported : 0;
+    res.json({ device: updated, ...outcome, ingested: importedCount });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : 'ZKTeco K40 sync failed' });
   }
-  const outcome = await syncZktecoDeviceReadOnly(dev, getActorName(req), 'Manual Sync');
-  const updated = maskDeviceRow(db.prepare('SELECT * FROM devices WHERE id = ?').get(id));
-  if (!outcome.ok) {
-    res.status(outcome.busy ? 409 : 502).json({
-      error: outcome.busy
-        ? outcome.message
-        : `${outcome.error}. Note: Direct TCP port 4370 requires LAN reachability to ${dev.ip_address}:${dev.port}. For cloud/Render hosting, run the Local Read-Only LAN Connector or set K40 ADMS URL to /iclock/cdata?SN=${dev.serial_number}.`,
-      device: updated,
-    });
-    return;
-  }
-  const importedCount = 'imported' in outcome ? outcome.imported : 0;
-  res.json({ device: updated, ...outcome, ingested: importedCount });
 });
 
 app.post('/api/devices/:id/zkteco/pull-attendance', async (req, res) => {
-  const tid = getTenantId(req);
-  const id = Number(req.params.id);
-  const dev = db.prepare('SELECT * FROM devices WHERE id = ? AND tenant_id = ?').get(id, tid) as
-    | { id: number; tenant_id: number; device_name: string; ip_address: string; port: number; serial_number: string; device_type?: string; comm_password_enc?: string }
-    | undefined;
-  if (!dev) {
-    res.status(404).json({ error: 'ZKTeco K40 device not found in active tenant.' });
-    return;
+  try {
+    const tid = getTenantId(req);
+    const id = Number(req.params.id);
+    const dev = db.prepare('SELECT * FROM devices WHERE id = ? AND tenant_id = ?').get(id, tid) as
+      | { id: number; tenant_id: number; device_name: string; ip_address: string; port: number; serial_number: string; device_type?: string; comm_password_enc?: string }
+      | undefined;
+    if (!dev) {
+      res.status(404).json({ error: 'ZKTeco K40 device not found in active tenant.' });
+      return;
+    }
+    const outcome = await syncZktecoDeviceReadOnly(dev, getActorName(req), 'Manual Pull');
+    const updated = maskDeviceRow(db.prepare('SELECT * FROM devices WHERE id = ?').get(id));
+    if (!outcome.ok) {
+      res.status(outcome.busy ? 409 : 502).json({
+        error: `${outcome.error || outcome.message}. Direct TCP port 4370 requires LAN reachability to ${dev.ip_address}:${dev.port}. For cloud hosting, run the Local Read-Only LAN Connector or configure ADMS /iclock/cdata?SN=${dev.serial_number}.`,
+        device: updated,
+      });
+      return;
+    }
+    const importedCount = 'imported' in outcome ? outcome.imported : 0;
+    res.json({ device: updated, ingested: importedCount, ...outcome });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : 'ZKTeco K40 pull failed' });
   }
-  const outcome = await syncZktecoDeviceReadOnly(dev, getActorName(req), 'Manual Pull');
-  const updated = maskDeviceRow(db.prepare('SELECT * FROM devices WHERE id = ?').get(id));
-  if (!outcome.ok) {
-    res.status(outcome.busy ? 409 : 502).json({
-      error: `${outcome.error || outcome.message}. Direct TCP port 4370 requires LAN reachability to ${dev.ip_address}:${dev.port}. For cloud hosting, run the Local Read-Only LAN Connector or configure ADMS /iclock/cdata?SN=${dev.serial_number}.`,
-      device: updated,
-    });
-    return;
-  }
-  const importedCount = 'imported' in outcome ? outcome.imported : 0;
-  res.json({ device: updated, ingested: importedCount, ...outcome });
 });
 
 app.get('/api/devices/zkteco/sync-logs', (req, res) => {
@@ -8196,7 +8666,14 @@ app.post('/api/devices/zkteco/connector/heartbeat', (req, res) => {
     return;
   }
   const now = new Date().toISOString();
-  db.prepare("UPDATE devices SET status = 'Connected', last_checked_at = ?, last_error = '' WHERE id = ?").run(now, check.dev.id);
+  const fsizes = req.body?.free_sizes as { users?: number; fingerprints?: number; attlogs?: number } | undefined;
+  db.prepare(
+    `UPDATE devices SET status = 'Connected', last_checked_at = ?, last_error = '',
+      k40_user_count = COALESCE(?, k40_user_count),
+      k40_fp_count = COALESCE(?, k40_fp_count),
+      k40_attlog_count = COALESCE(?, k40_attlog_count)
+    WHERE id = ?`
+  ).run(now, fsizes?.users ?? null, fsizes?.fingerprints ?? null, fsizes?.attlogs ?? null, check.dev.id);
   broadcastWs('device:status', { id: check.dev.id, status: 'Connected', tenant_id: check.dev.tenant_id });
   res.json({ ok: true });
 });
@@ -8210,6 +8687,11 @@ app.post('/api/devices/zkteco/connector/ingest', (req, res) => {
     return;
   }
   const punchesRaw = Array.isArray(b.punches) ? b.punches : [];
+  const freeSizes = (b.free_sizes && typeof b.free_sizes === 'object' ? b.free_sizes : null) as {
+    users: number;
+    fingerprints: number;
+    attlogs: number;
+  } | null;
   const devRow = db.prepare('SELECT * FROM devices WHERE id = ?').get(check.dev.id) as {
     id: number;
     tenant_id: number;
@@ -8224,6 +8706,7 @@ app.post('/api/devices/zkteco/connector/ingest', (req, res) => {
     syncSource: 'Local Read-Only Connector',
     actor: 'Local K40 Connector',
     triggeredBy: 'LAN Connector',
+    freeSizes,
   });
   res.json({ ok: true, ...out });
 });
@@ -8745,10 +9228,10 @@ const handleIclockGetRequest = (req: express.Request, res: express.Response) => 
     res.type('text/plain').send('OK');
     return;
   }
-  const dev = db.prepare('SELECT id, tenant_id FROM devices WHERE serial_number = ? LIMIT 1').get(sn) as
-    | { id: number; tenant_id: number }
+  const dev = db.prepare('SELECT id, tenant_id, read_only_mode FROM devices WHERE serial_number = ? LIMIT 1').get(sn) as
+    | { id: number; tenant_id: number; read_only_mode?: number }
     | undefined;
-  if (!dev) {
+  if (!dev || Number(dev.read_only_mode ?? 1) === 1) {
     res.type('text/plain').send('OK');
     return;
   }

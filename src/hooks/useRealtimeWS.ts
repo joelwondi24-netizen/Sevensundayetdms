@@ -18,6 +18,7 @@ export function useRealtimeWS(onEvent: (evt: WsEventPayload) => void) {
     let ws: WebSocket | null = null;
     let reconnectTimer: number | null = null;
     let stopped = false;
+    let hasConnectedOnce = false;
 
     const connect = () => {
       if (stopped) return;
@@ -27,6 +28,10 @@ export function useRealtimeWS(onEvent: (evt: WsEventPayload) => void) {
         ws = new WebSocket(url);
         ws.onopen = () => {
           setConnected(true);
+          if (hasConnectedOnce) {
+            callbackRef.current({ event: 'ws:reconnected', payload: {} });
+          }
+          hasConnectedOnce = true;
         };
         ws.onmessage = (ev) => {
           try {

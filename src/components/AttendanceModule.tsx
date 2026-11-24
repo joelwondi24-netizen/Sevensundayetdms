@@ -338,6 +338,15 @@ export const AttendanceModule: React.FC<AttendanceModuleProps> = ({
     loadReports();
   }, []);
 
+  // Silent fallback poll while Live Dashboard is open so hardware reconnects update automatically even without manual refresh
+  useEffect(() => {
+    if (activeTab !== 'live') return;
+    const timer = window.setInterval(() => {
+      loadLiveDashboard(liveDate);
+    }, 4000);
+    return () => window.clearInterval(timer);
+  }, [activeTab, liveDate]);
+
   const lastHandledWsRef = useRef<WsEventPayload | null>(null);
   useEffect(() => {
     if (!lastWsEvent || lastWsEvent === lastHandledWsRef.current) return;
@@ -349,7 +358,8 @@ export const AttendanceModule: React.FC<AttendanceModuleProps> = ({
       evtName !== 'device:punch' &&
       evtName !== 'device:status' &&
       evtName !== 'zkteco:sync_complete' &&
-      evtName !== 'biometric:auth_log'
+      evtName !== 'biometric:auth_log' &&
+      evtName !== 'ws:reconnected'
     ) {
       return;
     }
@@ -370,7 +380,7 @@ export const AttendanceModule: React.FC<AttendanceModuleProps> = ({
     } else if (evtName === 'attendance:updated' && payload.source === 'biometric') {
       setNotice('Live biometric update received — Attendance Register synced.');
     }
-  }, [lastWsEvent]);
+  }, [lastWsEvent, liveDate]);
 
   const currentMultiplier = useMemo(() => {
     switch (form.ot_type) {
@@ -1047,7 +1057,9 @@ export const AttendanceModule: React.FC<AttendanceModuleProps> = ({
                         </td>
                         <td className="py-3 px-4">
                           <div>{rec.shift_name}</div>
-                          <div className="text-[11px] text-slate-500">{rec.shift_period || 'Day'}</div>
+                          <div className="text-[11px] font-mono text-slate-500">
+                            {rec.attendance_date} · {rec.shift_period || 'Day'}
+                          </div>
                         </td>
                         <td className="py-3 px-4 font-mono tabular-nums">
                           <div className="font-semibold">{rec.check_in || '--'}</div>

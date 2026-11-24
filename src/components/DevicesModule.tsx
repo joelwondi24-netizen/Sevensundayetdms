@@ -483,10 +483,16 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
       return;
     }
 
-    if (lastWsEvent.event === 'device:punch' || lastWsEvent.event === 'device:status' || lastWsEvent.event === 'attendance:updated') {
+    if (
+      lastWsEvent.event === 'device:punch' ||
+      lastWsEvent.event === 'device:status' ||
+      lastWsEvent.event === 'attendance:updated' ||
+      lastWsEvent.event === 'ws:reconnected'
+    ) {
       loadDevices(true);
       loadRealtimeListeners();
       loadSyncLogs();
+      loadBioLogs();
     }
   }, [lastWsEvent]);
 
@@ -1034,10 +1040,10 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
     setError(null);
     try {
       const url = `/api/devices/zkteco/bridge-script${deviceId ? `?device_id=${deviceId}` : ''}`;
-      await downloadFile(url, 'zkteco-k40-bridge.mjs');
-      setNotice('Downloaded zkteco-k40-bridge.mjs. Run "node zkteco-k40-bridge.mjs" on any PC in your factory LAN.');
+      await downloadFile(url, 'zkteco-k40-readonly-connector.mjs');
+      setNotice('Downloaded zkteco-k40-readonly-connector.mjs (Strict Read-Only). Run "node zkteco-k40-readonly-connector.mjs" on any PC in your factory LAN.');
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to download ZKTeco K40 LAN bridge script');
+      setError(err instanceof Error ? err.message : 'Failed to download ZKTeco K40 Read-Only LAN connector script');
     }
   };
 
@@ -2058,6 +2064,11 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
                           Last Sync: {formatLogTimestamp(dev.last_sync_at).time}
                         </div>
                       )}
+                      {k40Capable && (dev.k40_fp_count !== null && dev.k40_fp_count !== undefined) && (
+                        <div className="text-[10px] font-mono text-emerald-700 dark:text-emerald-400">
+                          K40 Memory (Read-Only): {dev.k40_user_count ?? 0} users · {dev.k40_fp_count} FPs unchanged · {dev.k40_attlog_count ?? 0} logs
+                        </div>
+                      )}
                       {(dev.last_error || dev.last_message) && (
                         <div
                           className={`text-xs truncate max-w-[260px] ${
@@ -2222,11 +2233,11 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
             <div className="space-y-1">
               <h2 className="text-base font-bold text-[#172033] dark:text-white flex items-center gap-2">
                 <Fingerprint className="w-5 h-5 text-[#087CEB]" />
-                ZKTeco K40 Real Fingerprint Reader — Live Enrollment &amp; Attendance Stream
+                ZKTeco K40 Read-Only Terminal Sync &amp; Real-Time Attendance Stream
               </h2>
               <p className="text-xs text-slate-500 dark:text-slate-400">
-                Connects via real TCP port <span className="font-mono font-bold text-[#172033] dark:text-slate-200">4370</span> (<span className="font-mono">CMD_STARTENROLL</span> + <span className="font-mono">CMD_REG_EVENT</span>), ZKTeco ADMS HTTP Push at{' '}
-                <span className="font-mono font-bold text-[#087CEB]">/iclock/cdata?SN=SERIAL</span>, Factory LAN Bridge, and attached USB/Platform hardware fingerprint sensors. Every real finger scan automatically logs into Biometric Authentication Logs and records Check-In / Check-Out timestamps in Attendance Register.
+                Connects strictly READ-ONLY via TCP port <span className="font-mono font-bold text-[#172033] dark:text-slate-200">4370</span> (<span className="font-mono">CMD_ATTLOG_RRQ</span> + <span className="font-mono">CMD_USER_RRQ</span> + <span className="font-mono">CMD_GET_FREE_SIZES</span> + <span className="font-mono">CMD_REG_EVENT</span>), ZKTeco ADMS HTTP Push at{' '}
+                <span className="font-mono font-bold text-[#087CEB]">/iclock/cdata?SN=SERIAL</span>, and the Read-Only LAN Connector. Existing K40 fingerprint templates are never written, altered, or deleted.
               </p>
             </div>
             <div className="flex flex-wrap items-center gap-2 shrink-0">
@@ -2250,7 +2261,7 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
                 className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-[#087CEB] bg-[#EAF4FF] dark:bg-sky-950/60 border border-[#087CEB]/30 hover:bg-[#DBEAFE] rounded-lg whitespace-nowrap"
               >
                 <Download className="w-3.5 h-3.5" />
-                Download K40 LAN Bridge
+                Download Read-Only LAN Connector
               </button>
               <button
                 type="button"
@@ -3140,13 +3151,14 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
                     <th className="py-3 px-4 text-right">Imported</th>
                     <th className="py-3 px-4 text-right">Duplicates Skipped</th>
                     <th className="py-3 px-4 text-right">Unmatched PINs</th>
+                    <th className="py-3 px-4 text-right">K40 FPs (Unchanged)</th>
                     <th className="py-3 px-4">Status &amp; Error</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-200 dark:divide-slate-800">
                   {syncLogs.length === 0 ? (
                     <tr>
-                      <td colSpan={8} className="py-8 text-center text-slate-500">
+                      <td colSpan={9} className="py-8 text-center text-slate-500">
                         No synchronization logs recorded yet. Run Read-Only Sync Now or connect a ZKTeco K40 terminal.
                       </td>
                     </tr>
@@ -3172,6 +3184,9 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
                             {row.skipped_duplicates}
                           </td>
                           <td className="py-3 px-4 text-right font-mono text-amber-600 tabular-nums">{row.unmatched_count}</td>
+                          <td className="py-3 px-4 text-right font-mono text-emerald-700 dark:text-emerald-400 tabular-nums">
+                            {row.k40_fp_count !== null && row.k40_fp_count !== undefined ? row.k40_fp_count : '--'}
+                          </td>
                           <td className="py-3 px-4">
                             <span
                               className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-bold ${

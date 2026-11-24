@@ -305,6 +305,10 @@ export interface DeviceRecord {
   punch_count?: number;
   total_imported_count?: number;
   failed_sync_count?: number;
+  k40_user_count?: number | null;
+  k40_fp_count?: number | null;
+  k40_attlog_count?: number | null;
+  k40_device_time?: string | null;
 }
 
 export interface DeviceSyncLogRecord {
@@ -319,6 +323,7 @@ export interface DeviceSyncLogRecord {
   imported_count: number;
   skipped_duplicates: number;
   unmatched_count: number;
+  k40_fp_count?: number | null;
   latency_ms: number;
   error_message: string;
   started_at: string;
