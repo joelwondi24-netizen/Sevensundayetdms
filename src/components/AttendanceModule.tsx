@@ -1,22 +1,36 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
+import * as XLSX from 'xlsx';
 import {
+  Activity,
+  Check,
   CheckCircle2,
   Clock,
+  Download,
+  FileSpreadsheet,
   Fingerprint,
+  History,
   Lock,
   Pencil,
   Printer,
+  Radio,
+  RefreshCw,
   Save,
+  ShieldAlert,
   Trash2,
   Unlock,
   Upload,
+  Users,
   X,
+  XCircle,
 } from 'lucide-react';
 import { api, getApiTenantId } from '../api';
+import { useI18n } from '../i18n/I18nProvider';
 import type { WsEventPayload } from '../hooks/useRealtimeWS';
 import type {
+  AttendanceAuditLogRecord,
   AttendanceRecord,
   EmployeeProfile,
+  LiveAttendanceDashboardData,
   OtSettings,
   ShiftDefinition,
   StaffScheduleRecord,
@@ -84,8 +98,49 @@ export const AttendanceModule: React.FC<AttendanceModuleProps> = ({
   lastWsEvent,
   onRefreshDashboard,
 }) => {
+  const { t } = useI18n();
   const canEditRecords = ATTENDANCE_MANAGER_ROLES.has(currentUserRole);
   const canModifyClosedOrDelete = HIGH_ADMIN_ROLES.has(currentUserRole);
+
+  const [activeTab, setActiveTab] = useState<'live' | 'register' | 'overtime' | 'reports'>('live');
+  const [liveDate, setLiveDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [liveDashboard, setLiveDashboard] = useState<LiveAttendanceDashboardData | null>(null);
+  const [liveLoading, setLiveLoading] = useState(false);
+
+  const [otFilter, setOtFilter] = useState<'Pending' | 'Approved' | 'Rejected' | 'All'>('Pending');
+  const [otModalRec, setOtModalRec] = useState<AttendanceRecord | null>(null);
+  const [otDecision, setOtDecision] = useState<'Approved' | 'Rejected' | 'Adjusted'>('Approved');
+  const [otAdjustedHours, setOtAdjustedHours] = useState('');
+  const [otReason, setOtReason] = useState('');
+  const [otBusy, setOtBusy] = useState(false);
+
+  const [auditModalRec, setAuditModalRec] = useState<AttendanceRecord | null>(null);
+  const [auditLogs, setAuditLogs] = useState<AttendanceAuditLogRecord[]>([]);
+  const [auditLoading, setAuditLoading] = useState(false);
+
+  const [reportFrom, setReportFrom] = useState(() => {
+    const d = new Date();
+    d.setDate(1);
+    return d.toISOString().slice(0, 10);
+  });
+  const [reportTo, setReportTo] = useState(() => new Date().toISOString().slice(0, 10));
+  const [reportDept, setReportDept] = useState('All');
+  const [reportShift, setReportShift] = useState('All');
+  const [reportStatus, setReportStatus] = useState('All');
+  const [reportData, setReportData] = useState<{
+    from: string;
+    to: string;
+    total_records: number;
+    total_regular_hours: number;
+    total_late_minutes: number;
+    late_count: number;
+    absent_count: number;
+    total_ot_hours: number;
+    approved_ot_hours: number;
+    approved_ot_pay: number;
+    records: AttendanceRecord[];
+  } | null>(null);
+  const [reportLoading, setReportLoading] = useState(false);
 
   const [records, setRecords] = useState<AttendanceRecord[]>([]);
   const [employees, setEmployees] = useState<EmployeeProfile[]>([]);
@@ -207,6 +262,51 @@ export const AttendanceModule: React.FC<AttendanceModuleProps> = ({
     }));
   };
 
+  const loadLiveDashboard = async (targetDate = liveDate) => {
+    try {
+      setLiveLoading(true);
+      const data = await api.get<LiveAttendanceDashboardData>(
+        `/api/attendance/live-dashboard?date=${encodeURIComponent(targetDate)}`
+      );
+      setLiveDashboard(data);
+    } catch {
+      // ignore initial live dashboard fetch failure
+    } finally {
+      setLiveLoading(false);
+    }
+  };
+
+  const loadReports = async () => {
+    try {
+      setReportLoading(true);
+      const qs = new URLSearchParams({
+        from: reportFrom,
+        to: reportTo,
+        department: reportDept,
+        shift_period: reportShift,
+        status: reportStatus,
+      });
+      const data = await api.get<{
+        from: string;
+        to: string;
+        total_records: number;
+        total_regular_hours: number;
+        total_late_minutes: number;
+        late_count: number;
+        absent_count: number;
+        total_ot_hours: number;
+        approved_ot_hours: number;
+        approved_ot_pay: number;
+        records: AttendanceRecord[];
+      }>(`/api/attendance/reports?${qs.toString()}`);
+      setReportData(data);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to load attendance report');
+    } finally {
+      setReportLoading(false);
+    }
+  };
+
   const loadData = async () => {
     try {
       const [attData, settingsData, empData, shiftData, schedData, ruleData] = await Promise.all([
@@ -234,6 +334,8 @@ export const AttendanceModule: React.FC<AttendanceModuleProps> = ({
 
   useEffect(() => {
     loadData();
+    loadLiveDashboard(liveDate);
+    loadReports();
   }, []);
 
   const lastHandledWsRef = useRef<WsEventPayload | null>(null);
@@ -241,7 +343,14 @@ export const AttendanceModule: React.FC<AttendanceModuleProps> = ({
     if (!lastWsEvent || lastWsEvent === lastHandledWsRef.current) return;
     lastHandledWsRef.current = lastWsEvent;
     const evtName = lastWsEvent.event;
-    if (evtName !== 'attendance:updated' && evtName !== 'device:punch' && evtName !== 'biometric:auth_log') {
+    if (
+      evtName !== 'attendance:created' &&
+      evtName !== 'attendance:updated' &&
+      evtName !== 'device:punch' &&
+      evtName !== 'device:status' &&
+      evtName !== 'zkteco:sync_complete' &&
+      evtName !== 'biometric:auth_log'
+    ) {
       return;
     }
     const payload = (lastWsEvent.payload || {}) as Record<string, unknown>;
@@ -253,6 +362,7 @@ export const AttendanceModule: React.FC<AttendanceModuleProps> = ({
       return;
     }
     loadData();
+    loadLiveDashboard(liveDate);
     if (evtName === 'biometric:auth_log' && payload.attendance_marked) {
       setNotice(
         `Live biometric scan verified for ${String(payload.employee_name || payload.employee_code || 'staff')} — Attendance Register synced.`
@@ -575,8 +685,771 @@ export const AttendanceModule: React.FC<AttendanceModuleProps> = ({
     );
   }, [filteredRecords]);
 
+  const openOtModal = (rec: AttendanceRecord, defaultDecision: 'Approved' | 'Rejected' | 'Adjusted' = 'Approved') => {
+    setOtModalRec(rec);
+    setOtDecision(defaultDecision);
+    setOtAdjustedHours(String(rec.ot_hours || 0));
+    setOtReason(rec.ot_adjustment_reason || '');
+    setError(null);
+  };
+
+  const handleSubmitOtDecision = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!otModalRec) return;
+    if (!otReason.trim()) {
+      setError('A written reason is mandatory for all overtime approval, rejection, or adjustment actions.');
+      return;
+    }
+    setOtBusy(true);
+    setError(null);
+    try {
+      const updated = await api.patch<AttendanceRecord>(`/api/attendance/${otModalRec.id}/overtime-approval`, {
+        decision: otDecision,
+        reason: otReason.trim(),
+        adjusted_ot_hours: otDecision === 'Adjusted' ? Number(otAdjustedHours) : undefined,
+      });
+      setRecords((prev) => prev.map((r) => (r.id === updated.id ? updated : r)));
+      setOtModalRec(null);
+      setOtReason('');
+      setNotice(
+        `Overtime ${otDecision} for ${updated.employee_name} (${updated.ot_hours.toFixed(2)}h · ${formatMoney(updated.ot_pay, currency)}).`
+      );
+      loadLiveDashboard(liveDate);
+      onRefreshDashboard();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to save overtime approval decision');
+    } finally {
+      setOtBusy(false);
+    }
+  };
+
+  const handleOpenAuditModal = async (rec: AttendanceRecord) => {
+    setAuditModalRec(rec);
+    setAuditLoading(true);
+    try {
+      const logs = await api.get<AttendanceAuditLogRecord[]>(`/api/attendance/${rec.id}/audit`);
+      setAuditLogs(logs);
+    } catch {
+      setAuditLogs([]);
+    } finally {
+      setAuditLoading(false);
+    }
+  };
+
+  const handleExportReportExcel = () => {
+    const rows = (reportData?.records || []).map((r) => ({
+      'Employee ID': r.employee_code,
+      'Employee Name': r.employee_name,
+      Department: r.department,
+      Date: r.attendance_date,
+      Shift: r.shift_name,
+      'Check In (EAT)': r.check_in,
+      'Check Out (EAT)': r.check_out,
+      'Late (mins)': r.late_minutes || 0,
+      'Regular Hours': r.regular_hours,
+      'OT Hours': r.ot_hours,
+      'OT Approval': r.ot_approval_status || 'Approved',
+      'OT Pay': r.ot_pay,
+      Status: r.status,
+      'Verification Method': r.verification_method || 'Manual',
+      'Sync Status': r.sync_status || 'Synced',
+    }));
+    const wb = XLSX.utils.book_new();
+    const ws = XLSX.utils.json_to_sheet(rows);
+    XLSX.utils.book_append_sheet(wb, ws, 'Attendance Report');
+    XLSX.writeFile(wb, `attendance-report-${reportFrom}-to-${reportTo}.xlsx`);
+  };
+
+  const handleExportReportCsv = () => {
+    const cols = [
+      'Employee ID', 'Employee Name', 'Department', 'Date', 'Shift',
+      'Check In', 'Check Out', 'Late Minutes', 'Regular Hours',
+      'OT Hours', 'OT Approval', 'OT Pay', 'Status', 'Verification Method',
+    ];
+    const lines = [cols.join(',')];
+    for (const r of reportData?.records || []) {
+      const vals = [
+        r.employee_code, r.employee_name, r.department, r.attendance_date, r.shift_name,
+        r.check_in, r.check_out, String(r.late_minutes || 0), String(r.regular_hours),
+        String(r.ot_hours), r.ot_approval_status || 'Approved', String(r.ot_pay),
+        r.status, r.verification_method || 'Manual',
+      ].map((v) => `"${String(v || '').replace(/"/g, '""')}"`);
+      lines.push(vals.join(','));
+    }
+    const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `attendance-report-${reportFrom}-to-${reportTo}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const otQueueRecords = useMemo(() => {
+    return records.filter((r) => {
+      if ((Number(r.ot_hours) || 0) <= 0 && r.ot_approval_status !== 'Rejected') return false;
+      if (otFilter !== 'All' && (r.ot_approval_status || 'Approved') !== otFilter) return false;
+      return true;
+    });
+  }, [records, otFilter]);
+
+  const pendingOtCount = useMemo(
+    () => records.filter((r) => (Number(r.ot_hours) || 0) > 0 && r.ot_approval_status === 'Pending').length,
+    [records]
+  );
+
   return (
     <div className="space-y-6">
+      {/* Top Attendance Module Navigation */}
+      <div className="no-print bg-[#FFFFFF] dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-4 flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+        <div>
+          <h2 className="text-lg font-bold text-[#172033] dark:text-white flex items-center gap-2">
+            <Activity className="w-5 h-5 text-[#087CEB]" />
+            {t('att.title', 'Attendance & Biometric Control Center')}
+          </h2>
+          <p className="text-xs text-slate-500 dark:text-slate-400">
+            {t('att.subtitle', 'Ethiopian Local Time (Africa/Addis_Ababa · UTC+3) · Morning, Afternoon & Night Shift Engine')}
+          </p>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={() => {
+              setActiveTab('live');
+              loadLiveDashboard(liveDate);
+            }}
+            className={`inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-bold rounded-lg transition-colors whitespace-nowrap ${
+              activeTab === 'live'
+                ? 'bg-[#18243A] text-white shadow-sm'
+                : 'text-[#172033] dark:text-slate-300 bg-[#F8FAFC] dark:bg-slate-800 border border-slate-200 dark:border-slate-700'
+            }`}
+          >
+            <Radio className="w-3.5 h-3.5 text-emerald-400" />
+            {t('att.tab.live', 'Live Dashboard')}
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveTab('register')}
+            className={`inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-bold rounded-lg transition-colors whitespace-nowrap ${
+              activeTab === 'register'
+                ? 'bg-[#18243A] text-white shadow-sm'
+                : 'text-[#172033] dark:text-slate-300 bg-[#F8FAFC] dark:bg-slate-800 border border-slate-200 dark:border-slate-700'
+            }`}
+          >
+            <Clock className="w-3.5 h-3.5 text-[#087CEB]" />
+            {t('att.tab.records', 'Attendance Register')}
+            <span className="px-1.5 py-0.5 text-[10px] font-mono rounded bg-white/15 tabular-nums">{records.length}</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveTab('overtime')}
+            className={`inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-bold rounded-lg transition-colors whitespace-nowrap ${
+              activeTab === 'overtime'
+                ? 'bg-[#18243A] text-white shadow-sm'
+                : 'text-[#172033] dark:text-slate-300 bg-[#F8FAFC] dark:bg-slate-800 border border-slate-200 dark:border-slate-700'
+            }`}
+          >
+            <ShieldAlert className="w-3.5 h-3.5 text-amber-500" />
+            {t('att.tab.overtime', 'Overtime Approvals')}
+            <span
+              className={`px-1.5 py-0.5 text-[10px] font-mono rounded tabular-nums ${
+                pendingOtCount > 0 ? 'bg-amber-500 text-white' : 'bg-white/15'
+              }`}
+            >
+              {pendingOtCount}
+            </span>
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setActiveTab('reports');
+              loadReports();
+            }}
+            className={`inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-bold rounded-lg transition-colors whitespace-nowrap ${
+              activeTab === 'reports'
+                ? 'bg-[#18243A] text-white shadow-sm'
+                : 'text-[#172033] dark:text-slate-300 bg-[#F8FAFC] dark:bg-slate-800 border border-slate-200 dark:border-slate-700'
+            }`}
+          >
+            <FileSpreadsheet className="w-3.5 h-3.5 text-[#087CEB]" />
+            {t('att.tab.reports', 'Reports & Exports')}
+          </button>
+        </div>
+      </div>
+
+      {notice && (
+        <div className="no-print flex items-center justify-between px-4 py-2.5 text-xs font-medium text-emerald-800 bg-emerald-50 border border-emerald-200 rounded-lg dark:bg-emerald-950/30 dark:border-emerald-900 dark:text-emerald-300">
+          <span>{notice}</span>
+          <button type="button" onClick={() => setNotice(null)}>
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      )}
+
+      {error && (
+        <div className="no-print flex items-center justify-between px-4 py-2.5 text-xs font-medium text-red-700 bg-red-50 border border-red-200 rounded-lg dark:bg-red-950/30 dark:border-red-900 dark:text-red-300">
+          <span>{error}</span>
+          <button type="button" onClick={() => setError(null)}>
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      )}
+
+      {/* LIVE ATTENDANCE DASHBOARD */}
+      {activeTab === 'live' && (
+        <div className="no-print space-y-5">
+          <div className="bg-[#FFFFFF] dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-4 flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-2.5">
+              <span
+                className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-bold ${
+                  liveDashboard?.k40_status === 'Online'
+                    ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300'
+                    : liveDashboard?.k40_status === 'Offline'
+                    ? 'bg-red-100 text-red-800 dark:bg-red-950/60 dark:text-red-300'
+                    : 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300'
+                }`}
+              >
+                <span
+                  className={`w-2 h-2 rounded-full ${
+                    liveDashboard?.k40_status === 'Online' ? 'bg-emerald-500 animate-pulse' : 'bg-slate-400'
+                  }`}
+                />
+                K40 Status: {liveDashboard?.k40_status || 'Checking...'} ({liveDashboard?.k40_connected_count ?? 0}/
+                {liveDashboard?.k40_total_count ?? 0})
+              </span>
+              <span className="text-xs font-mono text-slate-500">
+                {t('att.kpi.lastSync', 'Last Sync')}: {liveDashboard?.last_sync_at ? liveDashboard.last_sync_at.slice(11, 19) : 'Never'}
+              </span>
+              {(liveDashboard?.pending_unmatched_count ?? 0) > 0 && (
+                <span className="px-2 py-0.5 text-[11px] font-bold bg-amber-100 text-amber-800 rounded">
+                  {liveDashboard?.pending_unmatched_count} Unmatched K40 PIN(s)
+                </span>
+              )}
+            </div>
+
+            <div className="flex items-center gap-2">
+              <input
+                type="date"
+                value={liveDate}
+                onChange={(e) => {
+                  setLiveDate(e.target.value);
+                  loadLiveDashboard(e.target.value);
+                }}
+                className="px-2.5 py-1.5 text-xs font-mono border border-slate-300 dark:border-slate-700 rounded-lg bg-[#F8FAFC] dark:bg-slate-800"
+              />
+              <button
+                type="button"
+                onClick={() => loadLiveDashboard(liveDate)}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-[#172033] dark:text-slate-200 bg-[#F8FAFC] dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${liveLoading ? 'animate-spin' : ''}`} />
+                Refresh
+              </button>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
+            <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-4">
+              <div className="text-[11px] font-semibold uppercase tracking-wider text-slate-500 flex items-center gap-1">
+                <Users className="w-3.5 h-3.5 text-[#087CEB]" />
+                {t('att.kpi.totalEmployees', 'Total Employees')}
+              </div>
+              <div className="mt-1 text-2xl font-extrabold font-mono text-[#172033] dark:text-white tabular-nums">
+                {liveDashboard?.total_employees ?? employees.length}
+              </div>
+            </div>
+
+            <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-4">
+              <div className="text-[11px] font-semibold uppercase tracking-wider text-emerald-700 dark:text-emerald-400">
+                {t('att.kpi.presentToday', 'Present Today')}
+              </div>
+              <div className="mt-1 text-2xl font-extrabold font-mono text-emerald-700 dark:text-emerald-400 tabular-nums">
+                {liveDashboard?.present_today ?? 0}
+              </div>
+              <div className="text-[11px] text-slate-500 font-mono">
+                In: {liveDashboard?.checked_in_count ?? 0} · Out: {liveDashboard?.checked_out_count ?? 0}
+              </div>
+            </div>
+
+            <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-4">
+              <div className="text-[11px] font-semibold uppercase tracking-wider text-red-700 dark:text-red-400">
+                {t('att.kpi.absentToday', 'Absent Today')}
+              </div>
+              <div className="mt-1 text-2xl font-extrabold font-mono text-red-700 dark:text-red-400 tabular-nums">
+                {liveDashboard?.absent_today ?? 0}
+              </div>
+            </div>
+
+            <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-4">
+              <div className="text-[11px] font-semibold uppercase tracking-wider text-amber-600">
+                {t('att.kpi.lateToday', 'Currently Late')}
+              </div>
+              <div className="mt-1 text-2xl font-extrabold font-mono text-amber-600 tabular-nums">
+                {liveDashboard?.late_today ?? 0}
+              </div>
+              <div className="text-[11px] text-slate-500 font-mono">
+                OT Pending: {liveDashboard?.pending_ot_approvals ?? pendingOtCount}
+              </div>
+            </div>
+
+            <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-4">
+              <div className="text-[11px] font-semibold uppercase tracking-wider text-[#087CEB]">
+                {t('att.kpi.firstCheckIn', 'First In / Last Out')}
+              </div>
+              <div className="mt-1 text-base font-extrabold font-mono text-[#172033] dark:text-white tabular-nums">
+                {liveDashboard?.first_check_in || '--:--'} / {liveDashboard?.last_check_out || '--:--'}
+              </div>
+              <div className="text-[11px] text-slate-500 font-mono">
+                {liveDashboard?.total_records_today ?? 0} record(s) on {liveDate}
+              </div>
+            </div>
+          </div>
+
+          {/* Live Attendance Stream Table */}
+          <div className="bg-[#FFFFFF] dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden">
+            <div className="p-4 border-b border-slate-200 dark:border-slate-800 flex flex-wrap items-center justify-between gap-2">
+              <h3 className="text-sm font-bold text-[#172033] dark:text-white">
+                Real-Time Attendance Stream ({liveDate})
+              </h3>
+              <span className="text-[11px] font-mono text-slate-500">
+                Auto-updates via WebSocket · Ethiopian Local Time + EAT
+              </span>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full min-w-[920px] text-left border-collapse text-xs">
+                <thead>
+                  <tr className="border-b border-slate-200 dark:border-slate-800 bg-[#18243A] text-white font-semibold">
+                    <th className="py-3 px-4">{t('att.col.empName', 'Employee')}</th>
+                    <th className="py-3 px-4">{t('att.col.shift', 'Shift')}</th>
+                    <th className="py-3 px-4">{t('att.col.checkIn', 'Check-In')}</th>
+                    <th className="py-3 px-4">{t('att.col.checkOut', 'Check-Out')}</th>
+                    <th className="py-3 px-4">{t('att.col.otHours', 'OT & Approval')}</th>
+                    <th className="py-3 px-4">{t('att.col.sourceDevice', 'Method & Sync')}</th>
+                    <th className="py-3 px-4">{t('att.col.status', 'Status')}</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-200 dark:divide-slate-800">
+                  {(liveDashboard?.recent_records || []).length === 0 ? (
+                    <tr>
+                      <td colSpan={7} className="py-8 text-center text-slate-500">
+                        No live attendance punches recorded for {liveDate} yet. Scan on ZKTeco K40 or switch to Attendance Register.
+                      </td>
+                    </tr>
+                  ) : (
+                    (liveDashboard?.recent_records || []).map((rec) => (
+                      <tr key={`live-${rec.id}`} className="hover:bg-[#F8FAFC] dark:hover:bg-slate-800/40">
+                        <td className="py-3 px-4">
+                          <div className="font-semibold text-[#172033] dark:text-white">{rec.employee_name}</div>
+                          <div className="text-[11px] font-mono text-slate-500">
+                            {rec.employee_code} · {rec.department}
+                          </div>
+                        </td>
+                        <td className="py-3 px-4">
+                          <div>{rec.shift_name}</div>
+                          <div className="text-[11px] text-slate-500">{rec.shift_period || 'Day'}</div>
+                        </td>
+                        <td className="py-3 px-4 font-mono tabular-nums">
+                          <div className="font-semibold">{rec.check_in || '--'}</div>
+                          {rec.check_in && (
+                            <div className="text-[10px] text-slate-400">{formatEthiopianLocalTime(rec.check_in)}</div>
+                          )}
+                        </td>
+                        <td className="py-3 px-4 font-mono tabular-nums">
+                          <div className="font-semibold">{rec.check_out || '--'}</div>
+                          {rec.check_out && (
+                            <div className="text-[10px] text-slate-400">{formatEthiopianLocalTime(rec.check_out)}</div>
+                          )}
+                        </td>
+                        <td className="py-3 px-4 font-mono tabular-nums">
+                          <div>{Number(rec.ot_hours).toFixed(2)}h</div>
+                          {Number(rec.ot_hours) > 0 && (
+                            <span
+                              className={`inline-block px-1.5 py-0.5 text-[10px] font-bold rounded ${
+                                rec.ot_approval_status === 'Approved'
+                                  ? 'bg-emerald-100 text-emerald-800'
+                                  : rec.ot_approval_status === 'Rejected'
+                                  ? 'bg-red-100 text-red-800'
+                                  : 'bg-amber-100 text-amber-800'
+                              }`}
+                            >
+                              {rec.ot_approval_status || 'Approved'}
+                            </span>
+                          )}
+                        </td>
+                        <td className="py-3 px-4">
+                          <div className="font-medium">{rec.verification_method || 'Manual'}</div>
+                          <div className="text-[11px] font-mono text-[#087CEB]">{rec.sync_status || 'Synced'}</div>
+                        </td>
+                        <td className="py-3 px-4">
+                          <span
+                            className={`font-bold ${
+                              rec.status === 'Absent'
+                                ? 'text-red-600'
+                                : rec.status === 'Late' || rec.status === 'Late & Early'
+                                ? 'text-amber-600'
+                                : 'text-emerald-700 dark:text-emerald-400'
+                            }`}
+                          >
+                            {rec.status}
+                          </span>
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* OVERTIME APPROVAL QUEUE */}
+      {activeTab === 'overtime' && (
+        <div className="no-print space-y-4">
+          <div className="bg-[#FFFFFF] dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-5 flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h3 className="text-base font-bold text-[#172033] dark:text-white">
+                Overtime Approval &amp; Audit Queue
+              </h3>
+              <p className="text-xs text-slate-500 mt-0.5">
+                Only Approved overtime hours are included in Payroll calculations. Every approval, adjustment, or rejection requires a written reason.
+              </p>
+            </div>
+            <div className="flex items-center gap-1.5">
+              {(['Pending', 'Approved', 'Rejected', 'All'] as const).map((st) => (
+                <button
+                  key={st}
+                  type="button"
+                  onClick={() => setOtFilter(st)}
+                  className={`px-3 py-1.5 text-xs font-bold rounded-lg ${
+                    otFilter === st
+                      ? 'bg-[#18243A] text-white'
+                      : 'bg-[#F8FAFC] dark:bg-slate-800 text-slate-600 dark:text-slate-300 border border-slate-200 dark:border-slate-700'
+                  }`}
+                >
+                  {st}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="bg-[#FFFFFF] dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden">
+            <div className="overflow-x-auto">
+              <table className="w-full min-w-[920px] text-left border-collapse text-xs">
+                <thead>
+                  <tr className="border-b border-slate-200 dark:border-slate-800 bg-[#18243A] text-white font-semibold">
+                    <th className="py-3 px-4">Employee</th>
+                    <th className="py-3 px-4">Date &amp; Shift</th>
+                    <th className="py-3 px-4">Punches (EAT / ET)</th>
+                    <th className="py-3 px-4">OT Hours &amp; Pay</th>
+                    <th className="py-3 px-4">Approval Status &amp; Reason</th>
+                    <th className="py-3 px-4 text-right">Actions</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-200 dark:divide-slate-800">
+                  {otQueueRecords.length === 0 ? (
+                    <tr>
+                      <td colSpan={6} className="py-8 text-center text-slate-500">
+                        No overtime records match filter "{otFilter}".
+                      </td>
+                    </tr>
+                  ) : (
+                    otQueueRecords.map((rec) => (
+                      <tr key={`ot-${rec.id}`} className="hover:bg-[#F8FAFC] dark:hover:bg-slate-800/40">
+                        <td className="py-3 px-4">
+                          <div className="font-semibold text-[#172033] dark:text-white">{rec.employee_name}</div>
+                          <div className="text-[11px] font-mono text-slate-500">
+                            {rec.employee_code} · {rec.department}
+                          </div>
+                        </td>
+                        <td className="py-3 px-4 font-mono">
+                          <div>{rec.attendance_date}</div>
+                          <div className="text-[11px] text-slate-500">{rec.shift_name}</div>
+                        </td>
+                        <td className="py-3 px-4 font-mono tabular-nums">
+                          <div>
+                            {rec.check_in} – {rec.check_out}
+                          </div>
+                          <div className="text-[10px] text-slate-400">
+                            {formatEthiopianLocalTime(rec.check_in)} → {formatEthiopianLocalTime(rec.check_out)}
+                          </div>
+                        </td>
+                        <td className="py-3 px-4 font-mono tabular-nums">
+                          <div className="font-bold">
+                            {rec.ot_hours.toFixed(2)}h ({rec.ot_multiplier}x)
+                          </div>
+                          <div className="text-[#087CEB] font-semibold">{formatMoney(rec.ot_pay, currency)}</div>
+                        </td>
+                        <td className="py-3 px-4">
+                          <span
+                            className={`inline-block px-2 py-0.5 text-[11px] font-bold rounded ${
+                              rec.ot_approval_status === 'Approved'
+                                ? 'bg-emerald-100 text-emerald-800'
+                                : rec.ot_approval_status === 'Rejected'
+                                ? 'bg-red-100 text-red-800'
+                                : 'bg-amber-100 text-amber-800'
+                            }`}
+                          >
+                            {rec.ot_approval_status || 'Approved'}
+                          </span>
+                          {rec.ot_adjustment_reason && (
+                            <div className="text-[11px] text-slate-500 mt-1 max-w-[240px]">
+                              {rec.ot_adjustment_reason}
+                            </div>
+                          )}
+                        </td>
+                        <td className="py-3 px-4 text-right whitespace-nowrap">
+                          <div className="inline-flex items-center gap-1.5">
+                            {canEditRecords && (
+                              <>
+                                <button
+                                  type="button"
+                                  onClick={() => openOtModal(rec, 'Approved')}
+                                  className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] font-bold text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg"
+                                >
+                                  <Check className="w-3 h-3" />
+                                  Approve / Adjust
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => openOtModal(rec, 'Rejected')}
+                                  className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] font-bold text-red-700 bg-red-50 hover:bg-red-100 rounded-lg"
+                                >
+                                  <XCircle className="w-3 h-3" />
+                                  Reject
+                                </button>
+                              </>
+                            )}
+                            <button
+                              type="button"
+                              onClick={() => handleOpenAuditModal(rec)}
+                              className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] font-semibold text-[#172033] bg-slate-100 hover:bg-slate-200 rounded-lg"
+                            >
+                              <History className="w-3 h-3" />
+                              Audit
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* REPORTS & EXPORTS */}
+      {activeTab === 'reports' && (
+        <div className="no-print space-y-5">
+          <div className="bg-[#FFFFFF] dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-5 space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h3 className="text-base font-bold text-[#172033] dark:text-white">
+                  Attendance &amp; Overtime Reports Center
+                </h3>
+                <p className="text-xs text-slate-500">
+                  Filter daily, weekly, or monthly attendance and export directly to Excel (.xlsx), CSV, or PDF Printer View.
+                </p>
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={handleExportReportExcel}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg"
+                >
+                  <FileSpreadsheet className="w-3.5 h-3.5" />
+                  {t('att.export.excel', 'Export Excel (.xlsx)')}
+                </button>
+                <button
+                  type="button"
+                  onClick={handleExportReportCsv}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold text-[#087CEB] bg-[#EAF4FF] hover:bg-[#DBEAFE] border border-[#087CEB]/30 rounded-lg"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  {t('att.export.csv', 'Export CSV')}
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    printWithAutoFit({
+                      orientation: 'landscape',
+                      targetSelector: '.print-only-container[data-print-active="true"]',
+                    })
+                  }
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold text-white bg-[#18243A] hover:bg-[#243656] rounded-lg"
+                >
+                  <Printer className="w-3.5 h-3.5" />
+                  {t('att.export.print', 'Print / Save PDF')}
+                </button>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-3">
+              <div>
+                <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">From Date</label>
+                <input
+                  type="date"
+                  value={reportFrom}
+                  onChange={(e) => setReportFrom(e.target.value)}
+                  className="w-full px-3 py-2 text-xs font-mono bg-[#F8FAFC] dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">To Date</label>
+                <input
+                  type="date"
+                  value={reportTo}
+                  onChange={(e) => setReportTo(e.target.value)}
+                  className="w-full px-3 py-2 text-xs font-mono bg-[#F8FAFC] dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">Department</label>
+                <select
+                  value={reportDept}
+                  onChange={(e) => setReportDept(e.target.value)}
+                  className="w-full px-3 py-2 text-xs bg-[#F8FAFC] dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg"
+                >
+                  <option value="All">All Departments</option>
+                  {departmentOptions.map((d) => (
+                    <option key={d} value={d}>
+                      {d}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">Shift Session</label>
+                <select
+                  value={reportShift}
+                  onChange={(e) => setReportShift(e.target.value)}
+                  className="w-full px-3 py-2 text-xs bg-[#F8FAFC] dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg"
+                >
+                  <option value="All">All Shifts</option>
+                  <option value="Morning">Morning</option>
+                  <option value="Afternoon">Afternoon</option>
+                  <option value="Night">Night</option>
+                </select>
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">Status</label>
+                <select
+                  value={reportStatus}
+                  onChange={(e) => setReportStatus(e.target.value)}
+                  className="w-full px-3 py-2 text-xs bg-[#F8FAFC] dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg"
+                >
+                  <option value="All">All Statuses</option>
+                  <option value="Present">Present</option>
+                  <option value="Late">Late</option>
+                  <option value="Absent">Absent</option>
+                </select>
+              </div>
+              <div className="flex items-end">
+                <button
+                  type="button"
+                  disabled={reportLoading}
+                  onClick={loadReports}
+                  className="w-full inline-flex items-center justify-center gap-1.5 px-4 py-2 text-xs font-bold text-white bg-[#087CEB] hover:bg-[#0265C4] rounded-lg"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${reportLoading ? 'animate-spin' : ''}`} />
+                  Run Report
+                </button>
+              </div>
+            </div>
+
+            {reportData && (
+              <div className="grid grid-cols-2 sm:grid-cols-6 gap-3 pt-2 border-t border-slate-200 dark:border-slate-800 text-xs">
+                <div>
+                  <span className="text-slate-500 block">Total Entries</span>
+                  <span className="font-mono font-bold text-sm">{reportData.total_records}</span>
+                </div>
+                <div>
+                  <span className="text-slate-500 block">Regular Hours</span>
+                  <span className="font-mono font-bold text-sm">{reportData.total_regular_hours.toFixed(2)}h</span>
+                </div>
+                <div>
+                  <span className="text-slate-500 block">Late Count / Mins</span>
+                  <span className="font-mono font-bold text-sm text-amber-600">
+                    {reportData.late_count} ({reportData.total_late_minutes}m)
+                  </span>
+                </div>
+                <div>
+                  <span className="text-slate-500 block">Absent Count</span>
+                  <span className="font-mono font-bold text-sm text-red-600">{reportData.absent_count}</span>
+                </div>
+                <div>
+                  <span className="text-slate-500 block">Approved OT Hrs</span>
+                  <span className="font-mono font-bold text-sm text-emerald-700">
+                    {reportData.approved_ot_hours.toFixed(2)}h / {reportData.total_ot_hours.toFixed(2)}h
+                  </span>
+                </div>
+                <div>
+                  <span className="text-slate-500 block">Approved OT Pay</span>
+                  <span className="font-mono font-bold text-sm text-[#087CEB]">
+                    {formatMoney(reportData.approved_ot_pay, currency)}
+                  </span>
+                </div>
+              </div>
+            )}
+          </div>
+
+          <div className="bg-[#FFFFFF] dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden">
+            <div className="overflow-x-auto">
+              <table className="w-full min-w-[900px] text-left border-collapse text-xs">
+                <thead>
+                  <tr className="border-b border-slate-200 dark:border-slate-800 bg-[#18243A] text-white font-semibold">
+                    <th className="py-3 px-4">Employee</th>
+                    <th className="py-3 px-4">Date</th>
+                    <th className="py-3 px-4">Shift</th>
+                    <th className="py-3 px-4">In / Out</th>
+                    <th className="py-3 px-4">Regular / Late</th>
+                    <th className="py-3 px-4">OT &amp; Approval</th>
+                    <th className="py-3 px-4">Status</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-200 dark:divide-slate-800">
+                  {(reportData?.records || []).length === 0 ? (
+                    <tr>
+                      <td colSpan={7} className="py-8 text-center text-slate-500">
+                        No attendance records found for this date range.
+                      </td>
+                    </tr>
+                  ) : (
+                    (reportData?.records || []).map((rec) => (
+                      <tr key={`rep-${rec.id}`} className="hover:bg-[#F8FAFC] dark:hover:bg-slate-800/40">
+                        <td className="py-2.5 px-4">
+                          <div className="font-semibold">{rec.employee_name}</div>
+                          <div className="text-[11px] font-mono text-slate-500">
+                            {rec.employee_code} · {rec.department}
+                          </div>
+                        </td>
+                        <td className="py-2.5 px-4 font-mono">{rec.attendance_date}</td>
+                        <td className="py-2.5 px-4">{rec.shift_name}</td>
+                        <td className="py-2.5 px-4 font-mono">
+                          {rec.check_in} – {rec.check_out}
+                        </td>
+                        <td className="py-2.5 px-4 font-mono">
+                          {rec.regular_hours.toFixed(2)}h · Late {rec.late_minutes || 0}m
+                        </td>
+                        <td className="py-2.5 px-4 font-mono">
+                          {rec.ot_hours.toFixed(2)}h ({rec.ot_approval_status || 'Approved'})
+                        </td>
+                        <td className="py-2.5 px-4 font-semibold">{rec.status}</td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {activeTab === 'register' && (
+        <>
       {/* OT Multipliers */}
       {canModifyClosedOrDelete && (
         <div className="no-print bg-[#FFFFFF] dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-5">
@@ -1243,6 +2116,19 @@ export const AttendanceModule: React.FC<AttendanceModuleProps> = ({
                       <div className="font-mono font-semibold text-blue-600 dark:text-blue-400">
                         {formatMoney(rec.ot_pay, currency)}
                       </div>
+                      {Number(rec.ot_hours) > 0 && (
+                        <span
+                          className={`inline-block mt-0.5 px-1.5 py-0.5 text-[10px] font-bold rounded ${
+                            rec.ot_approval_status === 'Approved'
+                              ? 'bg-emerald-100 text-emerald-800'
+                              : rec.ot_approval_status === 'Rejected'
+                              ? 'bg-red-100 text-red-800'
+                              : 'bg-amber-100 text-amber-800'
+                          }`}
+                        >
+                          OT {rec.ot_approval_status || 'Approved'}
+                        </span>
+                      )}
                     </td>
                     <td className="py-3 px-4">
                       <div
@@ -1256,19 +2142,41 @@ export const AttendanceModule: React.FC<AttendanceModuleProps> = ({
                       >
                         {rec.status} · {rec.register_state}
                       </div>
+                      <div className="text-[10px] font-mono text-slate-500">
+                        {rec.verification_method || 'Manual'} · {rec.sync_status || 'Synced'}
+                      </div>
                       {rec.updated_by && (
                         <div className="text-[10px] text-slate-400 truncate max-w-[140px]">By {rec.updated_by}</div>
                       )}
-                      {rec.notes && /biometric|adms|passkey|auto-marked/i.test(rec.notes) && (
+                      {rec.notes && /biometric|adms|passkey|auto-marked|zkteco/i.test(rec.notes) && (
                         <div className="mt-1 inline-flex items-center gap-1 px-1.5 py-0.5 text-[10px] font-semibold bg-[#EAF4FF] text-[#087CEB] dark:bg-sky-950/60 dark:text-sky-300 rounded">
                           <Fingerprint className="w-3 h-3" />
-                          Biometric Auto-Marked
+                          Biometric Synced
                         </div>
                       )}
                     </td>
                     {canEditRecords && (
                       <td className="py-3 px-4">
-                        <div className="flex items-center justify-end gap-1.5">
+                        <div className="flex items-center justify-end gap-1.5 flex-wrap">
+                          {Number(rec.ot_hours) > 0 && (
+                            <button
+                              type="button"
+                              onClick={() => openOtModal(rec, 'Approved')}
+                              className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-bold text-amber-900 bg-amber-100 hover:bg-amber-200 rounded-lg whitespace-nowrap"
+                              title="Approve, Adjust, or Reject Overtime"
+                            >
+                              <ShieldAlert className="w-3 h-3" />
+                              OT Review
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => handleOpenAuditModal(rec)}
+                            className="p-1.5 text-[#172033] bg-slate-100 hover:bg-slate-200 rounded-lg"
+                            title="View Immutable Timestamp & Audit Trail"
+                          >
+                            <History className="w-3.5 h-3.5" />
+                          </button>
                           <button
                             type="button"
                             onClick={() => handleToggleClosed(rec)}
@@ -1347,6 +2255,8 @@ export const AttendanceModule: React.FC<AttendanceModuleProps> = ({
           </table>
         </div>
       </div>
+        </>
+      )}
 
       {/* PRINTER VIEW */}
       <div
@@ -1470,6 +2380,159 @@ export const AttendanceModule: React.FC<AttendanceModuleProps> = ({
           </div>
         </div>
       </div>
+
+      {/* Overtime Approval / Adjustment Modal */}
+      {otModalRec && (
+        <div
+          className="fixed inset-0 z-50 bg-[#18243A]/70 flex items-center justify-center p-4"
+          onClick={() => setOtModalRec(null)}
+        >
+          <div
+            className="w-full max-w-md bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-xl p-6 space-y-4 shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between">
+              <div>
+                <h3 className="text-base font-bold text-[#172033] dark:text-white">
+                  Overtime Review · {otModalRec.employee_name}
+                </h3>
+                <p className="text-xs text-slate-500">
+                  {otModalRec.attendance_date} · {otModalRec.shift_name} · Current {otModalRec.ot_hours.toFixed(2)}h
+                </p>
+              </div>
+              <button type="button" onClick={() => setOtModalRec(null)} className="p-1 text-slate-400">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <form onSubmit={handleSubmitOtDecision} className="space-y-3">
+              <div>
+                <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1">Decision</label>
+                <select
+                  value={otDecision}
+                  onChange={(e) => setOtDecision(e.target.value as 'Approved' | 'Rejected' | 'Adjusted')}
+                  className="w-full px-3 py-2 text-xs bg-[#F8FAFC] dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg"
+                >
+                  <option value="Approved">Approve Full Calculated OT</option>
+                  <option value="Adjusted">Adjust Overtime Hours &amp; Approve</option>
+                  <option value="Rejected">Reject Overtime (Set Payable OT = 0)</option>
+                </select>
+              </div>
+
+              {otDecision === 'Adjusted' && (
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1">
+                    Adjusted Overtime Hours
+                  </label>
+                  <input
+                    type="number"
+                    step="0.05"
+                    min="0"
+                    max="16"
+                    required
+                    value={otAdjustedHours}
+                    onChange={(e) => setOtAdjustedHours(e.target.value)}
+                    className="w-full px-3 py-2 text-xs font-mono bg-[#F8FAFC] dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg"
+                  />
+                </div>
+              )}
+
+              <div>
+                <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1">
+                  {t('att.ot.reasonRequired', 'Mandatory Written Reason')}
+                </label>
+                <textarea
+                  rows={3}
+                  required
+                  placeholder="Enter mandatory justification for audit log..."
+                  value={otReason}
+                  onChange={(e) => setOtReason(e.target.value)}
+                  className="w-full px-3 py-2 text-xs bg-[#F8FAFC] dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg"
+                />
+              </div>
+
+              <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-200 dark:border-slate-800">
+                <button
+                  type="button"
+                  onClick={() => setOtModalRec(null)}
+                  className="px-3 py-2 text-xs font-semibold text-slate-600"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={otBusy}
+                  className="px-4 py-2 text-xs font-bold text-white bg-[#087CEB] hover:bg-[#0265C4] rounded-lg"
+                >
+                  {otBusy ? 'Saving...' : 'Confirm Decision'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Attendance Immutable Timestamp & Audit Trail Modal */}
+      {auditModalRec && (
+        <div
+          className="fixed inset-0 z-50 bg-[#18243A]/70 flex items-center justify-center p-4"
+          onClick={() => setAuditModalRec(null)}
+        >
+          <div
+            className="w-full max-w-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-xl p-6 space-y-4 shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between">
+              <div>
+                <h3 className="text-base font-bold text-[#172033] dark:text-white">
+                  Attendance Audit Trail · #{auditModalRec.id}
+                </h3>
+                <p className="text-xs text-slate-500">
+                  {auditModalRec.employee_name} ({auditModalRec.employee_code}) · {auditModalRec.attendance_date}
+                </p>
+              </div>
+              <button type="button" onClick={() => setAuditModalRec(null)} className="p-1 text-slate-400">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="p-3 rounded-lg bg-[#F8FAFC] dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-xs font-mono space-y-1">
+              <div>Immutable Machine Timestamp: {auditModalRec.machine_timestamp || 'N/A'}</div>
+              <div>Received Timestamp: {auditModalRec.received_timestamp || auditModalRec.created_at}</div>
+              <div>
+                Method: {auditModalRec.verification_method || 'Manual'} · TxID: {auditModalRec.device_tx_id || '--'}
+              </div>
+            </div>
+
+            <div className="max-h-64 overflow-y-auto space-y-2">
+              {auditLoading ? (
+                <div className="text-xs text-slate-500 py-4 text-center">Loading audit trail...</div>
+              ) : auditLogs.length === 0 ? (
+                <div className="text-xs text-slate-500 py-4 text-center">
+                  No manual overtime or status adjustments recorded for this entry.
+                </div>
+              ) : (
+                auditLogs.map((log) => (
+                  <div
+                    key={log.id}
+                    className="p-3 rounded-lg border border-slate-200 dark:border-slate-700 text-xs space-y-1"
+                  >
+                    <div className="flex items-center justify-between font-bold">
+                      <span>{log.action}</span>
+                      <span className="font-mono text-[11px] text-slate-500">{log.created_at.slice(0, 19).replace('T', ' ')}</span>
+                    </div>
+                    <div className="text-slate-600 dark:text-slate-300">
+                      By {log.actor_name} ({log.actor_role}) · OT {log.previous_ot_hours}h → {log.new_ot_hours}h ·{' '}
+                      {log.previous_status} → {log.new_status}
+                    </div>
+                    <div className="text-slate-500 italic">Reason: {log.reason}</div>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

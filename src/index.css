@@ -3,8 +3,8 @@
 
 @layer base {
   :root {
-    --font-display: 'Plus Jakarta Sans', 'Noto Sans Ethiopic', system-ui, -apple-system, sans-serif;
-    --font-sans: 'DM Sans', 'Noto Sans Ethiopic', system-ui, -apple-system, sans-serif;
+    --font-display: 'Plus Jakarta Sans', 'Noto Sans Ethiopic', 'Noto Sans Arabic', 'Noto Sans SC', 'Noto Sans TC', 'Noto Sans Devanagari', system-ui, -apple-system, sans-serif;
+    --font-sans: 'DM Sans', 'Noto Sans Ethiopic', 'Noto Sans Arabic', 'Noto Sans SC', 'Noto Sans TC', 'Noto Sans Devanagari', system-ui, -apple-system, sans-serif;
     --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
 
     --ss-primary: #087CEB;
@@ -20,6 +20,17 @@
     text-size-adjust: 100%;
     color-scheme: light;
     scroll-behavior: smooth;
+  }
+
+  html[dir="rtl"] body {
+    direction: rtl;
+    text-align: right;
+  }
+
+  html[dir="rtl"] .font-mono,
+  html[dir="rtl"] .tabular-nums {
+    direction: ltr;
+    unicode-bidi: isolate;
   }
 
   html.dark {

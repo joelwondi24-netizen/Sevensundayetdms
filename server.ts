@@ -9,6 +9,97 @@ import nodemailer from 'nodemailer';
 import Database from 'better-sqlite3';
 import { WebSocketServer, WebSocket } from 'ws';
 import { createServer as createViteServer } from 'vite';
+import { GoogleGenAI, Type } from '@google/genai';
+
+function getGeminiClient(): GoogleGenAI | null {
+  const apiKey = String(process.env.GEMINI_API_KEY || '').trim();
+  if (!apiKey) return null;
+  return new GoogleGenAI({
+    apiKey,
+    httpOptions: {
+      headers: {
+        'User-Agent': 'aistudio-build',
+      },
+    },
+  });
+}
+
+const ETH_TIMEZONE = 'Africa/Addis_Ababa';
+const eatFormatter = new Intl.DateTimeFormat('en-GB', {
+  timeZone: ETH_TIMEZONE,
+  hour12: false,
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+});
+
+function formatDateToEatParts(dateObj: Date): {
+  date: string;
+  hhmm: string;
+  timestamp: string;
+  isoEat: string;
+} {
+  const parts = eatFormatter.formatToParts(dateObj);
+  const map: Record<string, string> = {};
+  for (const p of parts) {
+    if (p.type !== 'literal') map[p.type] = p.value;
+  }
+  const yyyy = map.year || '2026';
+  const mm = map.month || '01';
+  const dd = map.day || '01';
+  const hh = map.hour === '24' ? '00' : map.hour || '00';
+  const mi = map.minute || '00';
+  const ss = map.second || '00';
+  return {
+    date: `${yyyy}-${mm}-${dd}`,
+    hhmm: `${hh}:${mi}`,
+    timestamp: `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss}`,
+    isoEat: `${yyyy}-${mm}-${dd}T${hh}:${mi}:${ss}+03:00`,
+  };
+}
+
+function getEatNowParts() {
+  return formatDateToEatParts(new Date());
+}
+
+function eatToday(): string {
+  return getEatNowParts().date;
+}
+
+function eatHHMM(): string {
+  return getEatNowParts().hhmm;
+}
+
+function parseTimestampToEat(input?: string | Date | null): {
+  date: string;
+  hhmm: string;
+  timestamp: string;
+  isoEat: string;
+} {
+  if (!input) return getEatNowParts();
+  if (input instanceof Date) return formatDateToEatParts(input);
+  const raw = String(input).trim();
+  if (!raw) return getEatNowParts();
+  // Naive local datetime from ZKTeco K40 hardware (already configured to Africa/Addis_Ababa local time)
+  const naiveMatch = raw.match(/^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?$/);
+  if (naiveMatch) {
+    const [, yyyy, mm, dd, hh, mi, ss = '00'] = naiveMatch;
+    return {
+      date: `${yyyy}-${mm}-${dd}`,
+      hhmm: `${hh}:${mi}`,
+      timestamp: `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss}`,
+      isoEat: `${yyyy}-${mm}-${dd}T${hh}:${mi}:${ss}+03:00`,
+    };
+  }
+  const parsed = new Date(raw);
+  if (!Number.isNaN(parsed.getTime())) {
+    return formatDateToEatParts(parsed);
+  }
+  return getEatNowParts();
+}
 
 const PORT = Number(process.env.PORT) || 3000;
 const IS_PROD = process.env.NODE_ENV === 'production';
@@ -954,16 +1045,36 @@ ensureColumn('payroll_records', 'ot_night_amount', 'REAL NOT NULL DEFAULT 0');
 ensureColumn('payroll_records', 'ot_sunday_amount', 'REAL NOT NULL DEFAULT 0');
 ensureColumn('payroll_records', 'ot_holiday_amount', 'REAL NOT NULL DEFAULT 0');
 
-// Real Device Connections extended columns
 ensureColumn('devices', 'protocol', "TEXT NOT NULL DEFAULT 'TCP/IP Socket'");
 ensureColumn('devices', 'endpoint_url', "TEXT NOT NULL DEFAULT ''");
 ensureColumn('devices', 'api_key', "TEXT NOT NULL DEFAULT ''");
 ensureColumn('devices', 'last_sync_at', 'TEXT');
 ensureColumn('devices', 'punch_count', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('devices', 'model', "TEXT NOT NULL DEFAULT 'ZKTeco K40'");
+ensureColumn('devices', 'comm_password_enc', "TEXT NOT NULL DEFAULT ''");
+ensureColumn('devices', 'sync_interval_sec', 'INTEGER NOT NULL DEFAULT 3');
+ensureColumn('devices', 'auto_sync_enabled', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('devices', 'read_only_mode', 'INTEGER NOT NULL DEFAULT 1');
+ensureColumn('devices', 'timezone', "TEXT NOT NULL DEFAULT 'Africa/Addis_Ababa'");
+ensureColumn('devices', 'total_imported_count', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('devices', 'failed_sync_count', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('devices', 'last_error', "TEXT NOT NULL DEFAULT ''");
+
 ensureColumn('staff_fingerprints', 'auth_source', "TEXT NOT NULL DEFAULT 'ZKTeco K40'");
 ensureColumn('staff_fingerprints', 'credential_id', "TEXT NOT NULL DEFAULT ''");
 
-// Extended Attendance Management columns (Morning/Afternoon/Night + Automatic Calculations + Audit)
+// Section 13 Shift editable time windows & approval rule columns
+ensureColumn('shifts', 'in_earliest', "TEXT NOT NULL DEFAULT ''");
+ensureColumn('shifts', 'in_latest', "TEXT NOT NULL DEFAULT ''");
+ensureColumn('shifts', 'out_earliest', "TEXT NOT NULL DEFAULT ''");
+ensureColumn('shifts', 'out_latest', "TEXT NOT NULL DEFAULT ''");
+ensureColumn('shifts', 'ot_start_time', "TEXT NOT NULL DEFAULT ''");
+ensureColumn('shifts', 'ot_end_time', "TEXT NOT NULL DEFAULT ''");
+ensureColumn('shifts', 'require_ot_approval', 'INTEGER NOT NULL DEFAULT 1');
+ensureColumn('shifts', 'assigned_department', "TEXT NOT NULL DEFAULT 'All'");
+ensureColumn('shifts', 'is_enabled', 'INTEGER NOT NULL DEFAULT 1');
+
+// Extended Attendance Management columns (Morning/Afternoon/Night + Automatic Calculations + K40 Metadata + OT Approval)
 ensureColumn('attendance_records', 'shift_id', 'INTEGER');
 ensureColumn('attendance_records', 'shift_period', "TEXT NOT NULL DEFAULT 'Day'");
 ensureColumn('attendance_records', 'morning_check_in', "TEXT NOT NULL DEFAULT ''");
@@ -978,8 +1089,114 @@ ensureColumn('attendance_records', 'late_minutes', 'INTEGER NOT NULL DEFAULT 0')
 ensureColumn('attendance_records', 'early_departure_minutes', 'INTEGER NOT NULL DEFAULT 0');
 ensureColumn('attendance_records', 'break_minutes', 'INTEGER NOT NULL DEFAULT 60');
 ensureColumn('attendance_records', 'absence_hours', 'REAL NOT NULL DEFAULT 0');
+ensureColumn('attendance_records', 'device_id', 'INTEGER');
+ensureColumn('attendance_records', 'device_tx_id', "TEXT NOT NULL DEFAULT ''");
+ensureColumn('attendance_records', 'machine_timestamp', "TEXT NOT NULL DEFAULT ''");
+ensureColumn('attendance_records', 'received_timestamp', "TEXT NOT NULL DEFAULT ''");
+ensureColumn('attendance_records', 'verification_method', "TEXT NOT NULL DEFAULT 'Manual'");
+ensureColumn('attendance_records', 'sync_status', "TEXT NOT NULL DEFAULT 'Synced'");
+ensureColumn('attendance_records', 'ot_approval_status', "TEXT NOT NULL DEFAULT 'Approved'");
+ensureColumn('attendance_records', 'ot_approved_by', "TEXT NOT NULL DEFAULT ''");
+ensureColumn('attendance_records', 'ot_approved_at', 'TEXT');
+ensureColumn('attendance_records', 'ot_adjustment_reason', "TEXT NOT NULL DEFAULT ''");
 ensureColumn('attendance_records', 'updated_by', "TEXT NOT NULL DEFAULT ''");
 ensureColumn('attendance_records', 'updated_at', "TEXT NOT NULL DEFAULT ''");
+ensureColumn('users', 'preferred_language', "TEXT NOT NULL DEFAULT 'en'");
+
+db.exec(`
+CREATE TABLE IF NOT EXISTS device_raw_punches (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id INTEGER NOT NULL DEFAULT 1,
+  device_id INTEGER NOT NULL,
+  device_serial TEXT NOT NULL DEFAULT '',
+  device_user_id TEXT NOT NULL,
+  device_user_name TEXT NOT NULL DEFAULT '',
+  machine_timestamp TEXT NOT NULL,
+  received_timestamp TEXT NOT NULL,
+  verify_mode TEXT NOT NULL DEFAULT 'Fingerprint',
+  punch_state INTEGER NOT NULL DEFAULT 0,
+  employee_code TEXT NOT NULL DEFAULT '',
+  attendance_record_id INTEGER,
+  sync_source TEXT NOT NULL DEFAULT 'TCP4370',
+  status TEXT NOT NULL DEFAULT 'Synced',
+  created_at TEXT NOT NULL,
+  UNIQUE(tenant_id, device_id, device_user_id, machine_timestamp)
+);
+
+CREATE TABLE IF NOT EXISTS device_sync_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id INTEGER NOT NULL DEFAULT 1,
+  device_id INTEGER,
+  device_name TEXT NOT NULL DEFAULT '',
+  device_ip TEXT NOT NULL DEFAULT '',
+  sync_mode TEXT NOT NULL DEFAULT 'TCP_READ_ONLY',
+  status TEXT NOT NULL DEFAULT 'Success',
+  fetched_count INTEGER NOT NULL DEFAULT 0,
+  imported_count INTEGER NOT NULL DEFAULT 0,
+  skipped_duplicates INTEGER NOT NULL DEFAULT 0,
+  unmatched_count INTEGER NOT NULL DEFAULT 0,
+  latency_ms INTEGER NOT NULL DEFAULT 0,
+  error_message TEXT NOT NULL DEFAULT '',
+  triggered_by TEXT NOT NULL DEFAULT 'Auto-Poller',
+  started_at TEXT NOT NULL,
+  completed_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS unmatched_device_users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id INTEGER NOT NULL DEFAULT 1,
+  device_id INTEGER,
+  device_name TEXT NOT NULL DEFAULT '',
+  device_serial TEXT NOT NULL DEFAULT '',
+  device_user_id TEXT NOT NULL,
+  device_user_name TEXT NOT NULL DEFAULT '',
+  first_seen_at TEXT NOT NULL,
+  last_seen_at TEXT NOT NULL,
+  sample_punch_at TEXT NOT NULL,
+  punch_count INTEGER NOT NULL DEFAULT 1,
+  mapped_employee_id TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'Pending',
+  resolved_by TEXT NOT NULL DEFAULT '',
+  resolved_at TEXT,
+  UNIQUE(tenant_id, device_id, device_user_id)
+);
+
+CREATE TABLE IF NOT EXISTS attendance_audit_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id INTEGER NOT NULL DEFAULT 1,
+  attendance_id INTEGER NOT NULL,
+  employee_code TEXT NOT NULL,
+  action TEXT NOT NULL,
+  actor_name TEXT NOT NULL,
+  actor_role TEXT NOT NULL,
+  previous_ot_hours REAL DEFAULT 0,
+  new_ot_hours REAL DEFAULT 0,
+  previous_status TEXT DEFAULT '',
+  new_status TEXT DEFAULT '',
+  reason TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS i18n_settings (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  default_language TEXT NOT NULL DEFAULT 'en',
+  enabled_languages_json TEXT NOT NULL DEFAULT '[]',
+  rtl_auto INTEGER NOT NULL DEFAULT 1,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS i18n_translations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  lang_code TEXT NOT NULL,
+  translation_key TEXT NOT NULL,
+  value_text TEXT NOT NULL,
+  is_approved INTEGER NOT NULL DEFAULT 1,
+  source TEXT NOT NULL DEFAULT 'manual',
+  updated_by TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL,
+  UNIQUE(lang_code, translation_key)
+);
+`);
 
 // Multi-Tenant isolation columns across all operational tables (default 1 = Primary HQ Tenant)
 const TENANT_SCOPED_TABLES = [
@@ -991,6 +1208,10 @@ const TENANT_SCOPED_TABLES = [
   'biometric_auth_logs',
   'staff_fingerprints',
   'zk_enroll_jobs',
+  'device_raw_punches',
+  'device_sync_logs',
+  'unmatched_device_users',
+  'attendance_audit_logs',
   'authorized_company_devices',
   'attendance_records',
   'shifts',
@@ -1981,6 +2202,31 @@ function seedIfEmpty() {
     });
     txEth();
   }
+
+  // Section 13 shift window definitions + i18n default settings
+  const ethShiftMigV2 = db.prepare("SELECT name FROM system_migrations WHERE name = 'ethiopian_shift_windows_v2'").get();
+  if (!ethShiftMigV2) {
+    const txEth2 = db.transaction(() => {
+      db.prepare(
+        "UPDATE shifts SET in_earliest='07:45', in_latest='08:00', out_earliest='11:58', out_latest='12:30', ot_start_time='12:30', ot_end_time='14:00', require_ot_approval=1, is_enabled=1, updated_at=? WHERE shift_code='SHF-MRN'"
+      ).run(now);
+      db.prepare(
+        "UPDATE shifts SET in_earliest='12:50', in_latest='13:00', out_earliest='16:58', out_latest='17:00', ot_start_time='17:00', ot_end_time='19:00', require_ot_approval=1, is_enabled=1, updated_at=? WHERE shift_code='SHF-AFT'"
+      ).run(now);
+      db.prepare(
+        "UPDATE shifts SET in_earliest='18:50', in_latest='19:00', out_earliest='01:58', out_latest='02:10', ot_start_time='02:10', ot_end_time='07:00', require_ot_approval=1, is_enabled=1, updated_at=? WHERE shift_code='SHF-NGT'"
+      ).run(now);
+      db.prepare(
+        "UPDATE shifts SET in_earliest='07:45', in_latest='08:00', out_earliest='16:58', out_latest='17:00', ot_start_time='17:00', ot_end_time='19:00', require_ot_approval=1, is_enabled=1, updated_at=? WHERE shift_code='SHF-DAY'"
+      ).run(now);
+      db.prepare(
+        `INSERT OR IGNORE INTO i18n_settings (id, default_language, enabled_languages_json, rtl_auto, updated_at)
+         VALUES (1, 'en', '[]', 1, ?)`
+      ).run(now);
+      db.prepare('INSERT INTO system_migrations (name, applied_at) VALUES (?, ?)').run('ethiopian_shift_windows_v2', now);
+    });
+    txEth2();
+  }
 }
 
 function seedWorkforceDefaultsForTenant(tenantId: number) {
@@ -1990,20 +2236,21 @@ function seedWorkforceDefaultsForTenant(tenantId: number) {
     const insShift = db.prepare(`
       INSERT INTO shifts (
         tenant_id, shift_code, shift_name, shift_category, scheduling_system, start_time, end_time,
+        in_earliest, in_latest, out_earliest, out_latest, ot_start_time, ot_end_time, require_ot_approval, is_enabled,
         break_minutes, working_days, rest_days, min_rest_hours, is_rotating, rotation_pattern,
         color_hex, ot_multiplier, grace_late_minutes, status, notes, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Active', ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Active', ?, ?, ?)
     `);
     const defaultShifts = [
-      ['SHF-DAY', 'Day Shift', 'Day Shift', 'Standard', '08:00', '17:00', 60, '["Mon","Tue","Wed","Thu","Fri"]', '["Sat","Sun"]', 11, 0, 'Fixed Standard', '#2563eb', 1.5, 0, 'Ethiopian Day Shift: Morning 1:45-2:00 In / 5:58-6:30 Out · Afternoon 6:50-7:00 In / 10:58-11:00 Out · OT 11:10-1:00 PM ET'],
-      ['SHF-MRN', 'Morning Shift', 'Morning Shift', '3-Shift', '08:00', '12:00', 0, '["Mon","Tue","Wed","Thu","Fri","Sat"]', '["Sun"]', 11, 1, 'Weekly 3-Shift Rotation', '#0ea5e9', 1.5, 0, 'Morning Shift: Signed In 1:45-2:00 (07:45-08:00) · Out 5:58-6:30 (11:58-12:30) Ethiopian Time'],
-      ['SHF-AFT', 'Afternoon Shift', 'Afternoon Shift', '3-Shift', '13:00', '17:00', 0, '["Mon","Tue","Wed","Thu","Fri","Sat"]', '["Sun"]', 11, 1, 'Weekly 3-Shift Rotation', '#f59e0b', 1.5, 0, 'Afternoon Shift: Signed In 6:50-7:00 (12:50-13:00) · Out 10:58-11:00 (16:58-17:00) · OT 11:10-1:00 PM (17:10-19:00) ET'],
-      ['SHF-NGT', 'Night Shift', 'Night Shift', '3-Shift', '19:00', '02:00', 0, '["Mon","Tue","Wed","Thu","Fri","Sat"]', '["Sun"]', 12, 1, 'Day-to-Night Rotation', '#6366f1', 1.75, 0, 'Night Shift: Signed In 12:50-1:00 PM (18:50-19:00) · Out 7:58-8:10 PM (01:58-02:10) · OT 8:10-1:00 AM (02:10-07:00) ET'],
-      ['SHF-WKD', 'Weekend Shift', 'Weekend Shift', '4-Shift', '08:00', '16:00', 45, '["Sat","Sun"]', '["Mon","Tue","Wed","Thu","Fri"]', 11, 0, 'Weekend Coverage', '#10b981', 2.0, 15, 'Saturday & Sunday coverage crew'],
-      ['SHF-HOL', 'Holiday Shift', 'Holiday Shift', '4-Shift', '08:00', '16:00', 45, '["Sun"]', '[]', 12, 0, 'Public Holiday Duty', '#ec4899', 2.5, 15, 'Official public holiday essential staff'],
-      ['SHF-SEC', 'Security Guard Shift', 'Security Guard Shift', 'Security 24/7', '18:00', '06:00', 45, '["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]', '[]', 12, 1, '4-Team 24/7 Security Rotation', '#0f172a', 1.75, 5, 'Gate control, patrol & perimeter duty'],
-      ['SHF-SPC', 'Special Duty Shift', 'Special Duty Shift', '4-Shift', '09:00', '17:00', 45, '["Mon","Tue","Wed","Thu","Fri"]', '["Sat","Sun"]', 11, 0, 'Task Assignment', '#8b5cf6', 1.5, 10, 'Audits, maintenance shutdown & special dispatch'],
-      ['SHF-OTM', 'Overtime Shift', 'Overtime Shift', 'Standard', '17:10', '19:00', 0, '["Mon","Tue","Wed","Thu","Fri","Sat"]', '["Sun"]', 11, 0, 'On-Demand Overtime', '#ea580c', 1.75, 0, 'Afternoon/Evening Overtime Window (11:10-1:00 PM Ethiopian Local Time)'],
+      ['SHF-DAY', 'Day Shift', 'Day Shift', 'Standard', '08:00', '17:00', '07:45', '08:00', '16:58', '17:00', '17:00', '19:00', 60, '["Mon","Tue","Wed","Thu","Fri"]', '["Sat","Sun"]', 11, 0, 'Fixed Standard', '#2563eb', 1.5, 0, 'Ethiopian Day Shift: Morning 1:45-2:00 In / 5:58-6:30 Out · Afternoon 6:50-7:00 In / 10:58-11:00 Out · OT 11:00-1:00 PM ET'],
+      ['SHF-MRN', 'Morning Shift', 'Morning Shift', '3-Shift', '08:00', '12:00', '07:45', '08:00', '11:58', '12:30', '12:30', '14:00', 0, '["Mon","Tue","Wed","Thu","Fri","Sat"]', '["Sun"]', 11, 1, 'Weekly 3-Shift Rotation', '#0ea5e9', 1.5, 0, 'Morning Shift: Signed In 1:45-2:00 (07:45-08:00) · Out 5:58-6:30 (11:58-12:30) · Morning OT after 6:30 (12:30+) ET'],
+      ['SHF-AFT', 'Afternoon Shift', 'Afternoon Shift', '3-Shift', '13:00', '17:00', '12:50', '13:00', '16:58', '17:00', '17:00', '19:00', 0, '["Mon","Tue","Wed","Thu","Fri","Sat"]', '["Sun"]', 11, 1, 'Weekly 3-Shift Rotation', '#f59e0b', 1.5, 0, 'Afternoon Shift: Signed In 6:50-7:00 (12:50-13:00) · Out 10:58-11:00 (16:58-17:00) · OT 11:00-1:00 PM (17:00-19:00) ET'],
+      ['SHF-NGT', 'Night Shift', 'Night Shift', '3-Shift', '19:00', '02:00', '18:50', '19:00', '01:58', '02:10', '02:10', '07:00', 0, '["Mon","Tue","Wed","Thu","Fri","Sat"]', '["Sun"]', 12, 1, 'Day-to-Night Rotation', '#6366f1', 1.75, 0, 'Night Shift: Signed In 12:50-1:00 PM (18:50-19:00) · Out 7:58-8:10 PM (01:58-02:10) · OT 8:10-1:00 AM (02:10-07:00) ET'],
+      ['SHF-WKD', 'Weekend Shift', 'Weekend Shift', '4-Shift', '08:00', '16:00', '07:45', '08:00', '15:58', '16:00', '16:00', '19:00', 45, '["Sat","Sun"]', '["Mon","Tue","Wed","Thu","Fri"]', 11, 0, 'Weekend Coverage', '#10b981', 2.0, 15, 'Saturday & Sunday coverage crew'],
+      ['SHF-HOL', 'Holiday Shift', 'Holiday Shift', '4-Shift', '08:00', '16:00', '07:45', '08:00', '15:58', '16:00', '16:00', '19:00', 45, '["Sun"]', '[]', 12, 0, 'Public Holiday Duty', '#ec4899', 2.5, 15, 'Official public holiday essential staff'],
+      ['SHF-SEC', 'Security Guard Shift', 'Security Guard Shift', 'Security 24/7', '18:00', '06:00', '17:45', '18:00', '05:55', '06:10', '06:10', '08:00', 45, '["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]', '[]', 12, 1, '4-Team 24/7 Security Rotation', '#0f172a', 1.75, 5, 'Gate control, patrol & perimeter duty'],
+      ['SHF-SPC', 'Special Duty Shift', 'Special Duty Shift', '4-Shift', '09:00', '17:00', '08:45', '09:00', '16:55', '17:05', '17:05', '19:00', 45, '["Mon","Tue","Wed","Thu","Fri"]', '["Sat","Sun"]', 11, 0, 'Task Assignment', '#8b5cf6', 1.5, 10, 'Audits, maintenance shutdown & special dispatch'],
+      ['SHF-OTM', 'Overtime Shift', 'Overtime Shift', 'Standard', '17:10', '19:00', '17:00', '17:10', '18:55', '19:00', '17:00', '19:00', 0, '["Mon","Tue","Wed","Thu","Fri","Sat"]', '["Sun"]', 11, 0, 'On-Demand Overtime', '#ea580c', 1.75, 0, 'Afternoon/Evening Overtime Window (11:10-1:00 PM Ethiopian Local Time)'],
     ] as const;
     for (const s of defaultShifts) {
       insShift.run(tenantId, ...s, now, now);
@@ -2356,6 +2603,7 @@ interface AuthenticatedUser {
   role: string;
   status: string;
   mfa_enabled?: number;
+  preferred_language?: string;
 }
 
 interface AuthedRequest extends express.Request {
@@ -2381,6 +2629,9 @@ const PUBLIC_API_EXEMPT = new Set([
   '/api/iclock/devicecmd',
   '/api/devices/zkteco/bridge/jobs',
   '/api/devices/zkteco/bridge/event',
+  '/api/devices/zkteco/connector/ingest',
+  '/api/devices/zkteco/connector/heartbeat',
+  '/api/i18n/config',
 ]);
 
 app.use('/api', (req: AuthedRequest, res, next) => {
@@ -2404,6 +2655,7 @@ app.use('/api', (req: AuthedRequest, res, next) => {
     ['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method) &&
     !fullPath.startsWith('/api/iclock/') &&
     !fullPath.startsWith('/api/devices/zkteco/bridge/') &&
+    !fullPath.startsWith('/api/devices/zkteco/connector/') &&
     req.headers.origin
   ) {
     try {
@@ -2427,13 +2679,19 @@ app.use('/api', (req: AuthedRequest, res, next) => {
       const row = db
         .prepare(
           `SELECT s.id as session_id, s.user_id, s.auth_method, s.expires_at, s.last_active_at,
-                  u.id, u.tenant_id, u.employee_code, u.full_name, u.email, u.department, u.job_title, u.role, u.status, u.mfa_enabled
+                  u.id, u.tenant_id, u.employee_code, u.full_name, u.email, u.department, u.job_title, u.role, u.status, u.mfa_enabled, u.preferred_language
            FROM auth_sessions s
            JOIN users u ON u.id = s.user_id
            WHERE s.token_hash = ?`
         )
         .get(tokenHash) as
-        | (AuthenticatedUser & { session_id: number; auth_method: string; expires_at: string; last_active_at?: string })
+        | (AuthenticatedUser & {
+            session_id: number;
+            auth_method: string;
+            expires_at: string;
+            last_active_at?: string;
+            preferred_language?: string;
+          })
         | undefined;
       if (
         row &&
@@ -2544,6 +2802,7 @@ app.use('/api', (req: AuthedRequest, res, next) => {
         fullPath.endsWith('/decision') ||
         fullPath.endsWith('/approve') ||
         fullPath.endsWith('/audit') ||
+        fullPath.endsWith('/overtime-approval') ||
         /^\/api\/(approvals|leaves|company-forms\/submissions|material-requests|purchasing|sales-orders|payroll|salary|gate-passes)\/\d+\/status$/.test(
           fullPath
         );
@@ -2581,6 +2840,8 @@ app.use('/api', (req: AuthedRequest, res, next) => {
   const bypassDeviceGate =
     fullPath.startsWith('/api/security/company-devices/') ||
     fullPath.startsWith('/api/auth/') ||
+    fullPath.startsWith('/api/i18n/') ||
+    fullPath.startsWith('/api/devices/zkteco/connector/') ||
     fullPath === '/api/health';
   if (!bypassDeviceGate) {
     const secRow = db
@@ -2689,6 +2950,16 @@ app.post('/api/auth/register', (req, res) => {
         : 'Super Administrator'
       : 'Employee';
 
+  const setupCompanyCode = String(b.company_code || '').trim();
+  if (userCount === 0 && setupCompanyCode && setupCompanyCode.length < 4) {
+    res.status(400).json({ error: 'Company Security Code must be at least 4 characters long.' });
+    return;
+  }
+
+  const reqDeviceUid = String(b.device_uid || req.headers['x-device-uid'] || '').trim().toUpperCase();
+  const reqDeviceName = String(b.device_name || 'Primary Admin Workstation').trim();
+  const reqDeviceOs = String(b.device_os || String(req.headers['user-agent'] || '').slice(0, 80)).trim();
+
   const now = new Date().toISOString();
   let codeNum = userCount + 1;
   let empCode = `SS-USR-${String(codeNum).padStart(3, '0')}`;
@@ -2704,10 +2975,23 @@ app.post('/api/auth/register', (req, res) => {
   const tx = db.transaction(() => {
     const info = db
       .prepare(
-        `INSERT INTO users (tenant_id, employee_code, full_name, email, password, department, job_title, role, status, last_login, password_changed_at, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Active', ?, ?, ?)`
+        `INSERT INTO users (tenant_id, employee_code, full_name, email, password, department, job_title, role, status, preferred_language, last_login, password_changed_at, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Active', ?, ?, ?, ?)`
       )
-      .run(effectiveTid, empCode, fullName, email, hashedPw, department, jobTitle, assignedRole, now, now, now);
+      .run(
+        effectiveTid,
+        empCode,
+        fullName,
+        email,
+        hashedPw,
+        department,
+        jobTitle,
+        assignedRole,
+        String(b.preferred_language || 'en').trim() || 'en',
+        now,
+        now,
+        now
+      );
     const newId = Number(info.lastInsertRowid);
 
     const empExists = db.prepare('SELECT id FROM employees WHERE lower(email) = lower(?) AND tenant_id = ?').get(email, effectiveTid);
@@ -2717,7 +3001,35 @@ app.post('/api/auth/register', (req, res) => {
           tenant_id, employee_id, full_name, email, department, job_title, employment_type,
           start_date, basic_salary, status, created_at
         ) VALUES (?, ?, ?, ?, ?, ?, 'Permanent', ?, 0, 'Active', ?)`
-      ).run(effectiveTid, empCode, fullName, email, department, jobTitle, now.slice(0, 10), now);
+      ).run(effectiveTid, empCode, fullName, email, department, jobTitle, eatToday(), now);
+    }
+
+    // First-time Admin setup: initialize Company Code + exempt/auto-verify first Admin workstation so all subsequent devices are gated
+    if (userCount === 0 && setupCompanyCode.length >= 4) {
+      const codeHash = sha256Hex(`SS-COMP-CODE:${setupCompanyCode}`);
+      const codeHint = `${setupCompanyCode.slice(0, 2)}${'*'.repeat(Math.max(2, setupCompanyCode.length - 3))}${setupCompanyCode.slice(-1)}`;
+      db.prepare(
+        `INSERT INTO company_device_security (tenant_id, company_code_hash, company_code_hint, policy_enabled, configured_by, configured_at, updated_at)
+         VALUES (1, ?, ?, 1, ?, ?, ?)
+         ON CONFLICT(tenant_id) DO UPDATE SET
+           company_code_hash = excluded.company_code_hash,
+           company_code_hint = excluded.company_code_hint,
+           policy_enabled = 1,
+           configured_by = excluded.configured_by,
+           configured_at = COALESCE(company_device_security.configured_at, excluded.configured_at),
+           updated_at = excluded.updated_at`
+      ).run(codeHash, codeHint, fullName, now, now);
+
+      if (reqDeviceUid) {
+        db.prepare(
+          `INSERT INTO authorized_company_devices (tenant_id, device_uid, device_name, device_os, assigned_branch, assigned_to_email, status, verified_at, registered_by, last_seen_at, created_at)
+           VALUES (1, ?, ?, ?, 'HQ', ?, 'Active', ?, ?, ?, ?)
+           ON CONFLICT(device_uid) DO UPDATE SET
+             status = 'Active',
+             verified_at = COALESCE(authorized_company_devices.verified_at, excluded.verified_at),
+             last_seen_at = excluded.last_seen_at`
+        ).run(reqDeviceUid, reqDeviceName, reqDeviceOs, email, now, fullName, now, now);
+      }
     }
 
     db.prepare(
@@ -2728,8 +3040,11 @@ app.post('/api/auth/register', (req, res) => {
   });
 
   const userId = tx();
+  if (userCount === 0 && setupCompanyCode.length >= 4) {
+    broadcastWs('company:device_security_updated', { policy_enabled: true, device_uid: reqDeviceUid });
+  }
   const created = db
-    .prepare('SELECT id, tenant_id, employee_code, full_name, email, department, job_title, role, status, mfa_enabled, last_login, created_at FROM users WHERE id = ?')
+    .prepare('SELECT id, tenant_id, employee_code, full_name, email, department, job_title, role, status, mfa_enabled, preferred_language, last_login, created_at FROM users WHERE id = ?')
     .get(userId) as Record<string, unknown>;
   const { token, encryptedSyncKey } = createSessionToken(userId, effectiveTid, 'register', req);
 
@@ -4693,7 +5008,7 @@ app.post('/api/payroll-runs/calculate', (req, res) => {
     const empCode = String(emp.employee_id);
     const attSum = db
       .prepare(
-        "SELECT COALESCE(SUM(ot_pay), 0) as ot FROM attendance_records WHERE tenant_id = ? AND employee_code = ? AND substr(attendance_date, 1, 7) = ?"
+        "SELECT COALESCE(SUM(ot_pay), 0) as ot FROM attendance_records WHERE tenant_id = ? AND employee_code = ? AND substr(attendance_date, 1, 7) = ? AND COALESCE(ot_approval_status, 'Approved') = 'Approved'"
       )
       .get(tid, empCode, month) as { ot: number };
     const bonus = Number((Number(fixed_bonus) + basic * (Number(bonus_percent) / 100)).toFixed(2));
@@ -4935,9 +5250,16 @@ async function probeDeviceRecord(dev: {
 function maskDeviceRow(row: unknown) {
   if (!row || typeof row !== 'object') return row;
   const r = row as Record<string, unknown>;
+  const { comm_password_enc, ...rest } = r;
   return {
-    ...r,
+    ...rest,
     api_key: r.api_key ? '********' : '',
+    comm_password: comm_password_enc ? '********' : '',
+    has_comm_password: Boolean(comm_password_enc),
+    read_only_mode: r.read_only_mode === undefined ? 1 : Number(r.read_only_mode),
+    sync_interval_sec: Number(r.sync_interval_sec || 3),
+    auto_sync_enabled: Number(r.auto_sync_enabled || 0),
+    timezone: String(r.timezone || 'Africa/Addis_Ababa'),
   };
 }
 
@@ -4957,14 +5279,20 @@ app.post('/api/devices', (req, res) => {
       ? `SS-DEV-${crypto.randomBytes(6).toString('hex').toUpperCase()}`
       : rawApiKey;
   const encryptedKey = encryptField(apiKey);
+  const rawCommPw = String(b.comm_password || '').trim();
+  const encryptedCommPw = rawCommPw && rawCommPw !== '********' ? encryptField(rawCommPw) : '';
+  const syncInterval = Math.min(60, Math.max(2, Number(b.sync_interval_sec) || 3));
+  const autoSyncEnabled = b.auto_sync_enabled ? 1 : 0;
+  const model = String(b.model || 'ZKTeco K40').trim() || 'ZKTeco K40';
   const info = db
     .prepare(
       `
     INSERT INTO devices (
-      tenant_id, device_type, protocol, device_name, ip_address, port, endpoint_url,
-      subnet_mask, gateway, serial_number, api_key, status, last_message
+      tenant_id, device_type, protocol, device_name, model, ip_address, port, endpoint_url,
+      subnet_mask, gateway, serial_number, api_key, comm_password_enc, sync_interval_sec, auto_sync_enabled,
+      read_only_mode, timezone, status, last_message
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Disconnected', 'Registered · Ready to probe')
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 'Disconnected', 'Registered (Read-Only Sync Mode) · Ready to probe')
   `
     )
     .run(
@@ -4972,13 +5300,18 @@ app.post('/api/devices', (req, res) => {
       b.device_type || 'Biometric Fingerprint Terminal',
       b.protocol || 'TCP/IP Socket',
       b.device_name,
+      model,
       b.ip_address,
       Number(b.port) || 4370,
       b.endpoint_url || '',
       b.subnet_mask || '255.255.255.0',
       b.gateway || '192.168.10.1',
       b.serial_number || '',
-      encryptedKey
+      encryptedKey,
+      encryptedCommPw,
+      syncInterval,
+      autoSyncEnabled,
+      String(b.timezone || 'Africa/Addis_Ababa')
     );
   const created = maskDeviceRow(db.prepare('SELECT * FROM devices WHERE id = ?').get(info.lastInsertRowid));
   logAudit(req, 'CREATE', 'Device Connections', `Registered ${b.device_name} (${b.protocol || 'TCP/IP Socket'} · ${b.ip_address}:${b.port})`, tid);
@@ -4989,25 +5322,38 @@ app.put('/api/devices/:id', (req, res) => {
   const tid = getTenantId(req);
   const id = Number(req.params.id);
   const b = req.body || {};
-  const existing = db.prepare('SELECT api_key FROM devices WHERE id = ? AND tenant_id = ?').get(id, tid) as
-    | { api_key?: string }
+  const existing = db.prepare('SELECT api_key, comm_password_enc FROM devices WHERE id = ? AND tenant_id = ?').get(id, tid) as
+    | { api_key?: string; comm_password_enc?: string }
     | undefined;
   const incomingKey = String(b.api_key || '').trim();
   const nextEncryptedKey =
     !incomingKey || incomingKey === '********'
       ? existing?.api_key || encryptField(`SS-DEV-${id}`)
       : encryptField(incomingKey);
+  const incomingComm = String(b.comm_password || '').trim();
+  const nextCommEnc =
+    incomingComm === '********'
+      ? existing?.comm_password_enc || ''
+      : incomingComm
+      ? encryptField(incomingComm)
+      : b.clear_comm_password
+      ? ''
+      : existing?.comm_password_enc || '';
+  const syncInterval = Math.min(60, Math.max(2, Number(b.sync_interval_sec) || 3));
+  const autoSyncEnabled = b.auto_sync_enabled ? 1 : 0;
   db.prepare(
     `
     UPDATE devices SET
-      device_type=?, protocol=?, device_name=?, ip_address=?, port=?, endpoint_url=?,
-      subnet_mask=?, gateway=?, serial_number=?, api_key=?
+      device_type=?, protocol=?, device_name=?, model=?, ip_address=?, port=?, endpoint_url=?,
+      subnet_mask=?, gateway=?, serial_number=?, api_key=?, comm_password_enc=?,
+      sync_interval_sec=?, auto_sync_enabled=?, read_only_mode=1, timezone=?
     WHERE id=? AND tenant_id=?
   `
   ).run(
     b.device_type,
     b.protocol || 'TCP/IP Socket',
     b.device_name,
+    String(b.model || 'ZKTeco K40'),
     b.ip_address,
     Number(b.port) || 4370,
     b.endpoint_url || '',
@@ -5015,6 +5361,10 @@ app.put('/api/devices/:id', (req, res) => {
     b.gateway || '192.168.10.1',
     b.serial_number || '',
     nextEncryptedKey,
+    nextCommEnc,
+    syncInterval,
+    autoSyncEnabled,
+    String(b.timezone || 'Africa/Addis_Ababa'),
     id,
     tid
   );
@@ -5494,20 +5844,45 @@ const ZK_CMD_CONNECT = 1000;
 const ZK_CMD_EXIT = 1001;
 const ZK_CMD_ENABLEDEVICE = 1002;
 const ZK_CMD_DISABLEDEVICE = 1003;
+const ZK_CMD_AUTH = 1102;
 const ZK_CMD_USER_WRQ = 8;
+const ZK_CMD_USER_RRQ = 9;
 const ZK_CMD_STARTENROLL = 61;
 const ZK_CMD_CANCELCAPTURE = 62;
 const ZK_CMD_GET_TIME = 201;
 const ZK_CMD_ATTLOG_RRQ = 13;
 const ZK_CMD_REG_EVENT = 500;
 const ZK_CMD_ACK_OK = 2000;
+const ZK_CMD_ACK_ERROR = 2001;
+const ZK_CMD_ACK_UNAUTH = 2005;
 const ZK_CMD_PREPARE_DATA = 1500;
 const ZK_CMD_DATA = 1501;
+const ZK_CMD_FREE_DATA = 1502;
 
 const ZK_EF_ATTLOG = 1;
 const ZK_EF_FINGER = 2;
 const ZK_EF_ENROLLUSER = 4;
 const ZK_EF_ENROLLFINGER = 8;
+
+function zkMakeCommKeyBuffer(keyNum: number, sessionId: number, ticks = 50): Buffer {
+  let k = 0;
+  for (let i = 0; i < 32; i++) {
+    if ((keyNum & (1 << i)) !== 0) {
+      k = ((k << 1) | 1) >>> 0;
+    } else {
+      k = (k << 1) >>> 0;
+    }
+  }
+  k = (k + sessionId) >>> 0;
+  const b = Buffer.alloc(4);
+  b.writeUInt32LE(k, 0);
+  // XOR with 'ZKSO'
+  const xored = Buffer.from([b[0] ^ 0x5a, b[1] ^ 0x4b, b[2] ^ 0x53, b[3] ^ 0x4f]);
+  // Swap 16-bit halves and apply ticks mask
+  const swapped = Buffer.from([xored[2], xored[3], xored[0], xored[1]]);
+  const t = ticks & 0xff;
+  return Buffer.from([swapped[0] ^ t, swapped[1] ^ t, t, swapped[3] ^ t]);
+}
 
 function createZkPacket(command: number, sessionId: number, replyId: number, data: Buffer = Buffer.alloc(0)): Buffer {
   const payload = Buffer.alloc(8 + data.length);
@@ -5561,7 +5936,7 @@ async function zkSendCommand(
   sessionId = 0,
   replyId = 0,
   data: Buffer = Buffer.alloc(0),
-  timeoutMs = 1800
+  timeoutMs = 2200
 ): Promise<{ command: number; sessionId: number; replyId: number; payload: Buffer }> {
   return new Promise((resolve, reject) => {
     const socket = new net.Socket();
@@ -5617,7 +5992,7 @@ async function zkSendSessionSequence(
     let recvBuf = Buffer.alloc(0);
     let sessionId = 0;
     let replyId = 0;
-    let stepIndex = -1; // -1 = initial CONNECT
+    let stepIndex = -1;
     const results: Array<{ command: number; payload: Buffer }> = [];
 
     const finish = (err: Error | null) => {
@@ -5662,7 +6037,7 @@ async function zkSendSessionSequence(
             try {
               socket.write(createZkPacket(ZK_CMD_EXIT, sessionId, replyId + 1, Buffer.alloc(0)));
             } catch {
-              // ignore close error
+              // ignore
             }
             finish(null);
             return;
@@ -5678,19 +6053,17 @@ async function zkSendSessionSequence(
 }
 
 function buildZkUser72Packet(zkUserPin: string, fullName: string): Buffer {
-  // Standard ZKTeco K40 / ZK72 user structure (uid 2, role 1, password 8, name 24, card 4, group 1, tz 2, userId 9/24)
   const numericUid = Number(zkUserPin.replace(/[^0-9]/g, '').slice(0, 4)) || 101;
   const buf = Buffer.alloc(72);
   buf.writeUInt16LE(Math.min(65534, Math.max(1, numericUid)), 0);
-  buf.writeUInt8(0, 2); // role: standard user
+  buf.writeUInt8(0, 2);
   Buffer.from(fullName.slice(0, 23), 'ascii').copy(buf, 11);
-  buf.writeUInt8(1, 39); // group 1
+  buf.writeUInt8(1, 39);
   Buffer.from(zkUserPin.slice(0, 23), 'ascii').copy(buf, 48);
   return buf;
 }
 
 function buildZkStartEnrollPacket(zkUserPin: string, fingerIndex: number): Buffer {
-  // ZKTeco CMD_STARTENROLL payload: 24-byte user PIN (or 4-byte uid) + 1-byte finger index + 1-byte flag
   const buf = Buffer.alloc(26);
   Buffer.from(zkUserPin.slice(0, 23), 'ascii').copy(buf, 0);
   buf.writeUInt8(Math.min(9, Math.max(0, fingerIndex)), 24);
@@ -5733,70 +6106,298 @@ async function zkSetUserAndStartEnroll(
   }
 }
 
+function parseZkAttlogPayload(raw: Buffer): Array<{ zk_user_pin: string; timestamp: string; punch_type: 'Check-In' | 'Check-Out'; punch_state: number; verify_mode: string }> {
+  const records: Array<{ zk_user_pin: string; timestamp: string; punch_type: 'Check-In' | 'Check-Out'; punch_state: number; verify_mode: string }> = [];
+  if (raw.length < 12) return records;
+  // Standard 40-byte attendance log layout on ZKTeco K40 (starts after optional 4-byte total size header when present)
+  const startOffset = raw.length % 40 === 4 ? 4 : 0;
+  if (raw.length - startOffset >= 40) {
+    for (let offset = startOffset; offset + 40 <= raw.length; offset += 40) {
+      const pinBuf = raw.subarray(offset + 2, offset + 26);
+      const nullIdx = pinBuf.indexOf(0);
+      const pin = (nullIdx >= 0 ? pinBuf.subarray(0, nullIdx) : pinBuf).toString('ascii').trim();
+      const verifiedByte = raw[offset + 26];
+      const timeVal = raw.readUInt32LE(offset + 27);
+      const punchState = raw.length > offset + 31 ? raw[offset + 31] : 0;
+      const verifyMode =
+        verifiedByte === 1 || verifiedByte === 4
+          ? 'Fingerprint'
+          : verifiedByte === 15
+          ? 'Face ID'
+          : verifiedByte === 3
+          ? 'Password'
+          : 'Fingerprint';
+      if (pin && timeVal > 0) {
+        records.push({
+          zk_user_pin: pin,
+          timestamp: decodeZkTime(timeVal),
+          punch_type: punchState === 1 || punchState === 5 ? 'Check-Out' : 'Check-In',
+          punch_state: punchState,
+          verify_mode: verifyMode,
+        });
+      }
+    }
+  }
+  return records;
+}
+
+function parseZkUsersPayload(raw: Buffer): Record<string, string> {
+  const map: Record<string, string> = {};
+  if (raw.length < 72) return map;
+  const startOffset = raw.length % 72 === 4 ? 4 : 0;
+  for (let offset = startOffset; offset + 72 <= raw.length; offset += 72) {
+    const nameBuf = raw.subarray(offset + 11, offset + 35);
+    const nameNull = nameBuf.indexOf(0);
+    const name = (nameNull >= 0 ? nameBuf.subarray(0, nameNull) : nameBuf).toString('utf8').trim();
+    const pinBuf = raw.subarray(offset + 48, offset + 72);
+    const pinNull = pinBuf.indexOf(0);
+    const pin = (pinNull >= 0 ? pinBuf.subarray(0, pinNull) : pinBuf).toString('ascii').trim();
+    if (pin && name) {
+      map[pin] = name;
+    }
+  }
+  return map;
+}
+
+// Strictly READ-ONLY TCP/IP ZKTeco K40 Client (supports CommKey authentication + multi-packet PREPARE_DATA/DATA chunk assembly).
+// NEVER sends clear/delete/write/overwrite/reset commands.
 async function zkPullAttendanceFromK40(
   ip: string,
-  port: number
+  port: number,
+  commPassword = '',
+  timeoutMs = 2800
 ): Promise<{
   connected: boolean;
   latencyMs: number;
   sessionId?: number;
-  records: Array<{ zk_user_pin: string; timestamp: string; punch_type: 'Check-In' | 'Check-Out' }>;
+  records: Array<{ zk_user_pin: string; device_user_name?: string; timestamp: string; punch_type: 'Check-In' | 'Check-Out'; punch_state: number; verify_mode: string }>;
   message: string;
 }> {
   const start = Date.now();
-  try {
-    const conn = await zkSendCommand(ip, port, ZK_CMD_CONNECT, 0, 0, Buffer.alloc(0), 1800);
-    const sid = conn.sessionId;
-    const records: Array<{ zk_user_pin: string; timestamp: string; punch_type: 'Check-In' | 'Check-Out' }> = [];
+  return new Promise((resolve) => {
+    const socket = new net.Socket();
+    let settled = false;
+    let recvBuf = Buffer.alloc(0);
+    let sessionId = 0;
+    let replyId = 0;
+    let phase: 'CONNECT' | 'AUTH' | 'READ_ATTLOG' | 'READ_ATTLOG_CHUNKS' | 'FREE_ATTLOG' | 'READ_USERS' | 'READ_USERS_CHUNKS' | 'FREE_USERS' | 'EXIT' = 'CONNECT';
+    let expectedTotalBytes = 0;
+    const attChunks: Buffer[] = [];
+    const userChunks: Buffer[] = [];
+    let attBuffer = Buffer.alloc(0);
+    let userBuffer = Buffer.alloc(0);
 
-    try {
-      const attRes = await zkSendCommand(ip, port, ZK_CMD_ATTLOG_RRQ, sid, 1, Buffer.alloc(0), 2500);
-      if (attRes.command === ZK_CMD_PREPARE_DATA || attRes.command === ZK_CMD_DATA || attRes.command === ZK_CMD_ACK_OK) {
-        const raw = attRes.payload;
-        // Standard 40-byte attendance record layout on ZKTeco K40 firmware
-        const recSize = raw.length >= 44 ? 40 : 8;
-        if (recSize === 40) {
-          for (let offset = 4; offset + 40 <= raw.length; offset += 40) {
-            const pinBuf = raw.subarray(offset + 2, offset + 26);
-            const nullIdx = pinBuf.indexOf(0);
-            const pin = (nullIdx >= 0 ? pinBuf.subarray(0, nullIdx) : pinBuf).toString('ascii').trim();
-            const state = raw[offset + 26];
-            const timeVal = raw.readUInt32LE(offset + 27);
-            if (pin) {
-              records.push({
-                zk_user_pin: pin,
-                timestamp: decodeZkTime(timeVal),
-                punch_type: state === 1 || state === 5 ? 'Check-Out' : 'Check-In',
-              });
+    const finish = (connected: boolean, message: string) => {
+      if (settled) return;
+      settled = true;
+      try {
+        socket.destroy();
+      } catch {
+        // ignore
+      }
+      if (!connected) {
+        resolve({ connected: false, latencyMs: Date.now() - start, records: [], message });
+        return;
+      }
+      const userMap = parseZkUsersPayload(userBuffer);
+      const parsed = parseZkAttlogPayload(attBuffer).map((r) => ({
+        ...r,
+        device_user_name: userMap[r.zk_user_pin] || '',
+      }));
+      resolve({
+        connected: true,
+        latencyMs: Date.now() - start,
+        sessionId,
+        records: parsed,
+        message: message || `ZKTeco K40 Read-Only sync OK (${Date.now() - start}ms · ${parsed.length} punch record(s))`,
+      });
+    };
+
+    socket.setTimeout(timeoutMs);
+    socket.on('timeout', () => {
+      if (phase === 'READ_USERS' || phase === 'READ_USERS_CHUNKS' || phase === 'FREE_USERS' || phase === 'EXIT') {
+        finish(true, `ZKTeco K40 Read-Only sync OK (${Date.now() - start}ms)`);
+      } else {
+        finish(false, `ZKTeco K40 TCP timeout at ${ip}:${port}`);
+      }
+    });
+    socket.on('error', (err) => finish(false, err.message || `Failed to connect to ${ip}:${port}`));
+
+    socket.connect(port, ip, () => {
+      socket.write(createZkPacket(ZK_CMD_CONNECT, 0, 0, Buffer.alloc(0)));
+    });
+
+    const sendNext = (cmd: number, data: Buffer = Buffer.alloc(0)) => {
+      replyId += 1;
+      socket.write(createZkPacket(cmd, sessionId, replyId, data));
+    };
+
+    socket.on('data', (chunk) => {
+      recvBuf = Buffer.concat([recvBuf, chunk]);
+      while (recvBuf.length >= 16 && recvBuf[0] === 0x50 && recvBuf[1] === 0x50 && recvBuf[2] === 0x82 && recvBuf[3] === 0x7d) {
+        const expectedLen = recvBuf.readUInt32LE(4);
+        if (recvBuf.length < 8 + expectedLen) break;
+        const body = recvBuf.subarray(8, 8 + expectedLen);
+        recvBuf = recvBuf.subarray(8 + expectedLen);
+        const cmd = body.readUInt16LE(0);
+        sessionId = body.readUInt16LE(4) || sessionId;
+        const payload = body.subarray(8);
+
+        if (phase === 'CONNECT') {
+          if (cmd === ZK_CMD_ACK_UNAUTH) {
+            const keyNum = Number(String(commPassword || '0').replace(/\D/g, '')) || 0;
+            phase = 'AUTH';
+            sendNext(ZK_CMD_AUTH, zkMakeCommKeyBuffer(keyNum, sessionId));
+          } else if (cmd === ZK_CMD_ACK_OK) {
+            phase = 'READ_ATTLOG';
+            sendNext(ZK_CMD_ATTLOG_RRQ);
+          } else {
+            finish(false, `ZKTeco K40 rejected connection (code ${cmd})`);
+            return;
+          }
+        } else if (phase === 'AUTH') {
+          if (cmd === ZK_CMD_ACK_OK) {
+            phase = 'READ_ATTLOG';
+            sendNext(ZK_CMD_ATTLOG_RRQ);
+          } else {
+            finish(false, 'ZKTeco K40 CommKey authentication failed. Verify the terminal Communication Password.');
+            return;
+          }
+        } else if (phase === 'READ_ATTLOG') {
+          if (cmd === ZK_CMD_PREPARE_DATA) {
+            expectedTotalBytes = payload.length >= 4 ? payload.readUInt32LE(0) : 0;
+            phase = 'READ_ATTLOG_CHUNKS';
+          } else if (cmd === ZK_CMD_DATA) {
+            attBuffer = payload;
+            phase = 'FREE_ATTLOG';
+            sendNext(ZK_CMD_FREE_DATA);
+          } else {
+            // Empty attendance log or small ACK_OK
+            phase = 'READ_USERS';
+            sendNext(ZK_CMD_USER_RRQ);
+          }
+        } else if (phase === 'READ_ATTLOG_CHUNKS') {
+          if (cmd === ZK_CMD_DATA) {
+            attChunks.push(payload);
+            const totalGot = attChunks.reduce((s, c) => s + c.length, 0);
+            if (expectedTotalBytes > 0 && totalGot >= expectedTotalBytes) {
+              attBuffer = Buffer.concat(attChunks);
+              phase = 'FREE_ATTLOG';
+              sendNext(ZK_CMD_FREE_DATA);
+            }
+          } else if (cmd === ZK_CMD_ACK_OK) {
+            attBuffer = Buffer.concat(attChunks);
+            phase = 'READ_USERS';
+            sendNext(ZK_CMD_USER_RRQ);
+          }
+        } else if (phase === 'FREE_ATTLOG') {
+          phase = 'READ_USERS';
+          sendNext(ZK_CMD_USER_RRQ);
+        } else if (phase === 'READ_USERS') {
+          if (cmd === ZK_CMD_PREPARE_DATA) {
+            expectedTotalBytes = payload.length >= 4 ? payload.readUInt32LE(0) : 0;
+            phase = 'READ_USERS_CHUNKS';
+          } else if (cmd === ZK_CMD_DATA) {
+            userBuffer = payload;
+            phase = 'FREE_USERS';
+            sendNext(ZK_CMD_FREE_DATA);
+          } else {
+            phase = 'EXIT';
+            sendNext(ZK_CMD_EXIT);
+            finish(true, `ZKTeco K40 Read-Only sync OK (${Date.now() - start}ms)`);
+            return;
+          }
+        } else if (phase === 'READ_USERS_CHUNKS') {
+          if (cmd === ZK_CMD_DATA) {
+            userChunks.push(payload);
+            const totalGot = userChunks.reduce((s, c) => s + c.length, 0);
+            if (expectedTotalBytes > 0 && totalGot >= expectedTotalBytes) {
+              userBuffer = Buffer.concat(userChunks);
+              phase = 'FREE_USERS';
+              sendNext(ZK_CMD_FREE_DATA);
+            }
+          } else if (cmd === ZK_CMD_ACK_OK) {
+            userBuffer = Buffer.concat(userChunks);
+            phase = 'EXIT';
+            sendNext(ZK_CMD_EXIT);
+            finish(true, `ZKTeco K40 Read-Only sync OK (${Date.now() - start}ms)`);
+            return;
+          }
+        } else if (phase === 'FREE_USERS') {
+          phase = 'EXIT';
+          sendNext(ZK_CMD_EXIT);
+          finish(true, `ZKTeco K40 Read-Only sync OK (${Date.now() - start}ms)`);
+          return;
+        }
+      }
+    });
+  });
+}
+
+async function zkTestConnectionReadOnly(
+  ip: string,
+  port: number,
+  commPassword = ''
+): Promise<{ ok: boolean; latencyMs: number; message: string }> {
+  const start = Date.now();
+  return new Promise((resolve) => {
+    const socket = new net.Socket();
+    let settled = false;
+    let recvBuf = Buffer.alloc(0);
+    let phase: 'CONNECT' | 'AUTH' = 'CONNECT';
+    let sessionId = 0;
+
+    const done = (ok: boolean, message: string) => {
+      if (settled) return;
+      settled = true;
+      try {
+        socket.destroy();
+      } catch {
+        // ignore
+      }
+      resolve({ ok, latencyMs: Date.now() - start, message });
+    };
+
+    socket.setTimeout(2200);
+    socket.on('timeout', () => done(false, `ZKTeco K40 TCP timeout at ${ip}:${port}`));
+    socket.on('error', (err) => done(false, err.message || `TCP connection failed to ${ip}:${port}`));
+
+    socket.connect(port, ip, () => {
+      socket.write(createZkPacket(ZK_CMD_CONNECT, 0, 0, Buffer.alloc(0)));
+    });
+
+    socket.on('data', (chunk) => {
+      recvBuf = Buffer.concat([recvBuf, chunk]);
+      if (recvBuf.length >= 16 && recvBuf[0] === 0x50 && recvBuf[1] === 0x50 && recvBuf[2] === 0x82 && recvBuf[3] === 0x7d) {
+        const expectedLen = recvBuf.readUInt32LE(4);
+        if (recvBuf.length >= 8 + expectedLen) {
+          const body = recvBuf.subarray(8, 8 + expectedLen);
+          recvBuf = recvBuf.subarray(8 + expectedLen);
+          const cmd = body.readUInt16LE(0);
+          sessionId = body.readUInt16LE(4) || sessionId;
+          if (phase === 'CONNECT') {
+            if (cmd === ZK_CMD_ACK_UNAUTH) {
+              const keyNum = Number(String(commPassword || '0').replace(/\D/g, '')) || 0;
+              phase = 'AUTH';
+              socket.write(createZkPacket(ZK_CMD_AUTH, sessionId, 1, zkMakeCommKeyBuffer(keyNum, sessionId)));
+            } else if (cmd === ZK_CMD_ACK_OK) {
+              try { socket.write(createZkPacket(ZK_CMD_EXIT, sessionId, 1, Buffer.alloc(0))); } catch {}
+              done(true, `ZKTeco K40 Read-Only Handshake OK (${Date.now() - start}ms)`);
+            } else {
+              done(false, `ZKTeco K40 rejected handshake (code ${cmd})`);
+            }
+          } else {
+            if (cmd === ZK_CMD_ACK_OK) {
+              try { socket.write(createZkPacket(ZK_CMD_EXIT, sessionId, 2, Buffer.alloc(0))); } catch {}
+              done(true, `ZKTeco K40 CommKey Auth & Handshake OK (${Date.now() - start}ms)`);
+            } else {
+              done(false, 'ZKTeco K40 CommKey authentication failed. Check Communication Password.');
             }
           }
         }
       }
-    } catch {
-      // ignore empty log buffer
-    }
-
-    try {
-      await zkSendCommand(ip, port, ZK_CMD_EXIT, sid, 2, Buffer.alloc(0), 800);
-    } catch {
-      // ignore disconnect close
-    }
-
-    return {
-      connected: true,
-      latencyMs: Date.now() - start,
-      sessionId: sid,
-      records,
-      message: `ZKTeco K40 TCP handshake OK (${Date.now() - start}ms · ${records.length} attendance log(s))`,
-    };
-  } catch (err) {
-    return {
-      connected: false,
-      latencyMs: Date.now() - start,
-      records: [],
-      message: err instanceof Error ? err.message : 'ZKTeco K40 TCP port 4370 unreachable',
-    };
-  }
+    });
+  });
 }
 
 function recordRealtimeZktecoPunch(opts: {
@@ -5814,9 +6415,10 @@ function recordRealtimeZktecoPunch(opts: {
   notes?: string;
 }) {
   const now = new Date().toISOString();
-  const verifiedAt = opts.verifiedAt || now;
-  const attDate = verifiedAt.slice(0, 10) || now.slice(0, 10);
-  const punchTime = verifiedAt.slice(11, 16) || now.slice(11, 16);
+  const verifiedAtRaw = opts.verifiedAt || now;
+  const eat = parseTimestampToEat(verifiedAtRaw);
+  const attDate = eat.date;
+  const punchTime = eat.hhmm;
 
   let fp:
     | { id: number; employee_id: string; employee_name: string; department: string; zk_user_pin: string; finger_label: string }
@@ -5859,11 +6461,17 @@ function recordRealtimeZktecoPunch(opts: {
     punchTime,
     punchType: effectivePunchType,
     deviceName: opts.deviceName,
+    deviceId: opts.deviceId,
+    machineTimestamp: eat.timestamp,
+    receivedTimestamp: getEatNowParts().timestamp,
+    verificationMethod: opts.authMethod || 'Fingerprint',
+    syncStatus: 'Synced',
     hourlyRateOverride: emp?.basic_salary ? Number((emp.basic_salary / 208).toFixed(2)) : undefined,
-    notes: opts.notes || `${opts.authSource} ${effectivePunchType} at ${punchTime}`,
+    notes: opts.notes || `${opts.authSource} ${effectivePunchType} at ${punchTime} EAT`,
     actor: opts.actor,
   });
 
+  const verifiedAt = eat.isoEat;
   if (fp?.id) {
     db.prepare('UPDATE staff_fingerprints SET last_scanned_at = ? WHERE id = ?').run(verifiedAt, fp.id);
   }
@@ -6565,18 +7173,19 @@ app.post('/api/devices/:id/zkteco/realtime/stop', (req, res) => {
   res.json({ ok: true, running: false });
 });
 
-// Downloadable Zero-Dependency Node.js Factory LAN Bridge for connecting physical ZKTeco K40 (192.168.x.x:4370) to Cloud Server
+// Downloadable Zero-Dependency Node.js Factory LAN Read-Only Connector for ZKTeco K40 (192.168.x.x:4370)
+// Guarantees STRICT READ-ONLY attendance synchronization (never writes, clears, deletes, or modifies K40 templates/logs)
 app.get('/api/devices/zkteco/bridge-script', (req, res) => {
   const tid = getTenantId(req);
   const deviceId = req.query.device_id ? Number(req.query.device_id) : null;
   const dev = deviceId
     ? (db.prepare('SELECT * FROM devices WHERE id = ? AND tenant_id = ?').get(deviceId, tid) as
-        | { id: number; serial_number: string; ip_address: string; port: number; api_key: string; device_name: string }
+        | { id: number; serial_number: string; ip_address: string; port: number; api_key: string; comm_password_enc?: string; sync_interval_sec?: number; device_name: string }
         | undefined)
     : (db
         .prepare("SELECT * FROM devices WHERE tenant_id = ? AND (device_type LIKE '%Biometric%' OR protocol LIKE '%ZKTeco%' OR port = 4370) ORDER BY id DESC LIMIT 1")
         .get(tid) as
-        | { id: number; serial_number: string; ip_address: string; port: number; api_key: string; device_name: string }
+        | { id: number; serial_number: string; ip_address: string; port: number; api_key: string; comm_password_enc?: string; sync_interval_sec?: number; device_name: string }
         | undefined);
 
   const proto = String(req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0].trim();
@@ -6586,19 +7195,39 @@ app.get('/api/devices/zkteco/bridge-script', (req, res) => {
   const k40Ip = dev?.ip_address || '192.168.1.201';
   const k40Port = Number(dev?.port) || 4370;
   const rawKey = dev?.api_key ? decryptField(dev.api_key) : 'REPLACE_WITH_DEVICE_API_KEY';
+  const commPass = dev?.comm_password_enc ? decryptField(dev.comm_password_enc) : '';
+  const pollMs = Math.max(2000, Math.min(60000, (Number(dev?.sync_interval_sec) || 3) * 1000));
 
   const script = `#!/usr/bin/env node
-// Seven Sunday Ethiopia — Real-Time ZKTeco K40 LAN Bridge
-// Run on any factory PC on the same LAN as your ZKTeco K40 terminal: node zkteco-k40-bridge.mjs
+// Seven Sunday Ethiopia — Read-Only ZKTeco K40 LAN Connector Service
+// SAFETY GUARANTEE: Strictly READ-ONLY on K40 TCP 4370 (CMD_CONNECT, CMD_AUTH, CMD_ATTLOG_RRQ, CMD_USER_RRQ, CMD_FREE_DATA, CMD_EXIT).
+// NEVER deletes, clears, overwrites, uploads templates, enrolls, or alters settings on your K40 terminal.
+// Run on any PC on the factory LAN: node zkteco-k40-readonly-connector.mjs
 import net from 'node:net';
+import fs from 'node:fs';
+import path from 'node:path';
 
 const SERVER_URL = process.env.SERVER_URL || ${JSON.stringify(serverUrl)};
 const DEVICE_SERIAL = process.env.DEVICE_SERIAL || ${JSON.stringify(serial)};
 const DEVICE_KEY = process.env.DEVICE_KEY || ${JSON.stringify(rawKey)};
 const K40_IP = process.env.K40_IP || ${JSON.stringify(k40Ip)};
 const K40_PORT = Number(process.env.K40_PORT || ${k40Port});
+const K40_COMM_KEY = process.env.K40_COMM_KEY || ${JSON.stringify(commPass)};
+const POLL_MS = Number(process.env.POLL_MS || ${pollMs});
+const QUEUE_FILE = path.resolve(process.cwd(), '.k40-offline-queue-' + DEVICE_SERIAL.replace(/[^a-zA-Z0-9_-]/g, '_') + '.json');
 
-const CMD_CONNECT = 1000, CMD_EXIT = 1001, CMD_USER_WRQ = 8, CMD_STARTENROLL = 61, CMD_CANCELCAPTURE = 62, CMD_REG_EVENT = 500, CMD_GET_TIME = 201, CMD_ACK_OK = 2000;
+const CMD_CONNECT = 1000, CMD_EXIT = 1001, CMD_AUTH = 1102, CMD_ATTLOG_RRQ = 13, CMD_USER_RRQ = 9, CMD_PREPARE_DATA = 1500, CMD_DATA = 1501, CMD_FREE_DATA = 1502, CMD_ACK_OK = 2000, CMD_ACK_UNAUTH = 2005;
+
+function makeCommKey(keyNum, sid, ticks = 50) {
+  let k = 0;
+  for (let i = 0; i < 32; i++) k = (keyNum & (1 << i)) !== 0 ? ((k << 1) | 1) >>> 0 : (k << 1) >>> 0;
+  k = (k + sid) >>> 0;
+  const b = Buffer.alloc(4); b.writeUInt32LE(k, 0);
+  const x = [b[0] ^ 0x5a, b[1] ^ 0x4b, b[2] ^ 0x53, b[3] ^ 0x4f];
+  const s = [x[2], x[3], x[0], x[1]];
+  const t = ticks & 0xff;
+  return Buffer.from([s[0] ^ t, s[1] ^ t, t, s[3] ^ t]);
+}
 
 function packet(cmd, sid, rid, data = Buffer.alloc(0)) {
   const p = Buffer.alloc(8 + data.length);
@@ -6612,86 +7241,128 @@ function packet(cmd, sid, rid, data = Buffer.alloc(0)) {
   return Buffer.concat([h, p]);
 }
 
-async function postBridge(path, body) {
-  const r = await fetch(SERVER_URL + path, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'x-device-key': DEVICE_KEY },
-    body: JSON.stringify({ serial_number: DEVICE_SERIAL, ...body }),
-  });
-  return r.json().catch(() => ({}));
+function decodeZkTime(timeVal) {
+  const sec = timeVal % 60; let r = Math.floor(timeVal / 60);
+  const min = r % 60; r = Math.floor(r / 60);
+  const hour = r % 24; r = Math.floor(r / 24);
+  const day = (r % 31) + 1; r = Math.floor(r / 31);
+  const month = (r % 12) + 1; const year = Math.floor(r / 12) + 2000;
+  const pad = (n) => String(n).padStart(2, '0');
+  return year + '-' + pad(month) + '-' + pad(day) + 'T' + pad(hour) + ':' + pad(min) + ':' + pad(sec);
 }
 
-let sid = 0, rid = 0;
-const sock = new net.Socket();
-let buf = Buffer.alloc(0);
-
-sock.connect(K40_PORT, K40_IP, () => {
-  console.log('[K40-BRIDGE] Connected to ZKTeco K40 at', K40_IP + ':' + K40_PORT);
-  sock.write(packet(CMD_CONNECT, 0, 0));
-});
-
-sock.on('data', async (chunk) => {
-  buf = Buffer.concat([buf, chunk]);
-  while (buf.length >= 16 && buf[0] === 0x50 && buf[1] === 0x50 && buf[2] === 0x82 && buf[3] === 0x7d) {
-    const len = buf.readUInt32LE(4);
-    if (buf.length < 8 + len) break;
-    const body = buf.subarray(8, 8 + len); buf = buf.subarray(8 + len);
-    const cmd = body.readUInt16LE(0);
-    if (sid === 0) {
-      sid = body.readUInt16LE(4); rid = 1;
-      const mask = Buffer.alloc(4); mask.writeUInt32LE(1 | 2 | 4 | 8, 0);
-      sock.write(packet(CMD_REG_EVENT, sid, rid, mask));
-      console.log('[K40-BRIDGE] Real-time event stream registered.');
-    } else if (cmd === CMD_REG_EVENT) {
-      sock.write(packet(CMD_ACK_OK, sid, 0));
-      const flags = body.readUInt16LE(4);
-      const payload = body.subarray(8);
-      if ((flags & 1) && payload.length >= 24) {
-        const pinBuf = payload.subarray(0, 24);
-        const nullIdx = pinBuf.indexOf(0);
-        const pin = (nullIdx >= 0 ? pinBuf.subarray(0, nullIdx) : pinBuf).toString('ascii').trim();
-        if (pin) {
-          console.log('[K40-BRIDGE] Real finger scan -> PIN:', pin);
-          await postBridge('/api/devices/zkteco/bridge/event', { event: 'attlog', zk_user_pin: pin });
+function pullReadOnlyLogs() {
+  return new Promise((resolve, reject) => {
+    const sock = new net.Socket();
+    let buf = Buffer.alloc(0), sid = 0, rid = 0, phase = 'CONNECT', expLen = 0;
+    const chunks = [];
+    let attRaw = Buffer.alloc(0);
+    const done = (err) => { try { sock.destroy(); } catch {} err ? reject(err) : resolve(attRaw); };
+    sock.setTimeout(3500);
+    sock.on('timeout', () => done(new Error('K40 TCP timeout')));
+    sock.on('error', done);
+    sock.connect(K40_PORT, K40_IP, () => sock.write(packet(CMD_CONNECT, 0, 0)));
+    const next = (c, d = Buffer.alloc(0)) => sock.write(packet(c, sid, ++rid, d));
+    sock.on('data', (chunk) => {
+      buf = Buffer.concat([buf, chunk]);
+      while (buf.length >= 16 && buf[0] === 0x50 && buf[1] === 0x50 && buf[2] === 0x82 && buf[3] === 0x7d) {
+        const len = buf.readUInt32LE(4);
+        if (buf.length < 8 + len) break;
+        const body = buf.subarray(8, 8 + len); buf = buf.subarray(8 + len);
+        const cmd = body.readUInt16LE(0); sid = body.readUInt16LE(4) || sid;
+        const payload = body.subarray(8);
+        if (phase === 'CONNECT') {
+          if (cmd === CMD_ACK_UNAUTH) { phase = 'AUTH'; next(CMD_AUTH, makeCommKey(Number(String(K40_COMM_KEY || '0').replace(/\\D/g, '')) || 0, sid)); }
+          else if (cmd === CMD_ACK_OK) { phase = 'ATTLOG'; next(CMD_ATTLOG_RRQ); }
+          else return done(new Error('Connect failed: ' + cmd));
+        } else if (phase === 'AUTH') {
+          if (cmd === CMD_ACK_OK) { phase = 'ATTLOG'; next(CMD_ATTLOG_RRQ); }
+          else return done(new Error('CommKey authentication failed'));
+        } else if (phase === 'ATTLOG') {
+          if (cmd === CMD_PREPARE_DATA) { expLen = payload.readUInt32LE(0); phase = 'CHUNKS'; }
+          else if (cmd === CMD_DATA) { attRaw = payload; phase = 'FREE'; next(CMD_FREE_DATA); }
+          else { next(CMD_EXIT); return done(null); }
+        } else if (phase === 'CHUNKS') {
+          if (cmd === CMD_DATA) {
+            chunks.push(payload);
+            if (expLen > 0 && chunks.reduce((a, b) => a + b.length, 0) >= expLen) { attRaw = Buffer.concat(chunks); phase = 'FREE'; next(CMD_FREE_DATA); }
+          } else { attRaw = Buffer.concat(chunks); next(CMD_EXIT); return done(null); }
+        } else if (phase === 'FREE') {
+          next(CMD_EXIT); return done(null);
         }
       }
-      if ((flags & 8)) {
-        await postBridge('/api/devices/zkteco/bridge/event', { event: 'enroll_complete' });
-      }
-    }
-  }
-});
-
-setInterval(async () => {
-  try {
-    if (sid) { rid += 1; sock.write(packet(CMD_GET_TIME, sid, rid)); }
-    const res = await fetch(SERVER_URL + '/api/devices/zkteco/bridge/jobs?serial=' + encodeURIComponent(DEVICE_SERIAL), {
-      headers: { 'x-device-key': DEVICE_KEY },
     });
-    const jobs = await res.json();
-    if (Array.isArray(jobs) && jobs.length > 0 && sid) {
-      for (const j of jobs) {
-        console.log('[K40-BRIDGE] Prompting K40 real finger enroll for PIN:', j.zk_user_pin, 'Finger:', j.finger_index);
-        const u = Buffer.alloc(72);
-        u.writeUInt16LE(Number(String(j.zk_user_pin).replace(/\\D/g, '')) || 101, 0);
-        Buffer.from(String(j.employee_name || j.employee_id).slice(0, 23), 'ascii').copy(u, 11);
-        u.writeUInt8(1, 39);
-        Buffer.from(String(j.zk_user_pin).slice(0, 23), 'ascii').copy(u, 48);
-        const e = Buffer.alloc(26);
-        Buffer.from(String(j.zk_user_pin).slice(0, 23), 'ascii').copy(e, 0);
-        e.writeUInt8(Number(j.finger_index) || 6, 24); e.writeUInt8(1, 25);
-        sock.write(packet(CMD_CANCELCAPTURE, sid, ++rid));
-        sock.write(packet(CMD_USER_WRQ, sid, ++rid, u));
-        sock.write(packet(CMD_STARTENROLL, sid, ++rid, e));
-        await postBridge('/api/devices/zkteco/bridge/event', { event: 'enroll_dispatched', job_id: j.id });
+  });
+}
+
+function parseAttlog(raw) {
+  const out = [];
+  const start = raw.length % 40 === 4 ? 4 : 0;
+  for (let o = start; o + 40 <= raw.length; o += 40) {
+    const p = raw.subarray(o + 2, o + 26); const z = p.indexOf(0);
+    const pin = (z >= 0 ? p.subarray(0, z) : p).toString('ascii').trim();
+    const state = raw.length > o + 31 ? raw[o + 31] : 0;
+    const tv = raw.readUInt32LE(o + 27);
+    if (pin && tv > 0) out.push({ device_user_id: pin, machine_timestamp: decodeZkTime(tv), punch_state: state, verify_mode: 'Fingerprint' });
+  }
+  return out;
+}
+
+const seenKeys = new Set();
+function loadQueue() { try { return JSON.parse(fs.readFileSync(QUEUE_FILE, 'utf8')); } catch { return []; } }
+function saveQueue(q) { try { fs.writeFileSync(QUEUE_FILE, JSON.stringify(q.slice(-5000))); } catch {} }
+
+let syncing = false;
+async function pollCycle() {
+  if (syncing) return;
+  syncing = true;
+  let queue = loadQueue();
+  try {
+    const raw = await pullReadOnlyLogs();
+    const logs = parseAttlog(raw);
+    let added = 0;
+    for (const r of logs) {
+      const k = r.device_user_id + '|' + r.machine_timestamp;
+      if (!seenKeys.has(k)) {
+        seenKeys.add(k);
+        queue.push(r);
+        added++;
       }
     }
-  } catch (err) { console.error('[K40-BRIDGE] Poll error:', err.message); }
-}, 3000);
+    if (added > 0) saveQueue(queue);
+    if (queue.length > 0) {
+      const res = await fetch(SERVER_URL + '/api/devices/zkteco/connector/ingest', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-device-key': DEVICE_KEY },
+        body: JSON.stringify({ serial_number: DEVICE_SERIAL, punches: queue }),
+      });
+      if (res.ok) {
+        const body = await res.json();
+        console.log('[K40-CONNECTOR] Synced', body.imported, 'new,', body.skipped_duplicates, 'dup,', body.unmatched, 'unmatched');
+        queue = [];
+        saveQueue(queue);
+      }
+    } else {
+      await fetch(SERVER_URL + '/api/devices/zkteco/connector/heartbeat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-device-key': DEVICE_KEY },
+        body: JSON.stringify({ serial_number: DEVICE_SERIAL, status: 'Connected' }),
+      }).catch(() => {});
+    }
+  } catch (err) {
+    console.error('[K40-CONNECTOR] Cycle error:', err.message);
+  } finally {
+    syncing = false;
+  }
+}
+
+console.log('[K40-CONNECTOR] Read-Only Service started for', K40_IP + ':' + K40_PORT, '->' , SERVER_URL, 'every', POLL_MS + 'ms');
+pollCycle();
+setInterval(pollCycle, POLL_MS);
 `;
 
   res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
-  res.setHeader('Content-Disposition', 'attachment; filename="zkteco-k40-bridge.mjs"');
+  res.setHeader('Content-Disposition', 'attachment; filename="zkteco-k40-readonly-connector.mjs"');
   res.send(script);
 });
 
@@ -6984,87 +7655,609 @@ app.post('/api/devices/zkteco/scan', (req, res) => {
   res.status(201).json({ log: logRow, attendance, device: updatedDevice, punch_time: punchTime, punch_type: effectivePunchType });
 });
 
-app.post('/api/devices/:id/zkteco/pull-attendance', async (req, res) => {
-  const tid = getTenantId(req);
-  const id = Number(req.params.id);
-  const dev = db.prepare('SELECT * FROM devices WHERE id = ? AND tenant_id = ?').get(id, tid) as
-    | { id: number; tenant_id: number; device_name: string; ip_address: string; port: number; serial_number: string }
+interface RawK40PunchInput {
+  device_user_id: string;
+  device_user_name?: string;
+  machine_timestamp: string;
+  punch_type?: 'Auto' | 'Check-In' | 'Check-Out';
+  punch_state?: number;
+  verify_mode?: string;
+}
+
+function matchEmployeeByDevicePin(tid: number, rawPin: string) {
+  const cleanPin = String(rawPin || '').trim();
+  if (!cleanPin) return null;
+  const fp = db
+    .prepare(
+      "SELECT employee_id, employee_name, department, finger_label FROM staff_fingerprints WHERE tenant_id = ? AND (zk_user_pin = ? OR employee_id = ?) AND status = 'Active' ORDER BY id DESC LIMIT 1"
+    )
+    .get(tid, cleanPin, cleanPin) as
+    | { employee_id: string; employee_name: string; department: string; finger_label: string }
     | undefined;
-  if (!dev) {
-    res.status(404).json({ error: 'ZKTeco K40 device not found in active tenant.' });
-    return;
-  }
+  const candidateCode = fp?.employee_id || cleanPin;
+  const stripped = cleanPin.replace(/^0+/, '') || cleanPin;
+  const emp = db
+    .prepare(
+      "SELECT employee_id, full_name, department, basic_salary, status FROM employees WHERE tenant_id = ? AND (employee_id = ? OR employee_id = ? OR replace(employee_id, 'SS-EMP-', '') = ? OR ltrim(replace(employee_id, 'SS-EMP-', ''), '0') = ?) LIMIT 1"
+    )
+    .get(tid, candidateCode, cleanPin, cleanPin, stripped) as
+    | { employee_id: string; full_name: string; department: string; basic_salary: number; status: string }
+    | undefined;
+  if (!emp) return null;
+  return { emp, fp };
+}
 
-  const result = await zkPullAttendanceFromK40(dev.ip_address, Number(dev.port) || 4370);
-  const now = new Date().toISOString();
+function ingestReadOnlyK40Punches(opts: {
+  dev: {
+    id: number;
+    tenant_id: number;
+    device_name: string;
+    ip_address?: string;
+    serial_number: string;
+    device_type?: string;
+  };
+  punches: RawK40PunchInput[];
+  syncSource: string;
+  actor: string;
+  latencyMs?: number;
+  triggeredBy?: string;
+}) {
+  const { dev, punches, syncSource, actor, latencyMs = 0, triggeredBy = 'Manual' } = opts;
+  const tid = dev.tenant_id;
+  const startedAt = new Date().toISOString();
+  let imported = 0;
+  let skippedDuplicates = 0;
+  let unmatchedCount = 0;
 
-  if (!result.connected) {
-    db.prepare(
-      "UPDATE devices SET status='Unreachable', last_latency_ms=?, last_checked_at=?, last_message=? WHERE id=?"
-    ).run(result.latencyMs, now, `${result.message}. For cloud/Render deployments configure K40 ADMS URL: /iclock/cdata?SN=${dev.serial_number}`, id);
-    const updated = maskDeviceRow(db.prepare('SELECT * FROM devices WHERE id = ?').get(id));
-    res.status(502).json({
-      error: `${result.message}. Note: Direct TCP port 4370 requires the server to reach LAN IP ${dev.ip_address}:${dev.port}. For cloud hosting (Render), point your ZKTeco K40 ADMS Server Settings to /iclock/cdata?SN=${dev.serial_number}.`,
-      device: updated,
-    });
-    return;
-  }
+  for (const p of punches) {
+    const deviceUserId = String(p.device_user_id || '').trim();
+    if (!deviceUserId) continue;
+    const eatParts = parseTimestampToEat(p.machine_timestamp);
+    const machineTs = eatParts.timestamp; // Immutable machine timestamp in Africa/Addis_Ababa (EAT)
+    const receivedTs = getEatNowParts().timestamp;
+    const verifyMode = String(p.verify_mode || 'Fingerprint').trim() || 'Fingerprint';
 
-  let ingested = 0;
-  for (const rec of result.records) {
-    const fp = db
-      .prepare('SELECT employee_id, employee_name, department FROM staff_fingerprints WHERE tenant_id = ? AND (zk_user_pin = ? OR employee_id = ?) LIMIT 1')
-      .get(tid, rec.zk_user_pin, rec.zk_user_pin) as
-      | { employee_id: string; employee_name: string; department: string }
-      | undefined;
-    const empCode = fp?.employee_id || rec.zk_user_pin;
-    const emp = db
-      .prepare('SELECT full_name, department, basic_salary FROM employees WHERE tenant_id = ? AND employee_id = ?')
-      .get(tid, empCode) as { full_name: string; department: string; basic_salary: number } | undefined;
-    const attDate = rec.timestamp.slice(0, 10);
-    const punchTime = rec.timestamp.slice(11, 16);
+    // Duplicate punch check against immutable raw punches ledger
+    const dupRow = db
+      .prepare('SELECT id FROM device_raw_punches WHERE tenant_id = ? AND device_id = ? AND device_user_id = ? AND machine_timestamp = ?')
+      .get(tid, dev.id, deviceUserId, machineTs);
+    if (dupRow) {
+      skippedDuplicates += 1;
+      continue;
+    }
+
+    const matched = matchEmployeeByDevicePin(tid, deviceUserId);
+    if (!matched) {
+      unmatchedCount += 1;
+      db.prepare(
+        `INSERT INTO device_raw_punches (
+          tenant_id, device_id, device_serial, device_user_id, device_user_name,
+          machine_timestamp, received_timestamp, verify_mode, punch_state,
+          employee_code, attendance_record_id, sync_source, status, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', NULL, ?, 'PendingMapping', ?)`
+      ).run(
+        tid,
+        dev.id,
+        dev.serial_number || `DEV-${dev.id}`,
+        deviceUserId,
+        String(p.device_user_name || '').trim(),
+        machineTs,
+        receivedTs,
+        verifyMode,
+        Number(p.punch_state || 0),
+        syncSource,
+        startedAt
+      );
+
+      db.prepare(
+        `INSERT INTO unmatched_device_users (
+          tenant_id, device_id, device_name, device_serial, device_user_id, device_user_name,
+          first_seen_at, last_seen_at, sample_punch_at, punch_count, status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'Pending')
+        ON CONFLICT(tenant_id, device_id, device_user_id) DO UPDATE SET
+          last_seen_at = excluded.last_seen_at,
+          sample_punch_at = excluded.sample_punch_at,
+          device_user_name = CASE WHEN excluded.device_user_name != '' THEN excluded.device_user_name ELSE unmatched_device_users.device_user_name END,
+          punch_count = unmatched_device_users.punch_count + 1,
+          status = CASE WHEN unmatched_device_users.mapped_employee_id = '' THEN 'Pending' ELSE unmatched_device_users.status END`
+      ).run(
+        tid,
+        dev.id,
+        dev.device_name,
+        dev.serial_number || `DEV-${dev.id}`,
+        deviceUserId,
+        String(p.device_user_name || '').trim(),
+        machineTs,
+        machineTs,
+        machineTs
+      );
+
+      insertBiometricAuthLog({
+        tenant_id: tid,
+        device_id: dev.id,
+        device_identifier: dev.serial_number || `DEV-${dev.id}`,
+        device_name: dev.device_name,
+        auth_source: syncSource,
+        auth_method: verifyMode,
+        employee_code: deviceUserId,
+        employee_name: String(p.device_user_name || 'Unmatched Device User'),
+        department: '',
+        punch_type: p.punch_type && p.punch_type !== 'Auto' ? p.punch_type : 'Check-In',
+        status: 'Failure',
+        failure_reason: `Unmatched K40 User ID "${deviceUserId}" — admin mapping required (no auto-created employee)`,
+        attendance_record_id: null,
+        attendance_marked: 0,
+        verified_at: eatParts.isoEat,
+      });
+      continue;
+    }
+
+    const { emp, fp } = matched;
+    const attDate = eatParts.date;
+    const punchTime = eatParts.hhmm;
+    const effectivePunchType: 'Check-In' | 'Check-Out' =
+      p.punch_type && p.punch_type !== 'Auto'
+        ? p.punch_type
+        : resolveAutoBiometricPunchType(tid, emp.employee_id, attDate, punchTime);
+
     const att = upsertBiometricAttendanceRecord({
       tid,
-      empCode,
-      empName: emp?.full_name || fp?.employee_name || empCode,
-      department: emp?.department || fp?.department || 'Production',
+      empCode: emp.employee_id,
+      empName: emp.full_name,
+      department: emp.department,
       attDate,
       punchTime,
-      punchType: rec.punch_type,
+      punchType: effectivePunchType,
       deviceName: dev.device_name,
-      hourlyRateOverride: emp?.basic_salary ? Number((emp.basic_salary / 208).toFixed(2)) : undefined,
-      notes: `Pulled via ZKTeco K40 TCP 4370 (${dev.ip_address})`,
-      actor: getActorName(req),
+      deviceId: dev.id,
+      deviceTxId: `${dev.id}:${deviceUserId}:${machineTs}`,
+      machineTimestamp: machineTs,
+      receivedTimestamp: receivedTs,
+      verificationMethod: fp ? `Fingerprint (${fp.finger_label})` : verifyMode,
+      syncStatus: 'Synced',
+      hourlyRateOverride: emp.basic_salary ? Number((emp.basic_salary / 208).toFixed(2)) : undefined,
+      notes: `${syncSource} (${dev.device_name}) ${effectivePunchType} at ${punchTime} EAT`,
+      actor,
     });
     const attId = Number(att.id || 0) || null;
+
+    db.prepare(
+      `INSERT INTO device_raw_punches (
+        tenant_id, device_id, device_serial, device_user_id, device_user_name,
+        machine_timestamp, received_timestamp, verify_mode, punch_state,
+        employee_code, attendance_record_id, sync_source, status, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Synced', ?)`
+    ).run(
+      tid,
+      dev.id,
+      dev.serial_number || `DEV-${dev.id}`,
+      deviceUserId,
+      String(p.device_user_name || emp.full_name),
+      machineTs,
+      receivedTs,
+      verifyMode,
+      Number(p.punch_state || 0),
+      emp.employee_id,
+      attId,
+      syncSource,
+      startedAt
+    );
+
     insertBiometricAuthLog({
       tenant_id: tid,
       device_id: dev.id,
       device_identifier: dev.serial_number || `DEV-${dev.id}`,
       device_name: dev.device_name,
-      auth_source: 'ZKTeco K40 TCP',
-      auth_method: 'Fingerprint',
-      employee_code: empCode,
-      employee_name: emp?.full_name || fp?.employee_name || empCode,
-      department: emp?.department || fp?.department || 'Production',
-      punch_type: rec.punch_type,
+      auth_source: syncSource,
+      auth_method: fp ? `Fingerprint (${fp.finger_label})` : verifyMode,
+      employee_code: emp.employee_id,
+      employee_name: emp.full_name,
+      department: emp.department,
+      punch_type: effectivePunchType,
       status: 'Success',
       failure_reason: '',
       attendance_record_id: attId,
       attendance_marked: attId ? 1 : 0,
-      verified_at: rec.timestamp,
+      verified_at: eatParts.isoEat,
     });
-    ingested++;
+    imported += 1;
+  }
+
+  const completedAt = new Date().toISOString();
+  db.prepare(
+    `INSERT INTO device_sync_logs (
+      tenant_id, device_id, device_name, device_ip, sync_mode, status,
+      fetched_count, imported_count, skipped_duplicates, unmatched_count, latency_ms,
+      error_message, triggered_by, started_at, completed_at
+    ) VALUES (?, ?, ?, ?, ?, 'Success', ?, ?, ?, ?, ?, '', ?, ?, ?)`
+  ).run(
+    tid,
+    dev.id,
+    dev.device_name,
+    dev.ip_address || '',
+    syncSource,
+    punches.length,
+    imported,
+    skippedDuplicates,
+    unmatchedCount,
+    latencyMs,
+    triggeredBy,
+    startedAt,
+    completedAt
+  );
+
+  db.prepare(
+    "UPDATE devices SET status='Connected', last_latency_ms=?, punch_count = COALESCE(punch_count, 0) + ?, total_imported_count = COALESCE(total_imported_count, 0) + ?, last_sync_at=?, last_checked_at=?, last_error='', last_message=? WHERE id=?"
+  ).run(
+    latencyMs,
+    imported,
+    imported,
+    completedAt,
+    completedAt,
+    `Read-Only Sync: +${imported} new, ${skippedDuplicates} dup skipped, ${unmatchedCount} unmatched`,
+    dev.id
+  );
+
+  broadcastWs('device:status', { id: dev.id, status: 'Connected', tenant_id: tid });
+  if (imported > 0) {
+    broadcastWs('attendance:updated', { tenant_id: tid, ingested: imported, source: syncSource });
+  }
+
+  return { fetched: punches.length, imported, skipped_duplicates: skippedDuplicates, unmatched: unmatchedCount };
+}
+
+const activeDeviceSyncs = new Set<number>();
+
+async function syncZktecoDeviceReadOnly(
+  dev: {
+    id: number;
+    tenant_id: number;
+    device_name: string;
+    ip_address: string;
+    port: number;
+    serial_number: string;
+    device_type?: string;
+    comm_password_enc?: string;
+  },
+  actor: string,
+  triggeredBy = 'Manual'
+) {
+  if (activeDeviceSyncs.has(dev.id)) {
+    return { ok: false, busy: true, message: 'Sync already in progress for this terminal.' };
+  }
+  activeDeviceSyncs.add(dev.id);
+  const startedAt = new Date().toISOString();
+  try {
+    const commPass = dev.comm_password_enc ? decryptField(dev.comm_password_enc) : '';
+    const result = await zkPullAttendanceFromK40(dev.ip_address, Number(dev.port) || 4370, commPass, 2800);
+    const now = new Date().toISOString();
+
+    if (!result.connected) {
+      db.prepare(
+        `INSERT INTO device_sync_logs (
+          tenant_id, device_id, device_name, device_ip, sync_mode, status,
+          fetched_count, imported_count, skipped_duplicates, unmatched_count, latency_ms,
+          error_message, triggered_by, started_at, completed_at
+        ) VALUES (?, ?, ?, ?, 'TCP_READ_ONLY', 'Failed', 0, 0, 0, 0, ?, ?, ?, ?, ?)`
+      ).run(dev.tenant_id, dev.id, dev.device_name, dev.ip_address, result.latencyMs, result.message, triggeredBy, startedAt, now);
+
+      db.prepare(
+        "UPDATE devices SET status='Unreachable', last_latency_ms=?, failed_sync_count = COALESCE(failed_sync_count, 0) + 1, last_error=?, last_checked_at=?, last_message=? WHERE id=?"
+      ).run(
+        result.latencyMs,
+        result.message,
+        now,
+        `${result.message}. Use Local Read-Only LAN Connector or ADMS (/iclock/cdata?SN=${dev.serial_number}) if server is hosted outside factory LAN.`,
+        dev.id
+      );
+      broadcastWs('device:status', { id: dev.id, status: 'Unreachable', tenant_id: dev.tenant_id });
+      return { ok: false, latencyMs: result.latencyMs, error: result.message };
+    }
+
+    const summary = ingestReadOnlyK40Punches({
+      dev,
+      punches: result.records.map((r) => ({
+        device_user_id: r.zk_user_pin,
+        device_user_name: r.device_user_name,
+        machine_timestamp: r.timestamp,
+        punch_type: r.punch_type,
+        punch_state: r.punch_state,
+        verify_mode: r.verify_mode,
+      })),
+      syncSource: 'ZKTeco K40 Read-Only TCP',
+      actor,
+      latencyMs: result.latencyMs,
+      triggeredBy,
+    });
+
+    return { ok: true, latencyMs: result.latencyMs, message: result.message, ...summary };
+  } finally {
+    activeDeviceSyncs.delete(dev.id);
+  }
+}
+
+app.post('/api/devices/:id/zkteco/test-connection', async (req, res) => {
+  const tid = getTenantId(req);
+  const id = Number(req.params.id);
+  const dev = db.prepare('SELECT * FROM devices WHERE id = ? AND tenant_id = ?').get(id, tid) as
+    | { id: number; tenant_id: number; device_name: string; ip_address: string; port: number; serial_number: string; comm_password_enc?: string }
+    | undefined;
+  if (!dev) {
+    res.status(404).json({ error: 'ZKTeco K40 device not found in active tenant.' });
+    return;
+  }
+  const commPass = dev.comm_password_enc ? decryptField(dev.comm_password_enc) : '';
+  const testRes = await zkTestConnectionReadOnly(dev.ip_address, Number(dev.port) || 4370, commPass);
+  const now = new Date().toISOString();
+  db.prepare(
+    'UPDATE devices SET status=?, last_latency_ms=?, last_checked_at=?, last_error=?, last_message=? WHERE id=?'
+  ).run(
+    testRes.ok ? 'Connected' : 'Unreachable',
+    testRes.latencyMs,
+    now,
+    testRes.ok ? '' : testRes.message,
+    testRes.message,
+    id
+  );
+  const updated = maskDeviceRow(db.prepare('SELECT * FROM devices WHERE id = ?').get(id));
+  broadcastWs('device:status', { id, status: testRes.ok ? 'Connected' : 'Unreachable', tenant_id: tid });
+  if (!testRes.ok) {
+    res.status(502).json({
+      ok: false,
+      error: `${testRes.message}. Tip: If your app is hosted in the cloud, download and run the Local Read-Only LAN Connector on a factory computer connected to ${dev.ip_address}:${dev.port}.`,
+      device: updated,
+    });
+    return;
+  }
+  res.json({ ok: true, latencyMs: testRes.latencyMs, message: testRes.message, device: updated });
+});
+
+app.post('/api/devices/:id/zkteco/sync-now', async (req, res) => {
+  const tid = getTenantId(req);
+  const id = Number(req.params.id);
+  const dev = db.prepare('SELECT * FROM devices WHERE id = ? AND tenant_id = ?').get(id, tid) as
+    | { id: number; tenant_id: number; device_name: string; ip_address: string; port: number; serial_number: string; device_type?: string; comm_password_enc?: string }
+    | undefined;
+  if (!dev) {
+    res.status(404).json({ error: 'ZKTeco K40 device not found in active tenant.' });
+    return;
+  }
+  const outcome = await syncZktecoDeviceReadOnly(dev, getActorName(req), 'Manual Sync');
+  const updated = maskDeviceRow(db.prepare('SELECT * FROM devices WHERE id = ?').get(id));
+  if (!outcome.ok) {
+    res.status(outcome.busy ? 409 : 502).json({
+      error: outcome.busy
+        ? outcome.message
+        : `${outcome.error}. Note: Direct TCP port 4370 requires LAN reachability to ${dev.ip_address}:${dev.port}. For cloud/Render hosting, run the Local Read-Only LAN Connector or set K40 ADMS URL to /iclock/cdata?SN=${dev.serial_number}.`,
+      device: updated,
+    });
+    return;
+  }
+  const importedCount = 'imported' in outcome ? outcome.imported : 0;
+  res.json({ device: updated, ...outcome, ingested: importedCount });
+});
+
+app.post('/api/devices/:id/zkteco/pull-attendance', async (req, res) => {
+  const tid = getTenantId(req);
+  const id = Number(req.params.id);
+  const dev = db.prepare('SELECT * FROM devices WHERE id = ? AND tenant_id = ?').get(id, tid) as
+    | { id: number; tenant_id: number; device_name: string; ip_address: string; port: number; serial_number: string; device_type?: string; comm_password_enc?: string }
+    | undefined;
+  if (!dev) {
+    res.status(404).json({ error: 'ZKTeco K40 device not found in active tenant.' });
+    return;
+  }
+  const outcome = await syncZktecoDeviceReadOnly(dev, getActorName(req), 'Manual Pull');
+  const updated = maskDeviceRow(db.prepare('SELECT * FROM devices WHERE id = ?').get(id));
+  if (!outcome.ok) {
+    res.status(outcome.busy ? 409 : 502).json({
+      error: `${outcome.error || outcome.message}. Direct TCP port 4370 requires LAN reachability to ${dev.ip_address}:${dev.port}. For cloud hosting, run the Local Read-Only LAN Connector or configure ADMS /iclock/cdata?SN=${dev.serial_number}.`,
+      device: updated,
+    });
+    return;
+  }
+  const importedCount = 'imported' in outcome ? outcome.imported : 0;
+  res.json({ device: updated, ingested: importedCount, ...outcome });
+});
+
+app.get('/api/devices/zkteco/sync-logs', (req, res) => {
+  const tid = getTenantId(req);
+  const deviceId = req.query.device_id ? Number(req.query.device_id) : null;
+  const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 60));
+  const cols = '*, sync_mode AS sync_source, fetched_count AS total_fetched, completed_at AS finished_at';
+  if (deviceId) {
+    res.json(db.prepare(`SELECT ${cols} FROM device_sync_logs WHERE tenant_id = ? AND device_id = ? ORDER BY id DESC LIMIT ?`).all(tid, deviceId, limit));
+    return;
+  }
+  res.json(db.prepare(`SELECT ${cols} FROM device_sync_logs WHERE tenant_id = ? ORDER BY id DESC LIMIT ?`).all(tid, limit));
+});
+
+app.get('/api/devices/zkteco/unmatched', (req, res) => {
+  const tid = getTenantId(req);
+  const status = String(req.query.status || '').trim();
+  const cols = '*, resolved_by AS mapped_by, resolved_at AS mapped_at';
+  if (status) {
+    res.json(db.prepare(`SELECT ${cols} FROM unmatched_device_users WHERE tenant_id = ? AND status = ? ORDER BY last_seen_at DESC`).all(tid, status));
+    return;
+  }
+  res.json(db.prepare(`SELECT ${cols} FROM unmatched_device_users WHERE tenant_id = ? ORDER BY status ASC, last_seen_at DESC`).all(tid));
+});
+
+app.post('/api/devices/zkteco/unmatched/:id/map', (req, res) => {
+  if (!requireRole(req, res, ATTENDANCE_MANAGER_ROLES, 'mapping unmatched biometric device users')) return;
+  const tid = getTenantId(req);
+  const id = Number(req.params.id);
+  const employeeId = String(req.body?.employee_id || '').trim();
+  if (!employeeId) {
+    res.status(400).json({ error: 'Select an existing employee to map this K40 User ID.' });
+    return;
+  }
+  const unmatched = db.prepare('SELECT * FROM unmatched_device_users WHERE id = ? AND tenant_id = ?').get(id, tid) as
+    | { id: number; device_id: number; device_name: string; device_serial: string; device_user_id: string }
+    | undefined;
+  if (!unmatched) {
+    res.status(404).json({ error: 'Unmatched device user record not found.' });
+    return;
+  }
+  const emp = db
+    .prepare('SELECT employee_id, full_name, department, basic_salary FROM employees WHERE tenant_id = ? AND employee_id = ?')
+    .get(tid, employeeId) as { employee_id: string; full_name: string; department: string; basic_salary: number } | undefined;
+  if (!emp) {
+    res.status(404).json({ error: `Employee "${employeeId}" not found in HR directory.` });
+    return;
+  }
+
+  const now = new Date().toISOString();
+  const actor = getActorName(req);
+
+  db.prepare(
+    `INSERT INTO staff_fingerprints (
+      tenant_id, employee_id, employee_name, department, zk_user_pin,
+      finger_index, finger_label, template_hash, template_size,
+      device_id, device_serial, auth_source, enrolled_by, status, created_at
+    ) VALUES (?, ?, ?, ?, ?, 0, 'K40 Terminal Mapped PIN', ?, 0, ?, ?, 'ZKTeco K40 Mapping', ?, 'Active', ?)
+    ON CONFLICT(tenant_id, employee_id, finger_index) DO UPDATE SET
+      zk_user_pin = excluded.zk_user_pin,
+      status = 'Active'`
+  ).run(
+    tid,
+    emp.employee_id,
+    emp.full_name,
+    emp.department,
+    unmatched.device_user_id,
+    sha256Hex(`MAP:${tid}:${emp.employee_id}:${unmatched.device_user_id}`),
+    unmatched.device_id,
+    unmatched.device_serial,
+    actor,
+    now
+  );
+
+  // Retroactively process any pending raw punches for this device_user_id (software side only — K40 terminal is never touched)
+  const pendingPunches = db
+    .prepare(
+      "SELECT * FROM device_raw_punches WHERE tenant_id = ? AND device_id = ? AND device_user_id = ? AND status = 'PendingMapping' ORDER BY machine_timestamp ASC"
+    )
+    .all(tid, unmatched.device_id, unmatched.device_user_id) as Array<{
+    id: number;
+    machine_timestamp: string;
+    received_timestamp: string;
+    verify_mode: string;
+    punch_state: number;
+  }>;
+
+  let backfilled = 0;
+  for (const raw of pendingPunches) {
+    const eatParts = parseTimestampToEat(raw.machine_timestamp);
+    const punchType =
+      raw.punch_state === 1 || raw.punch_state === 5
+        ? 'Check-Out'
+        : resolveAutoBiometricPunchType(tid, emp.employee_id, eatParts.date, eatParts.hhmm);
+    const att = upsertBiometricAttendanceRecord({
+      tid,
+      empCode: emp.employee_id,
+      empName: emp.full_name,
+      department: emp.department,
+      attDate: eatParts.date,
+      punchTime: eatParts.hhmm,
+      punchType,
+      deviceName: unmatched.device_name || 'ZKTeco K40',
+      deviceId: unmatched.device_id,
+      deviceTxId: `${unmatched.device_id}:${unmatched.device_user_id}:${raw.machine_timestamp}`,
+      machineTimestamp: raw.machine_timestamp,
+      receivedTimestamp: raw.received_timestamp,
+      verificationMethod: raw.verify_mode || 'Fingerprint',
+      syncStatus: 'Synced',
+      hourlyRateOverride: emp.basic_salary ? Number((emp.basic_salary / 208).toFixed(2)) : undefined,
+      notes: `Mapped K40 PIN ${unmatched.device_user_id} -> ${emp.employee_id}`,
+      actor,
+    });
+    db.prepare("UPDATE device_raw_punches SET employee_code = ?, attendance_record_id = ?, status = 'Synced' WHERE id = ?").run(
+      emp.employee_id,
+      Number(att.id || 0) || null,
+      raw.id
+    );
+    backfilled += 1;
   }
 
   db.prepare(
-    "UPDATE devices SET status='Connected', last_latency_ms=?, punch_count = COALESCE(punch_count, 0) + ?, last_sync_at=?, last_checked_at=?, last_message=? WHERE id=?"
-  ).run(result.latencyMs, ingested, now, now, result.message, id);
-  const updated = maskDeviceRow(db.prepare('SELECT * FROM devices WHERE id = ?').get(id));
-  broadcastWs('device:status', { id, status: 'Connected', tenant_id: tid });
-  if (ingested > 0) broadcastWs('attendance:updated', { tenant_id: tid, ingested });
-  res.json({ device: updated, ingested, message: result.message });
+    "UPDATE unmatched_device_users SET mapped_employee_id = ?, status = 'Mapped', resolved_by = ?, resolved_at = ? WHERE id = ?"
+  ).run(emp.employee_id, actor, now, id);
+
+  logAudit(req, 'MAP_K40_USER', 'Device Connections', `Mapped K40 PIN "${unmatched.device_user_id}" to ${emp.full_name} (${emp.employee_id}) · backfilled ${backfilled} punch(es)`, tid);
+  broadcastWs('attendance:updated', { tenant_id: tid, backfilled });
+  res.json({ ok: true, mapped_employee_id: emp.employee_id, backfilled });
 });
+
+app.post('/api/devices/zkteco/connector/heartbeat', (req, res) => {
+  const serial = String(req.body?.serial_number || '').trim();
+  const check = verifyBridgeDevice(req, serial);
+  if (!check.ok) {
+    res.status(401).json({ error: check.error });
+    return;
+  }
+  const now = new Date().toISOString();
+  db.prepare("UPDATE devices SET status = 'Connected', last_checked_at = ?, last_error = '' WHERE id = ?").run(now, check.dev.id);
+  broadcastWs('device:status', { id: check.dev.id, status: 'Connected', tenant_id: check.dev.tenant_id });
+  res.json({ ok: true });
+});
+
+app.post('/api/devices/zkteco/connector/ingest', (req, res) => {
+  const b = (req.body || {}) as Record<string, unknown>;
+  const serial = String(b.serial_number || '').trim();
+  const check = verifyBridgeDevice(req, serial);
+  if (!check.ok) {
+    res.status(401).json({ error: check.error });
+    return;
+  }
+  const punchesRaw = Array.isArray(b.punches) ? b.punches : [];
+  const devRow = db.prepare('SELECT * FROM devices WHERE id = ?').get(check.dev.id) as {
+    id: number;
+    tenant_id: number;
+    device_name: string;
+    ip_address: string;
+    serial_number: string;
+    device_type?: string;
+  };
+  const out = ingestReadOnlyK40Punches({
+    dev: devRow,
+    punches: punchesRaw as RawK40PunchInput[],
+    syncSource: 'Local Read-Only Connector',
+    actor: 'Local K40 Connector',
+    triggeredBy: 'LAN Connector',
+  });
+  res.json({ ok: true, ...out });
+});
+
+function startZktecoAutoPoller() {
+  const lastAttempt = new Map<number, number>();
+  const timer = setInterval(() => {
+    const nowMs = Date.now();
+    const devs = db
+      .prepare(
+        "SELECT id, tenant_id, device_name, ip_address, port, serial_number, device_type, comm_password_enc, sync_interval_sec FROM devices WHERE auto_sync_enabled = 1 AND protocol != 'HTTP/HTTPS REST'"
+      )
+      .all() as Array<{
+      id: number;
+      tenant_id: number;
+      device_name: string;
+      ip_address: string;
+      port: number;
+      serial_number: string;
+      device_type?: string;
+      comm_password_enc?: string;
+      sync_interval_sec?: number;
+    }>;
+
+    for (const dev of devs) {
+      const intervalMs = Math.max(2, Math.min(60, Number(dev.sync_interval_sec) || 3)) * 1000;
+      const prev = lastAttempt.get(dev.id) || 0;
+      if (nowMs - prev < intervalMs || activeDeviceSyncs.has(dev.id)) continue;
+      lastAttempt.set(dev.id, nowMs);
+      void syncZktecoDeviceReadOnly(dev, 'K40 Auto-Poller', 'Auto-Poller').catch(() => {});
+    }
+  }, 1000);
+  timer.unref();
+}
 
 // ============================================================================
 // COMPANY DEVICE & COMPANY CODE SECURITY POLICY ENDPOINTS
@@ -7073,10 +8266,11 @@ const COMPANY_DEVICE_ADMIN_ROLES = new Set(['System Administrator', 'Super Admin
 
 app.get('/api/security/company-devices/status', (req, res) => {
   const rawUid = String(req.query.device_uid || req.headers['x-device-uid'] || '').trim().toUpperCase();
+  const userCount = (db.prepare('SELECT COUNT(*) as c FROM users').get() as { c: number }).c;
   const sec = db
-    .prepare('SELECT company_code_hint, policy_enabled, configured_by, configured_at FROM company_device_security WHERE tenant_id = 1')
+    .prepare('SELECT company_code_hash, company_code_hint, policy_enabled, configured_by, configured_at FROM company_device_security WHERE tenant_id = 1')
     .get() as
-    | { company_code_hint: string; policy_enabled: number; configured_by: string; configured_at: string | null }
+    | { company_code_hash: string; company_code_hint: string; policy_enabled: number; configured_by: string; configured_at: string | null }
     | undefined;
   const totalDevs = (db.prepare("SELECT COUNT(*) as c FROM authorized_company_devices WHERE status = 'Active'").get() as { c: number }).c;
 
@@ -7091,6 +8285,9 @@ app.get('/api/security/company-devices/status', (req, res) => {
 
   res.json({
     policy_enabled: Boolean(sec?.policy_enabled === 1),
+    policy_configured: Boolean(sec?.company_code_hash),
+    has_users: userCount > 0,
+    requires_first_admin_setup: userCount === 0,
     device_uid: rawUid,
     device_registered: Boolean(regDev && regDev.status === 'Active'),
     device_verified: Boolean(regDev && regDev.status === 'Active' && regDev.verified_at),
@@ -7101,6 +8298,43 @@ app.get('/api/security/company-devices/status', (req, res) => {
     configured_at: sec?.configured_at || null,
     total_registered_devices: totalDevs,
   });
+});
+
+app.post('/api/security/company-devices/bootstrap', (req: AuthedRequest, res) => {
+  if (!requireRole(req, res, COMPANY_DEVICE_ADMIN_ROLES, 'bootstrapping company device policy')) return;
+  const existing = db.prepare('SELECT company_code_hash FROM company_device_security WHERE tenant_id = 1').get() as
+    | { company_code_hash: string }
+    | undefined;
+  if (existing?.company_code_hash) {
+    res.status(409).json({ error: 'Company security policy is already configured. Update it in Admin → Device Security.' });
+    return;
+  }
+  const rawCode = String(req.body?.company_code || '').trim();
+  if (rawCode.length < 4) {
+    res.status(400).json({ error: 'Company Security Code must be at least 4 characters long.' });
+    return;
+  }
+  const uid = String(req.body?.device_uid || req.headers['x-device-uid'] || '').trim().toUpperCase();
+  const now = new Date().toISOString();
+  const actor = req.authUser?.full_name || getActorName(req);
+  const codeHash = sha256Hex(`SS-COMP-CODE:${rawCode}`);
+  const codeHint = `${rawCode.slice(0, 2)}${'*'.repeat(Math.max(2, rawCode.length - 3))}${rawCode.slice(-1)}`;
+
+  db.prepare(
+    `INSERT INTO company_device_security (tenant_id, company_code_hash, company_code_hint, policy_enabled, configured_by, configured_at, updated_at)
+     VALUES (1, ?, ?, 1, ?, ?, ?)
+     ON CONFLICT(tenant_id) DO UPDATE SET company_code_hash=excluded.company_code_hash, company_code_hint=excluded.company_code_hint, policy_enabled=1, configured_by=excluded.configured_by, configured_at=excluded.configured_at, updated_at=excluded.updated_at`
+  ).run(codeHash, codeHint, actor, now, now);
+
+  if (uid) {
+    db.prepare(
+      `INSERT INTO authorized_company_devices (tenant_id, device_uid, device_name, device_os, assigned_branch, assigned_to_email, status, verified_at, registered_by, last_seen_at, created_at)
+       VALUES (1, ?, ?, ?, 'HQ', ?, 'Active', ?, ?, ?, ?)
+       ON CONFLICT(device_uid) DO UPDATE SET status='Active', verified_at=COALESCE(authorized_company_devices.verified_at, excluded.verified_at)`
+    ).run(uid, String(req.body?.device_name || 'Primary Admin Workstation'), String(req.body?.device_os || ''), req.authUser?.email || '', now, actor, now, now);
+  }
+  broadcastWs('company:device_security_updated', { policy_enabled: true, device_uid: uid });
+  res.json({ ok: true, policy_enabled: true, company_code_hint: codeHint });
 });
 
 app.post('/api/security/company-devices/verify', (req, res) => {
@@ -7470,58 +8704,31 @@ const handleIclockPost = (req: express.Request, res: express.Response) => {
       }
     }
   } else {
+    const parsedPunches: RawK40PunchInput[] = [];
     for (const line of lines) {
       const parts = line.split(/\t|,/);
       if (parts.length < 2) continue;
       const pinOrCode = parts[0].trim();
       const ts = parts[1].trim();
       const punchFlag = parts[2]?.trim();
-      const punchType = punchFlag === '1' || punchFlag === '5' ? 'Check-Out' : 'Check-In';
-      const attDate = ts.slice(0, 10) || now.slice(0, 10);
-      const punchTime = ts.slice(11, 16) || now.slice(11, 16);
-
-      const fpMatch = db
-        .prepare('SELECT employee_id FROM staff_fingerprints WHERE tenant_id = ? AND zk_user_pin = ? LIMIT 1')
-        .get(dev.tenant_id, pinOrCode) as { employee_id: string } | undefined;
-      const empCode = fpMatch?.employee_id || pinOrCode;
-      const emp = db
-        .prepare('SELECT full_name, department, basic_salary FROM employees WHERE tenant_id = ? AND employee_id = ?')
-        .get(dev.tenant_id, empCode) as { full_name: string; department: string; basic_salary: number } | undefined;
-
-      const att = upsertBiometricAttendanceRecord({
-        tid: dev.tenant_id,
-        empCode,
-        empName: emp?.full_name || empCode,
-        department: emp?.department || 'Production',
-        attDate,
-        punchTime,
-        punchType,
-        deviceName: dev.device_name,
-        shiftName: `ADMS Push (${dev.device_name})`,
-        hourlyRateOverride: emp?.basic_salary ? Number((emp.basic_salary / 208).toFixed(2)) : 50,
-        notes: `ZKTeco ADMS Serial ${sn}`,
-        actor: 'ZKTeco ADMS',
-      });
-      const attId = Number(att.id || 0) || null;
-      insertBiometricAuthLog({
-        tenant_id: dev.tenant_id,
-        device_id: dev.id,
-        device_identifier: sn,
-        device_name: dev.device_name,
-        auth_source: 'ZKTeco ADMS',
-        auth_method: dev.device_type?.toLowerCase().includes('face') ? 'Face ID' : 'Fingerprint',
-        employee_code: empCode,
-        employee_name: emp?.full_name || empCode,
-        department: emp?.department || 'Production',
+      const punchType: 'Check-In' | 'Check-Out' = punchFlag === '1' || punchFlag === '5' ? 'Check-Out' : 'Check-In';
+      parsedPunches.push({
+        device_user_id: pinOrCode,
+        machine_timestamp: ts || now,
         punch_type: punchType,
-        status: 'Success',
-        failure_reason: '',
-        attendance_record_id: attId,
-        attendance_marked: attId ? 1 : 0,
-        verified_at: ts.includes('T') || ts.includes(' ') ? ts : now,
+        punch_state: Number(punchFlag || 0),
+        verify_mode: dev.device_type?.toLowerCase().includes('face') ? 'Face ID' : 'Fingerprint',
       });
-      ingested++;
     }
+    const out = ingestReadOnlyK40Punches({
+      dev: { ...dev, serial_number: sn },
+      punches: parsedPunches,
+      syncSource: 'ZKTeco ADMS',
+      actor: 'ZKTeco ADMS',
+      triggeredBy: 'ADMS Push',
+    });
+    res.type('text/plain').send(`OK: ${out.imported}`);
+    return;
   }
 
   db.prepare(
@@ -7775,7 +8982,7 @@ function getPreviousIsoDate(isoDate: string): string {
 
 function resolveAutoBiometricPunchType(tid: number, empCode: string, attDate: string, punchTime: string): 'Check-In' | 'Check-Out' {
   const mins = timeToMinutes(punchTime);
-  if (mins < 7 * 60 + 15) {
+  if (mins < 8 * 60) {
     const prevDate = getPreviousIsoDate(attDate);
     const openNight = db
       .prepare(
@@ -7786,7 +8993,7 @@ function resolveAutoBiometricPunchType(tid: number, empCode: string, attDate: st
   }
   const todayAtt = db
     .prepare(
-      "SELECT check_in, check_out, morning_check_in, morning_check_out, afternoon_check_in, afternoon_check_out FROM attendance_records WHERE tenant_id = ? AND employee_code = ? AND attendance_date = ? AND register_state = 'Open' ORDER BY id DESC LIMIT 1"
+      "SELECT check_in, check_out, morning_check_in, morning_check_out, afternoon_check_in, afternoon_check_out, night_check_in, night_check_out FROM attendance_records WHERE tenant_id = ? AND employee_code = ? AND attendance_date = ? AND register_state = 'Open' ORDER BY id DESC LIMIT 1"
     )
     .get(tid, empCode, attDate) as
     | {
@@ -7796,6 +9003,8 @@ function resolveAutoBiometricPunchType(tid: number, empCode: string, attDate: st
         morning_check_out: string;
         afternoon_check_in: string;
         afternoon_check_out: string;
+        night_check_in: string;
+        night_check_out: string;
       }
     | undefined;
   if (!todayAtt) return 'Check-In';
@@ -7804,6 +9013,7 @@ function resolveAutoBiometricPunchType(tid: number, empCode: string, attDate: st
     return 'Check-In';
   }
   if (todayAtt.afternoon_check_in && !todayAtt.afternoon_check_out) return 'Check-Out';
+  if (todayAtt.night_check_in && !todayAtt.night_check_out) return 'Check-Out';
   if (todayAtt.check_in && !todayAtt.check_out) return 'Check-Out';
   return 'Check-In';
 }
@@ -7867,6 +9077,12 @@ function upsertBiometricAttendanceRecord(params: {
   punchTime: string;
   punchType: 'Check-In' | 'Check-Out' | string;
   deviceName: string;
+  deviceId?: number | null;
+  deviceTxId?: string;
+  machineTimestamp?: string;
+  receivedTimestamp?: string;
+  verificationMethod?: string;
+  syncStatus?: string;
   shiftName?: string;
   otType?: string;
   otHours?: number;
@@ -7884,6 +9100,12 @@ function upsertBiometricAttendanceRecord(params: {
     punchTime,
     punchType,
     deviceName,
+    deviceId = null,
+    deviceTxId = '',
+    machineTimestamp = '',
+    receivedTimestamp = '',
+    verificationMethod = 'Fingerprint',
+    syncStatus = 'Synced',
     shiftName,
     otType,
     otHours,
@@ -7895,13 +9117,16 @@ function upsertBiometricAttendanceRecord(params: {
 
   const now = new Date().toISOString();
   const punchMins = timeToMinutes(punchTime);
+  const effectiveMachineTs = machineTimestamp || `${attDate}T${punchTime}:00`;
+  const effectiveReceivedTs = receivedTimestamp || getEatNowParts().timestamp;
+
   let existingOpen = db
     .prepare(
       "SELECT * FROM attendance_records WHERE tenant_id = ? AND employee_code = ? AND attendance_date = ? AND register_state = 'Open' ORDER BY id DESC LIMIT 1"
     )
     .get(tid, empCode, attDate) as Record<string, unknown> | undefined;
 
-  if (!existingOpen && punchType === 'Check-Out' && punchMins < 7 * 60 + 15) {
+  if (!existingOpen && punchType === 'Check-Out' && punchMins < 8 * 60) {
     const prevDate = getPreviousIsoDate(attDate);
     existingOpen = db
       .prepare(
@@ -7948,7 +9173,9 @@ function upsertBiometricAttendanceRecord(params: {
       `UPDATE attendance_records SET
         shift_name=?, shift_period=?, scheduled_start=?, scheduled_end=?, break_minutes=?,
         afternoon_check_in=?, check_out=?, regular_hours=?, late_minutes=?, early_departure_minutes=?, absence_hours=?,
-        ot_type=?, ot_hours=?, ot_multiplier=?, ot_pay=?, status=?, notes=?, updated_by=?, updated_at=?
+        ot_type=?, ot_hours=?, ot_multiplier=?, ot_pay=?, ot_approval_status=?, status=?,
+        device_id=COALESCE(?, device_id), received_timestamp=?, verification_method=?, sync_status=?,
+        notes=?, updated_by=?, updated_at=?
        WHERE id = ? AND tenant_id = ?`
     ).run(
       resolved.shiftName,
@@ -7966,14 +9193,21 @@ function upsertBiometricAttendanceRecord(params: {
       resolved.otHours,
       resolved.mult,
       resolved.pay,
+      resolved.otApprovalStatus,
       resolved.derivedStatus,
+      deviceId,
+      effectiveReceivedTs,
+      verificationMethod,
+      syncStatus,
       resolved.notes,
       actor,
       now,
       existingOpen.id,
       tid
     );
-    return db.prepare('SELECT * FROM attendance_records WHERE id = ?').get(existingOpen.id) as Record<string, unknown>;
+    const updatedRow = db.prepare('SELECT * FROM attendance_records WHERE id = ?').get(existingOpen.id) as Record<string, unknown>;
+    broadcastWs('attendance:updated', updatedRow);
+    return updatedRow;
   }
 
   if (existingOpen && punchType === 'Check-Out') {
@@ -8013,7 +9247,9 @@ function upsertBiometricAttendanceRecord(params: {
       `UPDATE attendance_records SET
         check_out=?, morning_check_out=?, afternoon_check_out=?, night_check_out=?,
         regular_hours=?, late_minutes=?, early_departure_minutes=?, absence_hours=?,
-        ot_type=?, ot_hours=?, ot_multiplier=?, ot_pay=?, status=?, notes=?, updated_by=?, updated_at=?
+        ot_type=?, ot_hours=?, ot_multiplier=?, ot_pay=?, ot_approval_status=?, status=?,
+        device_id=COALESCE(?, device_id), received_timestamp=?, verification_method=?, sync_status=?,
+        notes=?, updated_by=?, updated_at=?
        WHERE id = ? AND tenant_id = ?`
     ).run(
       resolved.lastPunchOut,
@@ -8028,26 +9264,63 @@ function upsertBiometricAttendanceRecord(params: {
       resolved.otHours,
       resolved.mult,
       resolved.pay,
+      resolved.otApprovalStatus,
       resolved.derivedStatus,
+      deviceId,
+      effectiveReceivedTs,
+      verificationMethod,
+      syncStatus,
       resolved.notes,
       actor,
       now,
       existingOpen.id,
       tid
     );
-    return db.prepare('SELECT * FROM attendance_records WHERE id = ?').get(existingOpen.id) as Record<string, unknown>;
+    const updatedRow = db.prepare('SELECT * FROM attendance_records WHERE id = ?').get(existingOpen.id) as Record<string, unknown>;
+    broadcastWs('attendance:updated', updatedRow);
+    return updatedRow;
   }
 
+  // Shift assignment priority: (1) explicit staff_schedules, (2) employee/dept default shift, (3) punch time window
   const periodHint = inferShiftPeriodFromTime(punchTime);
   const schedRow = db
     .prepare("SELECT * FROM staff_schedules WHERE tenant_id = ? AND employee_id = ? AND schedule_date = ? AND approval_status != 'Rejected' ORDER BY id DESC LIMIT 1")
     .get(tid, empCode, attDate) as Record<string, unknown> | undefined;
-  const resolvedPeriod = schedRow?.shift_name
-    ? String(schedRow.shift_name).toLowerCase().includes('night')
+
+  let resolvedShiftId: number | undefined = schedRow?.shift_id ? Number(schedRow.shift_id) : undefined;
+  let resolvedShiftName: string | undefined = schedRow?.shift_name ? String(schedRow.shift_name) : shiftName;
+  if (!resolvedShiftName && !resolvedShiftId) {
+    const deptName =
+      department ||
+      ((db.prepare('SELECT department FROM employees WHERE tenant_id = ? AND employee_id = ?').get(tid, empCode) as { department?: string } | undefined)?.department || '');
+    if (deptName) {
+      const deptShift = db
+        .prepare("SELECT s.id, s.shift_name FROM departments d INNER JOIN shifts s ON s.id = d.default_shift_id WHERE d.tenant_id = ? AND d.name = ? AND COALESCE(s.is_enabled, 1) = 1 LIMIT 1")
+        .get(tid, deptName) as { id: number; shift_name: string } | undefined;
+      const assignedShift = !deptShift
+        ? (db
+            .prepare("SELECT id, shift_name FROM shifts WHERE tenant_id = ? AND LOWER(assigned_department) = LOWER(?) AND COALESCE(is_enabled, 1) = 1 ORDER BY id ASC LIMIT 1")
+            .get(tid, deptName) as { id: number; shift_name: string } | undefined)
+        : undefined;
+      if (deptShift) {
+        // Only apply dept default if it isn't conflicting completely or if punch falls outside explicit shift
+        if (deptShift.shift_name.toLowerCase().includes(periodHint.toLowerCase()) || deptShift.shift_name.toLowerCase().includes('day')) {
+          resolvedShiftId = deptShift.id;
+          resolvedShiftName = deptShift.shift_name;
+        }
+      } else if (assignedShift) {
+        resolvedShiftId = assignedShift.id;
+        resolvedShiftName = assignedShift.shift_name;
+      }
+    }
+  }
+
+  const resolvedPeriod = resolvedShiftName
+    ? resolvedShiftName.toLowerCase().includes('night')
       ? 'Night'
-      : String(schedRow.shift_name).toLowerCase().includes('afternoon')
+      : resolvedShiftName.toLowerCase().includes('afternoon')
       ? 'Afternoon'
-      : String(schedRow.shift_name).toLowerCase().includes('day')
+      : resolvedShiftName.toLowerCase().includes('day')
       ? 'Day'
       : 'Morning'
     : periodHint;
@@ -8059,7 +9332,8 @@ function upsertBiometricAttendanceRecord(params: {
       employee_name: empName,
       department,
       attendance_date: attDate,
-      shift_name: shiftName || schedRow?.shift_name || `${resolvedPeriod} Shift`,
+      shift_id: resolvedShiftId,
+      shift_name: resolvedShiftName || `${resolvedPeriod} Shift`,
       shift_period: resolvedPeriod,
       check_in: isOut ? undefined : punchTime,
       check_out: isOut ? punchTime : undefined,
@@ -8085,8 +9359,10 @@ function upsertBiometricAttendanceRecord(params: {
         check_in, check_out, morning_check_in, morning_check_out, afternoon_check_in, afternoon_check_out,
         night_check_in, night_check_out, scheduled_start, scheduled_end, hourly_rate, regular_hours,
         late_minutes, early_departure_minutes, break_minutes, absence_hours,
-        ot_type, ot_hours, ot_multiplier, ot_pay, status, register_state, notes, updated_by, updated_at, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Open', ?, ?, ?, ?)`
+        ot_type, ot_hours, ot_multiplier, ot_pay, ot_approval_status,
+        device_id, device_tx_id, machine_timestamp, received_timestamp, verification_method, sync_status,
+        status, register_state, notes, updated_by, updated_at, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Open', ?, ?, ?, ?)`
     )
     .run(
       tid,
@@ -8117,6 +9393,13 @@ function upsertBiometricAttendanceRecord(params: {
       payload.otHours,
       payload.mult,
       payload.pay,
+      payload.otApprovalStatus,
+      deviceId,
+      deviceTxId,
+      effectiveMachineTs,
+      effectiveReceivedTs,
+      verificationMethod,
+      syncStatus,
       payload.derivedStatus,
       payload.notes,
       actor,
@@ -8124,7 +9407,9 @@ function upsertBiometricAttendanceRecord(params: {
       now
     );
 
-  return db.prepare('SELECT * FROM attendance_records WHERE id = ?').get(info.lastInsertRowid) as Record<string, unknown>;
+  const createdRow = db.prepare('SELECT * FROM attendance_records WHERE id = ?').get(info.lastInsertRowid) as Record<string, unknown>;
+  broadcastWs('attendance:created', createdRow);
+  return createdRow;
 }
 
 function resolveAttendancePayload(b: Record<string, unknown>, tid: number) {
@@ -8140,7 +9425,7 @@ function resolveAttendancePayload(b: Record<string, unknown>, tid: number) {
 
   const employeeName = String(b.employee_name || emp?.full_name || 'Staff');
   const department = String(b.department || emp?.department || 'Operations');
-  const attendanceDate = String(b.attendance_date || new Date().toISOString().slice(0, 10));
+  const attendanceDate = String(b.attendance_date || eatToday());
   const hourlyRate =
     Number(b.hourly_rate) > 0
       ? Number(b.hourly_rate)
@@ -8148,7 +9433,7 @@ function resolveAttendancePayload(b: Record<string, unknown>, tid: number) {
       ? Number((emp.basic_salary / 208).toFixed(2))
       : 100;
 
-  // Match shift from payload or assigned schedule
+  // Match shift from payload, staff schedule, department default, or fallback
   let shiftRow: Record<string, unknown> | undefined;
   if (b.shift_id) {
     shiftRow = db.prepare('SELECT * FROM shifts WHERE id = ? AND tenant_id = ?').get(Number(b.shift_id), tid) as Record<string, unknown> | undefined;
@@ -8159,6 +9444,14 @@ function resolveAttendancePayload(b: Record<string, unknown>, tid: number) {
   const schedRow = db
     .prepare("SELECT * FROM staff_schedules WHERE tenant_id = ? AND employee_id = ? AND schedule_date = ? AND approval_status != 'Rejected' ORDER BY id DESC LIMIT 1")
     .get(tid, empCode, attendanceDate) as Record<string, unknown> | undefined;
+  if (!shiftRow && schedRow?.shift_id) {
+    shiftRow = db.prepare('SELECT * FROM shifts WHERE id = ? AND tenant_id = ?').get(Number(schedRow.shift_id), tid) as Record<string, unknown> | undefined;
+  }
+  if (!shiftRow && !b.shift_period) {
+    shiftRow = db
+      .prepare("SELECT * FROM shifts WHERE tenant_id = ? AND LOWER(assigned_department) = LOWER(?) AND COALESCE(is_enabled, 1) = 1 ORDER BY id ASC LIMIT 1")
+      .get(tid, department) as Record<string, unknown> | undefined;
+  }
 
   const shiftId = b.shift_id ? Number(b.shift_id) : shiftRow ? Number(shiftRow.id) : schedRow?.shift_id ? Number(schedRow.shift_id) : null;
   const shiftName = String(b.shift_name || shiftRow?.shift_name || schedRow?.shift_name || 'Day Shift');
@@ -8179,6 +9472,12 @@ function resolveAttendancePayload(b: Record<string, unknown>, tid: number) {
         : 'Day')
   );
 
+  if (!shiftRow) {
+    const codeGuess =
+      shiftPeriod === 'Morning' ? 'SHF-MRN' : shiftPeriod === 'Afternoon' ? 'SHF-AFT' : shiftPeriod === 'Night' ? 'SHF-NGT' : 'SHF-DAY';
+    shiftRow = db.prepare('SELECT * FROM shifts WHERE shift_code = ? AND tenant_id = ?').get(codeGuess, tid) as Record<string, unknown> | undefined;
+  }
+
   const scheduledStart = String(
     b.scheduled_start ||
       shiftRow?.start_time ||
@@ -8193,6 +9492,14 @@ function resolveAttendancePayload(b: Record<string, unknown>, tid: number) {
   );
   const defaultBrkForPeriod = shiftPeriod === 'Morning' || shiftPeriod === 'Afternoon' || shiftPeriod === 'Night' ? 0 : Number(rules.default_break_minutes ?? 60);
   const breakMinutes = Number(b.break_minutes ?? shiftRow?.break_minutes ?? schedRow?.break_minutes ?? defaultBrkForPeriod);
+
+  // Editable Section 13 shift window & overtime thresholds from DB (with Ethiopian standard defaults)
+  const inEarliestStr = String(shiftRow?.in_earliest || (shiftPeriod === 'Afternoon' ? '12:50' : shiftPeriod === 'Night' ? '18:50' : '07:45'));
+  const inLatestStr = String(shiftRow?.in_latest || scheduledStart);
+  const outEarliestStr = String(shiftRow?.out_earliest || (shiftPeriod === 'Morning' ? '11:58' : shiftPeriod === 'Night' ? '01:58' : '16:58'));
+  const outLatestStr = String(shiftRow?.out_latest || (shiftPeriod === 'Morning' ? '12:30' : shiftPeriod === 'Night' ? '02:10' : '17:00'));
+  const otStartStr = String(shiftRow?.ot_start_time || outLatestStr);
+  const otEndStr = String(shiftRow?.ot_end_time || (shiftPeriod === 'Morning' ? '14:00' : shiftPeriod === 'Night' ? '07:00' : '19:00'));
 
   const morningIn = String(b.morning_check_in || '');
   const morningOut = String(b.morning_check_out || '');
@@ -8237,61 +9544,75 @@ function resolveAttendancePayload(b: Record<string, unknown>, tid: number) {
     absenceHours = absenceHours >= 0 ? absenceHours : Number(schedNetHours.toFixed(2));
     if (otHours < 0) otHours = 0;
   } else if (shiftPeriod === 'Morning' && !(afternoonIn || afternoonOut)) {
-    // Morning Ethiopian Window: In 1:45-2:00 (07:45-08:00), Out 5:58-6:30 (11:58-12:30)
+    // Morning Ethiopian Window: In 1:45-2:00 (07:45-08:00), Out 5:58-6:30 (11:58-12:30), Morning OT after 12:30 (or evening 17:00-19:00)
     const mIn = timeToMinutes(morningIn || firstPunchIn);
-    const mOut = lastPunchOut ? timeToMinutes(morningOut || lastPunchOut) : 12 * 60;
+    const mOut = lastPunchOut ? timeToMinutes(morningOut || lastPunchOut) : timeToMinutes(scheduledEnd);
+    const mStartLatest = timeToMinutes(inLatestStr);
+    const mStartEarliest = timeToMinutes(inEarliestStr);
+    const mOutLatest = timeToMinutes(outLatestStr); // 12:30
+    const mOtStart = timeToMinutes(otStartStr); // 12:30
+    const mOtEnd = timeToMinutes(otEndStr); // 14:00
+    const mNominalEnd = Math.max(12 * 60, timeToMinutes(outEarliestStr) + 2); // 12:00
     if (lateMinutes < 0) {
-      const diffIn = mIn - 8 * 60;
+      const diffIn = mIn - mStartLatest;
       lateMinutes = diffIn > lateGrace ? diffIn : 0;
     }
     if (earlyDepartureMinutes < 0) {
       if (!lastPunchOut) {
         earlyDepartureMinutes = 0;
       } else {
-        const endGap = 12 * 60 - mOut;
-        earlyDepartureMinutes = endGap > 2 ? endGap : 0;
+        const endGap = mNominalEnd - mOut;
+        earlyDepartureMinutes = endGap > earlyGrace ? endGap : 0;
       }
     }
     if (regularHours < 0) {
       if (!lastPunchOut) {
         regularHours = 0;
       } else {
-        const workedHrs = Math.max(0, (mOut - Math.max(mIn, 7 * 60 + 45)) / 60);
-        regularHours = Number(Math.min(4, workedHrs).toFixed(2));
+        const workedHrs = Math.max(0, (Math.min(mOut, mOutLatest) - Math.max(mIn, mStartEarliest)) / 60);
+        regularHours = Number(Math.min(4.5, workedHrs).toFixed(2));
       }
     }
     if (absenceHours < 0) {
       absenceHours = Number(((lateMinutes + earlyDepartureMinutes) / 60).toFixed(2));
     }
     if (otHours < 0) {
-      // Afternoon OT starts at 17:10-19:00 (11:10-1:00 PM Ethiopian) if morning staff stayed continuously into evening OT
       if (lastPunchOut && mOut >= 17 * 60 + 10) {
-        otHours = Number(((Math.min(mOut, 19 * 60) - (17 * 60 + 10)) / 60).toFixed(2));
+        // Morning worker worked straight through to evening OT (17:00-19:00 EAT)
+        otHours = Number(((Math.min(mOut, 19 * 60) - 17 * 60) / 60).toFixed(2));
+      } else if (lastPunchOut && mOut > mOtStart) {
+        // Morning OT after 6:30 Ethiopian (12:30 EAT) up to otEndStr (14:00 EAT)
+        otHours = Number(((Math.min(mOut, mOtEnd) - mOtStart) / 60).toFixed(2));
       } else {
         otHours = 0;
       }
     }
   } else if (shiftPeriod === 'Afternoon' && !(morningIn || morningOut)) {
-    // Afternoon Ethiopian Window: In 6:50-7:00 (12:50-13:00), Out 10:58-11:00 (16:58-17:00), OT 11:10-1:00 PM (17:10-19:00)
+    // Afternoon Ethiopian Window: In 6:50-7:00 (12:50-13:00), Out 10:58-11:00 (16:58-17:00), OT 11:00-1:00 PM (17:00-19:00; 11:10 counts 10m = 0.17h OT)
     const aIn = timeToMinutes(afternoonIn || firstPunchIn);
-    const aOut = lastPunchOut ? timeToMinutes(afternoonOut || lastPunchOut) : 17 * 60;
+    const aOut = lastPunchOut ? timeToMinutes(afternoonOut || lastPunchOut) : timeToMinutes(outLatestStr);
+    const aStartEarliest = timeToMinutes(inEarliestStr); // 12:50
+    const aStartLatest = timeToMinutes(inLatestStr); // 13:00
+    const aOutLatest = timeToMinutes(outLatestStr); // 17:00
+    const aOtStart = timeToMinutes(otStartStr); // 17:00
+    const aOtEnd = timeToMinutes(otEndStr); // 19:00
     if (lateMinutes < 0) {
-      const diffIn = aIn - 13 * 60;
+      const diffIn = aIn - aStartLatest;
       lateMinutes = diffIn > lateGrace ? diffIn : 0;
     }
     if (earlyDepartureMinutes < 0) {
       if (!lastPunchOut) {
         earlyDepartureMinutes = 0;
       } else {
-        const endGap = 17 * 60 - aOut;
-        earlyDepartureMinutes = endGap > 2 ? endGap : 0;
+        const endGap = aOutLatest - aOut;
+        earlyDepartureMinutes = endGap > earlyGrace ? endGap : 0;
       }
     }
     if (regularHours < 0) {
       if (!lastPunchOut) {
         regularHours = 0;
       } else {
-        const workedHrs = Math.max(0, (Math.min(aOut, 17 * 60) - Math.max(aIn, 12 * 60 + 50)) / 60);
+        const workedHrs = Math.max(0, (Math.min(aOut, aOutLatest) - Math.max(aIn, aStartEarliest)) / 60);
         regularHours = Number(Math.min(4, workedHrs).toFixed(2));
       }
     }
@@ -8299,14 +9620,14 @@ function resolveAttendancePayload(b: Record<string, unknown>, tid: number) {
       absenceHours = Number(((lateMinutes + earlyDepartureMinutes) / 60).toFixed(2));
     }
     if (otHours < 0) {
-      if (lastPunchOut && aOut >= 17 * 60 + 10) {
-        otHours = Number(((Math.min(aOut, 19 * 60) - (17 * 60 + 10)) / 60).toFixed(2));
+      if (lastPunchOut && aOut > aOtStart) {
+        otHours = Number(((Math.min(aOut, aOtEnd) - aOtStart) / 60).toFixed(2));
       } else {
         otHours = 0;
       }
     }
   } else if (shiftPeriod === 'Day' || ((morningIn || morningOut) && (afternoonIn || afternoonOut))) {
-    // Full Day Shift (Morning 07:45-08:00 In / 11:58-12:30 Out + Afternoon 12:50-13:00 In / 16:58-17:00 Out + OT 17:10-19:00)
+    // Full Day Shift (Morning 07:45-08:00 In / 11:58-12:30 Out + Afternoon 12:50-13:00 In / 16:58-17:00 Out + OT 17:00-19:00)
     const hasSplit = Boolean(morningIn && afternoonIn);
     let mLate = 0;
     let mEarly = 0;
@@ -8316,35 +9637,37 @@ function resolveAttendancePayload(b: Record<string, unknown>, tid: number) {
     let aHrs = 0;
     const finalOutStr = afternoonOut || lastPunchOut;
     const finalOutMin = finalOutStr ? timeToMinutes(finalOutStr) : 0;
+    const dOtStart = timeToMinutes(otStartStr || '17:00');
+    const dOtEnd = timeToMinutes(otEndStr || '19:00');
 
     if (hasSplit) {
       const mIn = timeToMinutes(morningIn);
       const mOut = morningOut ? timeToMinutes(morningOut) : 12 * 60;
       mLate = mIn - 8 * 60 > lateGrace ? mIn - 8 * 60 : 0;
-      mEarly = morningOut && 12 * 60 - mOut > 2 ? 12 * 60 - mOut : 0;
-      mHrs = morningOut ? Math.min(4, Math.max(0, (Math.min(mOut, 12 * 60 + 30) - Math.max(mIn, 7 * 60 + 45)) / 60)) : 0;
+      mEarly = morningOut && 12 * 60 - mOut > earlyGrace ? 12 * 60 - mOut : 0;
+      mHrs = morningOut ? Math.min(4.5, Math.max(0, (Math.min(mOut, 12 * 60 + 30) - Math.max(mIn, 7 * 60 + 45)) / 60)) : 0;
 
       const aIn = timeToMinutes(afternoonIn);
       const aOut = finalOutStr ? timeToMinutes(finalOutStr) : 17 * 60;
       aLate = aIn - 13 * 60 > lateGrace ? aIn - 13 * 60 : 0;
-      aEarly = finalOutStr && 17 * 60 - aOut > 2 ? 17 * 60 - aOut : 0;
+      aEarly = finalOutStr && 17 * 60 - aOut > earlyGrace ? 17 * 60 - aOut : 0;
       aHrs = finalOutStr ? Math.min(4, Math.max(0, (Math.min(aOut, 17 * 60) - Math.max(aIn, 12 * 60 + 50)) / 60)) : 0;
     } else {
       const inMin = timeToMinutes(firstPunchIn);
       const outMin = finalOutStr ? timeToMinutes(finalOutStr) : 17 * 60;
       mLate = inMin - 8 * 60 > lateGrace ? inMin - 8 * 60 : 0;
-      aEarly = finalOutStr && 17 * 60 - outMin > 2 ? 17 * 60 - outMin : 0;
+      aEarly = finalOutStr && 17 * 60 - outMin > earlyGrace ? 17 * 60 - outMin : 0;
       const net = finalOutStr ? Math.max(0, (Math.min(outMin, 17 * 60) - Math.max(inMin, 7 * 60 + 45) - breakMinutes) / 60) : 0;
       mHrs = Math.min(8, net);
     }
 
     if (lateMinutes < 0) lateMinutes = mLate + aLate;
     if (earlyDepartureMinutes < 0) earlyDepartureMinutes = mEarly + aEarly;
-    if (regularHours < 0) regularHours = Number(Math.min(8, mHrs + aHrs).toFixed(2));
+    if (regularHours < 0) regularHours = Number(Math.min(8.5, mHrs + aHrs).toFixed(2));
     if (absenceHours < 0) absenceHours = Number(((lateMinutes + earlyDepartureMinutes) / 60).toFixed(2));
     if (otHours < 0) {
-      if (finalOutStr && finalOutMin >= 17 * 60 + 10) {
-        otHours = Number(((Math.min(finalOutMin, 19 * 60) - (17 * 60 + 10)) / 60).toFixed(2));
+      if (finalOutStr && finalOutMin > dOtStart) {
+        otHours = Number(((Math.min(finalOutMin, dOtEnd) - dOtStart) / 60).toFixed(2));
       } else {
         otHours = 0;
       }
@@ -8357,33 +9680,44 @@ function resolveAttendancePayload(b: Record<string, unknown>, tid: number) {
     let outRel = rawOut <= 12 * 60 ? rawOut + 1440 : rawOut;
     if (lastPunchOut && outRel <= inRel) outRel += 1440;
 
+    const nStartEarliest = timeToMinutes(inEarliestStr); // 18:50
+    const nStartLatest = timeToMinutes(inLatestStr); // 19:00
+    const rawNominalOut = timeToMinutes(outLatestStr); // 02:10
+    const nOutMax = rawNominalOut < 12 * 60 ? rawNominalOut + 1440 : rawNominalOut; // 26:10
+    const nOutMin = timeToMinutes(outEarliestStr) < 12 * 60 ? timeToMinutes(outEarliestStr) + 1440 : timeToMinutes(outEarliestStr); // 25:58
+    const nOtStartRaw = timeToMinutes(otStartStr);
+    const nOtStartRel = nOtStartRaw <= 12 * 60 ? nOtStartRaw + 1440 : nOtStartRaw; // 26:10
+    const nOtEndRaw = timeToMinutes(otEndStr);
+    const nOtEndRel = nOtEndRaw <= 12 * 60 ? nOtEndRaw + 1440 : nOtEndRaw; // 31:00 (07:00 EAT)
+
     if (lateMinutes < 0) {
-      const diffIn = inRel - 19 * 60;
+      const diffIn = inRel - nStartLatest;
       lateMinutes = diffIn > lateGrace ? diffIn : 0;
     }
     if (earlyDepartureMinutes < 0) {
       if (!lastPunchOut) {
         earlyDepartureMinutes = 0;
       } else {
-        const endGap = 26 * 60 - outRel;
-        earlyDepartureMinutes = endGap > 2 ? endGap : 0;
+        const nominalMid = nOutMin + 2; // 02:00 EAT (26:00)
+        const endGap = nominalMid - outRel;
+        earlyDepartureMinutes = endGap > earlyGrace ? endGap : 0;
       }
     }
     if (regularHours < 0) {
       if (!lastPunchOut) {
         regularHours = 0;
       } else {
-        const regEnd = Math.min(outRel, 26 * 60 + 10);
-        const workedHrs = Math.max(0, (regEnd - Math.max(inRel, 18 * 60 + 50)) / 60);
-        regularHours = Number(Math.min(7, workedHrs).toFixed(2));
+        const regEnd = Math.min(outRel, nOutMax);
+        const workedHrs = Math.max(0, (regEnd - Math.max(inRel, nStartEarliest)) / 60);
+        regularHours = Number(Math.min(7.35, workedHrs).toFixed(2));
       }
     }
     if (absenceHours < 0) {
       absenceHours = Number(((lateMinutes + earlyDepartureMinutes) / 60).toFixed(2));
     }
     if (otHours < 0) {
-      if (lastPunchOut && outRel > 26 * 60 + 10) {
-        otHours = Number(((Math.min(outRel, 31 * 60) - (26 * 60 + 10)) / 60).toFixed(2));
+      if (lastPunchOut && outRel > nOtStartRel) {
+        otHours = Number(((Math.min(outRel, nOtEndRel) - nOtStartRel) / 60).toFixed(2));
       } else {
         otHours = 0;
       }
@@ -8425,6 +9759,13 @@ function resolveAttendancePayload(b: Record<string, unknown>, tid: number) {
   }
   const { mult, pay } = computeAttOt(otType, otHours, hourlyRate, tid);
 
+  const requireOtApproval = Number(shiftRow?.require_ot_approval ?? 1) === 1;
+  const otApprovalStatus = b.ot_approval_status
+    ? String(b.ot_approval_status)
+    : otHours > 0 && requireOtApproval
+    ? 'Pending'
+    : 'Approved';
+
   let derivedStatus = String(b.status || '');
   if (!derivedStatus || derivedStatus === 'Auto') {
     if (lateMinutes > 0 && earlyDepartureMinutes > 0) derivedStatus = 'Late & Early';
@@ -8462,6 +9803,7 @@ function resolveAttendancePayload(b: Record<string, unknown>, tid: number) {
     otHours,
     mult,
     pay,
+    otApprovalStatus,
     derivedStatus,
     notes: String(b.notes || ''),
   };
@@ -8469,7 +9811,7 @@ function resolveAttendancePayload(b: Record<string, unknown>, tid: number) {
 
 app.get('/api/attendance', (req: AuthedRequest, res) => {
   const tid = getTenantId(req);
-  const { from, to, department, shift_period } = req.query;
+  const { from, to, department, shift_period, ot_approval_status } = req.query;
   const where: string[] = ['tenant_id = ?'];
   const params: unknown[] = [tid];
   const authUser = req.authUser;
@@ -8493,7 +9835,252 @@ app.get('/api/attendance', (req: AuthedRequest, res) => {
     where.push('shift_period = ?');
     params.push(String(shift_period));
   }
+  if (ot_approval_status && ot_approval_status !== 'All') {
+    where.push("COALESCE(ot_approval_status, 'Approved') = ?");
+    params.push(String(ot_approval_status));
+  }
   res.json(db.prepare(`SELECT * FROM attendance_records WHERE ${where.join(' AND ')} ORDER BY attendance_date DESC, id DESC`).all(...params));
+});
+
+app.get('/api/attendance/live-dashboard', (req, res) => {
+  const tid = getTenantId(req);
+  const targetDate = String(req.query.date || eatToday()).slice(0, 10);
+  const totalEmployees = (db.prepare("SELECT COUNT(*) as c FROM employees WHERE tenant_id = ? AND status = 'Active'").get(tid) as { c: number }).c;
+  const todayRecords = db
+    .prepare('SELECT * FROM attendance_records WHERE tenant_id = ? AND attendance_date = ? ORDER BY updated_at DESC, id DESC')
+    .all(tid, targetDate) as Array<Record<string, unknown>>;
+
+  const presentEmpSet = new Set<string>();
+  const lateEmpSet = new Set<string>();
+  const absentEmpSet = new Set<string>();
+  let checkedInCount = 0;
+  let checkedOutCount = 0;
+  let pendingOtApprovals = 0;
+  let firstCheckIn = '';
+  let lastCheckOut = '';
+
+  for (const r of todayRecords) {
+    const emp = String(r.employee_code || '');
+    const st = String(r.status || '');
+    const ci = String(r.check_in || '').trim();
+    const co = String(r.check_out || '').trim();
+    if (st === 'Absent') {
+      absentEmpSet.add(emp);
+    } else if (st !== 'On Leave') {
+      presentEmpSet.add(emp);
+    }
+    if (Number(r.late_minutes || 0) > 0 || st === 'Late' || st === 'Late & Early') {
+      lateEmpSet.add(emp);
+    }
+    if (ci && ci !== '--:--') {
+      checkedInCount += 1;
+      if (!firstCheckIn || ci < firstCheckIn) firstCheckIn = ci;
+    }
+    if (co && co !== '--:--') {
+      checkedOutCount += 1;
+      if (!lastCheckOut || co > lastCheckOut) lastCheckOut = co;
+    }
+    if (Number(r.ot_hours || 0) > 0 && String(r.ot_approval_status || '') === 'Pending') {
+      pendingOtApprovals += 1;
+    }
+  }
+
+  const presentToday = presentEmpSet.size;
+  const absentToday = Math.max(0, totalEmployees - presentToday);
+  const totalRecordsToday = todayRecords.length;
+
+  const k40Devices = db
+    .prepare(
+      "SELECT id, device_name, model, serial_number, ip_address, port, status, auto_sync_enabled, sync_interval_sec, read_only_mode, last_sync_at, last_error, total_imported_count FROM devices WHERE tenant_id = ? AND (device_type LIKE '%Biometric%' OR protocol LIKE '%ZKTeco%' OR port = 4370) ORDER BY id ASC"
+    )
+    .all(tid) as Array<Record<string, unknown>>;
+
+  const connectedDevices = k40Devices.filter((d) => String(d.status) === 'Connected').length;
+  const latestSyncAt = k40Devices
+    .map((d) => String(d.last_sync_at || ''))
+    .filter(Boolean)
+    .sort()
+    .pop() || '';
+  const pendingUnmatchedCount = (db.prepare("SELECT COUNT(*) as c FROM unmatched_device_users WHERE tenant_id = ? AND status = 'Pending'").get(tid) as { c: number }).c;
+
+  res.json({
+    date: targetDate,
+    timezone: 'Africa/Addis_Ababa',
+    total_employees: totalEmployees,
+    present_today: presentToday,
+    absent_today: absentToday,
+    late_today: lateEmpSet.size,
+    checked_in_count: checkedInCount,
+    checked_out_count: checkedOutCount,
+    pending_ot_approvals: pendingOtApprovals,
+    first_check_in: firstCheckIn || '--:--',
+    last_check_out: lastCheckOut || '--:--',
+    total_records_today: totalRecordsToday,
+    k40_devices: k40Devices,
+    k40_connected_count: connectedDevices,
+    k40_total_count: k40Devices.length,
+    k40_status: connectedDevices > 0 ? 'Online' : k40Devices.length > 0 ? 'Offline' : 'Not Configured',
+    last_sync_at: latestSyncAt,
+    pending_unmatched_count: pendingUnmatchedCount,
+    recent_records: todayRecords.slice(0, 50),
+  });
+});
+
+app.get('/api/attendance/reports', (req: AuthedRequest, res) => {
+  const tid = getTenantId(req);
+  const from = String(req.query.from || eatToday().slice(0, 8) + '01');
+  const to = String(req.query.to || eatToday());
+  const department = String(req.query.department || 'All');
+  const shiftPeriod = String(req.query.shift_period || 'All');
+  const status = String(req.query.status || 'All');
+
+  const where: string[] = ['tenant_id = ?', 'attendance_date >= ?', 'attendance_date <= ?'];
+  const params: unknown[] = [tid, from, to];
+  const authUser = req.authUser;
+  if (authUser && (authUser.role === 'Employee' || authUser.role === 'Viewer') && !getRoleActionPerms(tid, authUser.role).manage) {
+    where.push('employee_code = ?');
+    params.push(authUser.employee_code);
+  }
+  if (department && department !== 'All') {
+    where.push('department = ?');
+    params.push(department);
+  }
+  if (shiftPeriod && shiftPeriod !== 'All') {
+    where.push('shift_period = ?');
+    params.push(shiftPeriod);
+  }
+  if (status && status !== 'All') {
+    where.push('status = ?');
+    params.push(status);
+  }
+
+  const rows = db
+    .prepare(`SELECT * FROM attendance_records WHERE ${where.join(' AND ')} ORDER BY attendance_date DESC, employee_name ASC`)
+    .all(...params) as Array<Record<string, unknown>>;
+
+  let totalRegularHours = 0;
+  let totalLateMinutes = 0;
+  let totalOtHours = 0;
+  let approvedOtHours = 0;
+  let approvedOtPay = 0;
+  let lateCount = 0;
+  let absentCount = 0;
+
+  for (const r of rows) {
+    totalRegularHours += Number(r.regular_hours || 0);
+    totalLateMinutes += Number(r.late_minutes || 0);
+    const oh = Number(r.ot_hours || 0);
+    totalOtHours += oh;
+    if (String(r.ot_approval_status || 'Approved') === 'Approved') {
+      approvedOtHours += oh;
+      approvedOtPay += Number(r.ot_pay || 0);
+    }
+    if (Number(r.late_minutes || 0) > 0 || String(r.status || '').includes('Late')) lateCount += 1;
+    if (String(r.status || '') === 'Absent') absentCount += 1;
+  }
+
+  res.json({
+    from,
+    to,
+    total_records: rows.length,
+    total_regular_hours: Number(totalRegularHours.toFixed(2)),
+    total_late_minutes: totalLateMinutes,
+    late_count: lateCount,
+    absent_count: absentCount,
+    total_ot_hours: Number(totalOtHours.toFixed(2)),
+    approved_ot_hours: Number(approvedOtHours.toFixed(2)),
+    approved_ot_pay: Number(approvedOtPay.toFixed(2)),
+    records: rows,
+  });
+});
+
+app.get('/api/attendance/:id/audit', (req, res) => {
+  const tid = getTenantId(req);
+  const id = Number(req.params.id);
+  const rows = db
+    .prepare('SELECT *, attendance_id AS attendance_record_id FROM attendance_audit_logs WHERE tenant_id = ? AND attendance_id = ? ORDER BY id DESC LIMIT 100')
+    .all(tid, id);
+  res.json(rows);
+});
+
+app.patch('/api/attendance/:id/overtime-approval', (req, res) => {
+  if (!requireRole(req, res, ATTENDANCE_MANAGER_ROLES, 'approving/adjusting attendance overtime')) return;
+  const tid = getTenantId(req);
+  const id = Number(req.params.id);
+  const existing = db.prepare('SELECT * FROM attendance_records WHERE id = ? AND tenant_id = ?').get(id, tid) as Record<string, unknown> | undefined;
+  if (!existing) {
+    res.status(404).json({ error: 'Attendance record not found.' });
+    return;
+  }
+
+  const b = (req.body || {}) as Record<string, unknown>;
+  const decision = String(b.decision || 'Approved').trim();
+  const reason = String(b.reason || '').trim();
+  if (!['Approved', 'Rejected', 'Adjusted'].includes(decision)) {
+    res.status(400).json({ error: 'Decision must be Approved, Rejected, or Adjusted.' });
+    return;
+  }
+  if (!reason) {
+    res.status(400).json({ error: 'Mandatory audit reason is required for overtime approval/adjustment.' });
+    return;
+  }
+
+  const prevHours = Number(existing.ot_hours || 0);
+  const prevStatus = String(existing.ot_approval_status || 'Approved');
+  let newHours = prevHours;
+  if (decision === 'Rejected') {
+    newHours = 0;
+  } else if (decision === 'Adjusted' || b.adjusted_ot_hours !== undefined) {
+    newHours = Math.max(0, Number(b.adjusted_ot_hours ?? prevHours));
+  }
+
+  const finalApprovalStatus = decision === 'Rejected' ? 'Rejected' : 'Approved';
+  const otType = String(existing.ot_type || 'Regular') === 'None' && newHours > 0 ? 'Regular' : String(existing.ot_type || 'Regular');
+  const hourlyRate = Number(existing.hourly_rate || 100);
+  const { mult, pay } = computeAttOt(otType, newHours, hourlyRate, tid);
+  const actor = getActorName(req);
+  const actorRole = getActorRole(req) || 'Manager';
+  const now = new Date().toISOString();
+
+  db.prepare(
+    `UPDATE attendance_records SET
+      ot_type=?, ot_hours=?, ot_multiplier=?, ot_pay=?,
+      ot_approval_status=?, ot_approved_by=?, ot_approved_at=?, ot_adjustment_reason=?,
+      updated_by=?, updated_at=?
+     WHERE id = ? AND tenant_id = ?`
+  ).run(
+    newHours > 0 ? otType : 'None',
+    newHours,
+    mult,
+    pay,
+    finalApprovalStatus,
+    actor,
+    now,
+    reason,
+    actor,
+    now,
+    id,
+    tid
+  );
+
+  db.prepare(
+    `INSERT INTO attendance_audit_logs (
+      tenant_id, attendance_id, employee_code, action, actor_name, actor_role,
+      previous_ot_hours, new_ot_hours, previous_status, new_status, reason, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(tid, id, String(existing.employee_code || ''), `OT_${decision.toUpperCase()}`, actor, actorRole, prevHours, newHours, prevStatus, finalApprovalStatus, reason, now);
+
+  logAudit(
+    req,
+    'OT_APPROVAL',
+    'Attendance',
+    `${decision} OT for ${existing.employee_name} (${existing.attendance_date}): ${prevHours}h -> ${newHours}h (${reason})`,
+    tid
+  );
+
+  const updated = db.prepare('SELECT * FROM attendance_records WHERE id = ? AND tenant_id = ?').get(id, tid);
+  broadcastWs('attendance:updated', updated);
+  res.json(updated);
 });
 
 app.post('/api/attendance', (req, res) => {
@@ -8510,8 +10097,9 @@ app.post('/api/attendance', (req, res) => {
       check_in, check_out, morning_check_in, morning_check_out, afternoon_check_in, afternoon_check_out,
       night_check_in, night_check_out, scheduled_start, scheduled_end, hourly_rate, regular_hours,
       late_minutes, early_departure_minutes, break_minutes, absence_hours,
-      ot_type, ot_hours, ot_multiplier, ot_pay, status, register_state, notes, updated_by, updated_at, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Open', ?, ?, ?, ?)
+      ot_type, ot_hours, ot_multiplier, ot_pay, ot_approval_status,
+      verification_method, sync_status, status, register_state, notes, updated_by, updated_at, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Manual', ?, 'Open', ?, ?, ?, ?)
   `
     )
     .run(
@@ -8543,6 +10131,8 @@ app.post('/api/attendance', (req, res) => {
       r.otHours,
       r.mult,
       r.pay,
+      r.otApprovalStatus,
+      String(b.verification_method || 'Manual'),
       r.derivedStatus,
       r.notes,
       actor,
@@ -8559,7 +10149,9 @@ app.post('/api/attendance', (req, res) => {
       module: 'attendance',
     });
   }
-  res.status(201).json(db.prepare('SELECT * FROM attendance_records WHERE id = ?').get(info.lastInsertRowid));
+  const created = db.prepare('SELECT * FROM attendance_records WHERE id = ?').get(info.lastInsertRowid);
+  broadcastWs('attendance:created', created);
+  res.status(201).json(created);
 });
 
 app.put('/api/attendance/:id', (req, res) => {
@@ -8580,6 +10172,8 @@ app.put('/api/attendance/:id', (req, res) => {
   const b = (req.body || {}) as Record<string, unknown>;
   const now = new Date().toISOString();
   const actor = getActorName(req);
+  const actorRole = getActorRole(req) || 'Manager';
+  // Preserve immutable raw machine_timestamp; record manual edit audit entry
   const r = resolveAttendancePayload(b, tid);
   db.prepare(
     `
@@ -8588,7 +10182,7 @@ app.put('/api/attendance/:id', (req, res) => {
       check_in=?, check_out=?, morning_check_in=?, morning_check_out=?, afternoon_check_in=?, afternoon_check_out=?,
       night_check_in=?, night_check_out=?, scheduled_start=?, scheduled_end=?, hourly_rate=?, regular_hours=?,
       late_minutes=?, early_departure_minutes=?, break_minutes=?, absence_hours=?,
-      ot_type=?, ot_hours=?, ot_multiplier=?, ot_pay=?, status=?, notes=?, updated_by=?, updated_at=?
+      ot_type=?, ot_hours=?, ot_multiplier=?, ot_pay=?, ot_approval_status=?, status=?, notes=?, updated_by=?, updated_at=?
     WHERE id = ? AND tenant_id = ?
   `
   ).run(
@@ -8619,6 +10213,7 @@ app.put('/api/attendance/:id', (req, res) => {
     r.otHours,
     r.mult,
     r.pay,
+    r.otApprovalStatus,
     r.derivedStatus,
     r.notes,
     actor,
@@ -8626,8 +10221,28 @@ app.put('/api/attendance/:id', (req, res) => {
     id,
     tid
   );
+  db.prepare(
+    `INSERT INTO attendance_audit_logs (
+      tenant_id, attendance_id, employee_code, action, actor_name, actor_role,
+      previous_ot_hours, new_ot_hours, previous_status, new_status, reason, created_at
+    ) VALUES (?, ?, ?, 'MANUAL_CORRECTION', ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    tid,
+    id,
+    r.empCode,
+    actor,
+    actorRole,
+    Number(existing.ot_hours || 0),
+    r.otHours,
+    String(existing.status || ''),
+    r.derivedStatus,
+    String(b.adjustment_reason || b.notes || 'Supervisor attendance correction (machine_timestamp preserved)'),
+    now
+  );
   logAudit(req, 'UPDATE', 'Attendance', `Corrected attendance #${id} for ${r.employeeName} (${r.attendanceDate}) -> ${r.derivedStatus}`, tid);
-  res.json(db.prepare('SELECT * FROM attendance_records WHERE id = ? AND tenant_id = ?').get(id, tid));
+  const updated = db.prepare('SELECT * FROM attendance_records WHERE id = ? AND tenant_id = ?').get(id, tid);
+  broadcastWs('attendance:updated', updated);
+  res.json(updated);
 });
 
 app.post('/api/attendance/import', (req, res) => {
@@ -8642,8 +10257,8 @@ app.post('/api/attendance/import', (req, res) => {
       check_in, check_out, morning_check_in, morning_check_out, afternoon_check_in, afternoon_check_out,
       night_check_in, night_check_out, scheduled_start, scheduled_end, hourly_rate, regular_hours,
       late_minutes, early_departure_minutes, break_minutes, absence_hours,
-      ot_type, ot_hours, ot_multiplier, ot_pay, status, register_state, notes, updated_by, updated_at, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Open', ?, ?, ?, ?)
+      ot_type, ot_hours, ot_multiplier, ot_pay, ot_approval_status, verification_method, sync_status, status, register_state, notes, updated_by, updated_at, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Import', 'Synced', ?, 'Open', ?, ?, ?, ?)
   `);
   let exceptionCount = 0;
   for (const row of rows) {
@@ -8680,6 +10295,7 @@ app.post('/api/attendance/import', (req, res) => {
       r.otHours,
       r.mult,
       r.pay,
+      r.otApprovalStatus,
       r.derivedStatus,
       r.notes,
       actor,
@@ -8768,9 +10384,11 @@ app.post('/api/shifts', (req, res) => {
       `
     INSERT INTO shifts (
       tenant_id, shift_code, shift_name, shift_category, scheduling_system, start_time, end_time,
+      in_earliest, in_latest, out_earliest, out_latest, ot_start_time, ot_end_time,
+      require_ot_approval, assigned_department, is_enabled,
       break_minutes, working_days, rest_days, min_rest_hours, is_rotating, rotation_pattern,
       color_hex, ot_multiplier, grace_late_minutes, status, notes, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `
     )
     .run(
@@ -8781,6 +10399,15 @@ app.post('/api/shifts', (req, res) => {
       b.scheduling_system || '3-Shift',
       b.start_time || '08:00',
       b.end_time || '17:00',
+      b.in_earliest || b.start_time || '07:45',
+      b.in_latest || b.start_time || '08:00',
+      b.out_earliest || b.end_time || '16:58',
+      b.out_latest || b.end_time || '17:00',
+      b.ot_start_time || b.out_latest || b.end_time || '17:00',
+      b.ot_end_time || '19:00',
+      b.require_ot_approval === false || Number(b.require_ot_approval) === 0 ? 0 : 1,
+      String(b.assigned_department || ''),
+      b.is_enabled === false || Number(b.is_enabled) === 0 ? 0 : 1,
       Number(b.break_minutes ?? 30),
       typeof b.working_days === 'string' ? b.working_days : JSON.stringify(b.working_days || ['Mon', 'Tue', 'Wed', 'Thu', 'Fri']),
       typeof b.rest_days === 'string' ? b.rest_days : JSON.stringify(b.rest_days || ['Sat', 'Sun']),
@@ -8805,10 +10432,13 @@ app.put('/api/shifts/:id', (req, res) => {
   const id = Number(req.params.id);
   const b = req.body || {};
   const now = new Date().toISOString();
+  // Note: Updating a shift template strictly configures future attendance evaluation without altering historical records.
   db.prepare(
     `
     UPDATE shifts SET
       shift_code=?, shift_name=?, shift_category=?, scheduling_system=?, start_time=?, end_time=?,
+      in_earliest=?, in_latest=?, out_earliest=?, out_latest=?, ot_start_time=?, ot_end_time=?,
+      require_ot_approval=?, assigned_department=?, is_enabled=?,
       break_minutes=?, working_days=?, rest_days=?, min_rest_hours=?, is_rotating=?, rotation_pattern=?,
       color_hex=?, ot_multiplier=?, grace_late_minutes=?, status=?, notes=?, updated_at=?
     WHERE id = ? AND tenant_id = ?
@@ -8820,6 +10450,15 @@ app.put('/api/shifts/:id', (req, res) => {
     b.scheduling_system || '3-Shift',
     b.start_time,
     b.end_time,
+    b.in_earliest || b.start_time,
+    b.in_latest || b.start_time,
+    b.out_earliest || b.end_time,
+    b.out_latest || b.end_time,
+    b.ot_start_time || b.out_latest || b.end_time,
+    b.ot_end_time || '19:00',
+    b.require_ot_approval === false || Number(b.require_ot_approval) === 0 ? 0 : 1,
+    String(b.assigned_department || ''),
+    b.is_enabled === false || Number(b.is_enabled) === 0 ? 0 : 1,
     Number(b.break_minutes ?? 30),
     typeof b.working_days === 'string' ? b.working_days : JSON.stringify(b.working_days || []),
     typeof b.rest_days === 'string' ? b.rest_days : JSON.stringify(b.rest_days || []),
@@ -11786,8 +13425,241 @@ app.get('/api/dashboard', (req, res) => {
     salesStageBreakdown,
     recentAuditLogs,
     totalImportedFiles: (db.prepare('SELECT COUNT(*) as c FROM imported_files WHERE tenant_id = ?').get(tid) as { c: number }).c,
-    scheduledShiftsToday: (db.prepare("SELECT COUNT(*) as c FROM staff_schedules WHERE tenant_id = ? AND schedule_date = ? AND approval_status != 'Rejected'").get(tid, new Date().toISOString().slice(0, 10)) as { c: number }).c,
+    scheduledShiftsToday: (db.prepare("SELECT COUNT(*) as c FROM staff_schedules WHERE tenant_id = ? AND schedule_date = ? AND approval_status != 'Rejected'").get(tid, eatToday()) as { c: number }).c,
     lateArrivalsCount: (db.prepare("SELECT COUNT(*) as c FROM attendance_records WHERE tenant_id = ? AND (late_minutes > 0 OR status IN ('Late', 'Late & Early'))").get(tid) as { c: number }).c,
+  });
+});
+
+// ============================================================================
+// MULTILINGUAL TRANSLATION SYSTEM (200+ LANGUAGES & ADMIN TRANSLATION MANAGER)
+// ============================================================================
+app.get('/api/i18n/config', (req: AuthedRequest, res) => {
+  const lang = String(req.query.lang || '').trim();
+  const settings = (db.prepare('SELECT * FROM i18n_settings WHERE id = 1').get() as {
+    default_language?: string;
+    enabled_languages_json?: string;
+    rtl_auto?: number;
+    updated_at?: string;
+  } | undefined) || {
+    default_language: 'en',
+    enabled_languages_json: '[]',
+    rtl_auto: 1,
+    updated_at: new Date().toISOString(),
+  };
+
+  let enabledLanguages: string[] = [];
+  try {
+    enabledLanguages = JSON.parse(settings.enabled_languages_json || '[]');
+  } catch {
+    enabledLanguages = [];
+  }
+
+  const targetLang = lang || req.authUser?.preferred_language || settings.default_language || 'en';
+  const rows = db
+    .prepare('SELECT translation_key, value_text FROM i18n_translations WHERE lang_code = ? AND is_approved = 1')
+    .all(targetLang) as Array<{ translation_key: string; value_text: string }>;
+  const translations: Record<string, string> = {};
+  for (const r of rows) {
+    translations[r.translation_key] = r.value_text;
+  }
+
+  const counts = db
+    .prepare('SELECT lang_code, COUNT(*) as count FROM i18n_translations WHERE is_approved = 1 GROUP BY lang_code')
+    .all() as Array<{ lang_code: string; count: number }>;
+
+  res.json({
+    default_language: settings.default_language || 'en',
+    enabled_languages: enabledLanguages,
+    rtl_auto: Number(settings.rtl_auto ?? 1) === 1,
+    user_preferred_language: req.authUser?.preferred_language || '',
+    requested_language: targetLang,
+    translations,
+    coverage_counts: counts,
+  });
+});
+
+app.post('/api/i18n/user-preference', (req: AuthedRequest, res) => {
+  const user = req.authUser;
+  if (!user) {
+    res.status(401).json({ error: 'Authentication required to persist user language preference.' });
+    return;
+  }
+  const langCode = String(req.body?.lang_code || '').trim().slice(0, 16);
+  if (!langCode || !/^[a-zA-Z0-9_-]{2,16}$/.test(langCode)) {
+    res.status(400).json({ error: 'Invalid language code.' });
+    return;
+  }
+  db.prepare('UPDATE users SET preferred_language = ? WHERE id = ?').run(langCode, user.id);
+  res.json({ ok: true, preferred_language: langCode });
+});
+
+app.get('/api/i18n/admin/translations', (req, res) => {
+  if (!requireRole(req, res, USER_ADMIN_ROLES, 'viewing translation catalog')) return;
+  const lang = String(req.query.lang || '').trim();
+  if (lang) {
+    res.json(db.prepare('SELECT * FROM i18n_translations WHERE lang_code = ? ORDER BY translation_key ASC').all(lang));
+    return;
+  }
+  res.json(db.prepare('SELECT * FROM i18n_translations ORDER BY lang_code ASC, translation_key ASC LIMIT 2000').all());
+});
+
+app.put('/api/i18n/admin/settings', (req, res) => {
+  if (!requireRole(req, res, USER_ADMIN_ROLES, 'updating multilingual settings')) return;
+  const b = (req.body || {}) as Record<string, unknown>;
+  const defaultLanguage = String(b.default_language || 'en').trim().slice(0, 16);
+  const enabledLanguages = Array.isArray(b.enabled_languages) ? b.enabled_languages.map((x) => String(x).trim()).filter(Boolean) : [];
+  const rtlAuto = b.rtl_auto === false || Number(b.rtl_auto) === 0 ? 0 : 1;
+  const now = new Date().toISOString();
+  db.prepare(
+    `INSERT INTO i18n_settings (id, default_language, enabled_languages_json, rtl_auto, updated_at)
+     VALUES (1, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       default_language = excluded.default_language,
+       enabled_languages_json = excluded.enabled_languages_json,
+       rtl_auto = excluded.rtl_auto,
+       updated_at = excluded.updated_at`
+  ).run(defaultLanguage, JSON.stringify(enabledLanguages), rtlAuto, now);
+  logAudit(req, 'UPDATE', 'I18n', `Updated default language=${defaultLanguage}, enabled=${enabledLanguages.length}, rtl_auto=${rtlAuto}`);
+  res.json({ default_language: defaultLanguage, enabled_languages: enabledLanguages, rtl_auto: rtlAuto === 1, updated_at: now });
+});
+
+app.put('/api/i18n/admin/translations', (req, res) => {
+  if (!requireRole(req, res, USER_ADMIN_ROLES, 'editing UI translations')) return;
+  const b = (req.body || {}) as Record<string, unknown>;
+  const langCode = String(b.lang_code || '').trim().slice(0, 16);
+  const key = String(b.translation_key || '').trim().slice(0, 128);
+  const valueText = String(b.value_text || '').trim();
+  const isApproved = b.is_approved === false || Number(b.is_approved) === 0 ? 0 : 1;
+  const source = String(b.source || 'manual').trim();
+  if (!langCode || !key || !valueText) {
+    res.status(400).json({ error: 'lang_code, translation_key, and value_text are required.' });
+    return;
+  }
+  const now = new Date().toISOString();
+  const actor = getActorName(req);
+  db.prepare(
+    `INSERT INTO i18n_translations (lang_code, translation_key, value_text, is_approved, source, updated_by, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(lang_code, translation_key) DO UPDATE SET
+       value_text = excluded.value_text,
+       is_approved = excluded.is_approved,
+       source = excluded.source,
+       updated_by = excluded.updated_by,
+       updated_at = excluded.updated_at`
+  ).run(langCode, key, valueText, isApproved, source, actor, now);
+  logAudit(req, 'UPDATE', 'I18n', `Updated translation [${langCode}] ${key}`);
+  res.json(db.prepare('SELECT * FROM i18n_translations WHERE lang_code = ? AND translation_key = ?').get(langCode, key));
+});
+
+app.post('/api/i18n/admin/import', (req, res) => {
+  if (!requireRole(req, res, USER_ADMIN_ROLES, 'importing JSON language packs')) return;
+  const langCode = String(req.body?.lang_code || '').trim().slice(0, 16);
+  const entries = (req.body?.translations && typeof req.body.translations === 'object' ? req.body.translations : {}) as Record<string, unknown>;
+  if (!langCode || Object.keys(entries).length === 0) {
+    res.status(400).json({ error: 'lang_code and non-empty translations JSON object are required.' });
+    return;
+  }
+  const now = new Date().toISOString();
+  const actor = getActorName(req);
+  const stmt = db.prepare(
+    `INSERT INTO i18n_translations (lang_code, translation_key, value_text, is_approved, source, updated_by, updated_at)
+     VALUES (?, ?, ?, 1, 'json_import', ?, ?)
+     ON CONFLICT(lang_code, translation_key) DO UPDATE SET
+       value_text = excluded.value_text,
+       is_approved = 1,
+       source = 'json_import',
+       updated_by = excluded.updated_by,
+       updated_at = excluded.updated_at`
+  );
+  let count = 0;
+  const tx = db.transaction(() => {
+    for (const [k, v] of Object.entries(entries)) {
+      if (typeof v !== 'string' || !v.trim()) continue;
+      stmt.run(langCode, k.slice(0, 128), v.trim(), actor, now);
+      count += 1;
+    }
+  });
+  tx();
+  logAudit(req, 'IMPORT', 'I18n', `Imported ${count} translation keys for language "${langCode}"`);
+  res.json({ ok: true, lang_code: langCode, imported: count });
+});
+
+app.post('/api/i18n/translate', async (req: AuthedRequest, res) => {
+  const b = (req.body || {}) as Record<string, unknown>;
+  const targetLang = String(b.target_lang || '').trim().slice(0, 16);
+  const targetLangName = String(b.target_lang_name || targetLang).trim().slice(0, 64);
+  const items = (b.keys && typeof b.keys === 'object' ? b.keys : {}) as Record<string, unknown>;
+  if (!targetLang || targetLang === 'en') {
+    res.status(400).json({ error: 'Valid non-English target_lang is required.' });
+    return;
+  }
+
+  // Strictly restrict to static UI dictionary keys (reject large payloads or potential PII)
+  const cleanEntries = Object.entries(items)
+    .filter(([k, v]) => /^[a-z0-9_.-]{2,96}$/i.test(k) && typeof v === 'string' && v.trim().length > 0 && v.trim().length <= 160)
+    .slice(0, 150) as Array<[string, string]>;
+  if (cleanEntries.length === 0) {
+    res.json({ target_lang: targetLang, translations: {}, cached: 0, generated: 0 });
+    return;
+  }
+
+  const result: Record<string, string> = {};
+  const missing: Array<[string, string]> = [];
+  const checkStmt = db.prepare('SELECT value_text FROM i18n_translations WHERE lang_code = ? AND translation_key = ?');
+  for (const [k, enVal] of cleanEntries) {
+    const cached = checkStmt.get(targetLang, k) as { value_text: string } | undefined;
+    if (cached?.value_text) {
+      result[k] = cached.value_text;
+    } else {
+      missing.push([k, enVal]);
+    }
+  }
+
+  let generatedCount = 0;
+  if (missing.length > 0) {
+    const ai = getGeminiClient();
+    if (ai) {
+      try {
+        const promptObj: Record<string, string> = {};
+        for (const [k, v] of missing) promptObj[k] = v;
+        const response = await ai.models.generateContent({
+          model: 'gemini-4-hydrogen',
+          contents: `Translate the following Enterprise Attendance, HR, Biometric Device, and ERP UI labels from English into ${targetLangName} (${targetLang}). Return ONLY a valid JSON object mapping the exact same keys to their natural, concise, professional UI translations. Do not translate placeholder tokens like {name} or {count}. Keep acronyms like ZKTeco K40, EAT, ETB, TCP/IP intact.\n\n${JSON.stringify(promptObj)}`,
+          config: { responseMimeType: 'application/json' },
+        });
+        const rawText = (response.text || '').trim();
+        const parsed = JSON.parse(rawText) as Record<string, unknown>;
+        const now = new Date().toISOString();
+        const insStmt = db.prepare(
+          `INSERT INTO i18n_translations (lang_code, translation_key, value_text, is_approved, source, updated_by, updated_at)
+           VALUES (?, ?, ?, 1, 'ai', ?, ?)
+           ON CONFLICT(lang_code, translation_key) DO UPDATE SET
+             value_text = CASE WHEN i18n_translations.source = 'manual' THEN i18n_translations.value_text ELSE excluded.value_text END,
+             updated_at = excluded.updated_at`
+        );
+        const actor = req.authUser?.full_name || 'System i18n';
+        const tx = db.transaction(() => {
+          for (const [k, v] of Object.entries(parsed)) {
+            if (typeof v === 'string' && v.trim() && promptObj[k]) {
+              result[k] = v.trim();
+              insStmt.run(targetLang, k, v.trim(), actor, now);
+              generatedCount += 1;
+            }
+          }
+        });
+        tx();
+      } catch (err) {
+        console.warn('[i18n Gemini fallback]', err instanceof Error ? err.message : err);
+      }
+    }
+  }
+
+  res.json({
+    target_lang: targetLang,
+    translations: result,
+    cached: cleanEntries.length - missing.length,
+    generated: generatedCount,
+    ai_available: Boolean(getGeminiClient()),
   });
 });
 
@@ -11995,6 +13867,8 @@ async function startServer() {
       res.sendFile(path.join(distDir, 'index.html'));
     });
   }
+
+  startZktecoAutoPoller();
 
   server.listen(PORT, '0.0.0.0', () => {
     console.log(`Seven Sunday ETMS server listening on http://0.0.0.0:${PORT}`);

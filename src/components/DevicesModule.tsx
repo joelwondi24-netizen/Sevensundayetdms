@@ -1,13 +1,16 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Activity,
+  AlertTriangle,
   Cable,
   CheckCircle2,
   Clock,
+  Database,
   Download,
   ExternalLink,
   Fingerprint,
   Loader2,
+  Lock,
   Pencil,
   Play,
   Plus,
@@ -18,6 +21,7 @@ import {
   Save,
   Search,
   Send,
+  Shield,
   ShieldAlert,
   ShieldCheck,
   Square,
@@ -30,14 +34,17 @@ import {
   XCircle,
 } from 'lucide-react';
 import { api, downloadFile, getApiTenantId } from '../api';
+import { useI18n } from '../i18n/I18nProvider';
 import type { WsEventPayload } from '../hooks/useRealtimeWS';
 import type {
   BiometricAuthLogRecord,
   DeviceRecord,
   DeviceScanResult,
+  DeviceSyncLogRecord,
   EmployeeProfile,
   ModuleKey,
   StaffFingerprintRecord,
+  UnmatchedDeviceUserRecord,
   ZkEnrollJobRecord,
   ZkRealtimeListenerStatus,
 } from '../types';
@@ -114,7 +121,10 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
   onNavigate,
   onRefreshDashboard,
 }) => {
-  const [activeTab, setActiveTab] = useState<'connections' | 'zkteco-k40' | 'biometric-logs'>('connections');
+  const { t } = useI18n();
+  const [activeTab, setActiveTab] = useState<
+    'connections' | 'zkteco-k40' | 'biometric-logs' | 'sync-logs' | 'unmatched-pins'
+  >('connections');
   const [devices, setDevices] = useState<DeviceRecord[]>([]);
   const [selectedDeviceId, setSelectedDeviceId] = useState<number | null>(null);
   const [employees, setEmployees] = useState<EmployeeProfile[]>([]);
@@ -127,6 +137,16 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
   const [verifyingScan, setVerifyingScan] = useState(false);
   const [markingLogId, setMarkingLogId] = useState<number | null>(null);
   const [lastLiveEventAt, setLastLiveEventAt] = useState<string | null>(null);
+
+  // Read-Only K40 Sync Logs & Unmatched PINs state
+  const [syncLogs, setSyncLogs] = useState<DeviceSyncLogRecord[]>([]);
+  const [syncLogsLoading, setSyncLogsLoading] = useState(false);
+  const [unmatchedUsers, setUnmatchedUsers] = useState<UnmatchedDeviceUserRecord[]>([]);
+  const [unmatchedLoading, setUnmatchedLoading] = useState(false);
+  const [mapTargetById, setMapTargetById] = useState<Record<number, string>>({});
+  const [mappingId, setMappingId] = useState<number | null>(null);
+  const [testingConnId, setTestingConnId] = useState<number | null>(null);
+  const [syncingNowId, setSyncingNowId] = useState<number | null>(null);
 
   // ZKTeco K40 Enrollment & Scan state
   const [enrollingFinger, setEnrollingFinger] = useState(false);
@@ -207,6 +227,7 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
 
   const emptyForm = {
     device_type: DEVICE_TYPES[0],
+    model: 'ZKTeco K40',
     protocol: PROTOCOL_OPTIONS[0],
     device_name: '',
     ip_address: '',
@@ -216,6 +237,10 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
     gateway: '192.168.10.1',
     serial_number: '',
     api_key: '',
+    comm_password: '',
+    sync_interval_sec: '3',
+    auto_sync_enabled: true,
+    has_comm_password: false,
   };
   const [form, setForm] = useState(emptyForm);
 
@@ -288,6 +313,30 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
     }
   };
 
+  const loadSyncLogs = async () => {
+    try {
+      setSyncLogsLoading(true);
+      const list = await api.get<DeviceSyncLogRecord[]>('/api/devices/zkteco/sync-logs?limit=80');
+      setSyncLogs(list);
+    } catch {
+      // ignore initial sync log fetch error
+    } finally {
+      setSyncLogsLoading(false);
+    }
+  };
+
+  const loadUnmatchedUsers = async () => {
+    try {
+      setUnmatchedLoading(true);
+      const list = await api.get<UnmatchedDeviceUserRecord[]>('/api/devices/zkteco/unmatched');
+      setUnmatchedUsers(list);
+    } catch {
+      // ignore initial unmatched fetch error
+    } finally {
+      setUnmatchedLoading(false);
+    }
+  };
+
   const loadRealtimeListeners = async () => {
     try {
       const list = await api.get<ZkRealtimeListenerStatus[]>('/api/devices/zkteco/realtime/status');
@@ -303,6 +352,8 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
     loadFingerprints();
     loadEmployees();
     loadRealtimeListeners();
+    loadSyncLogs();
+    loadUnmatchedUsers();
   }, []);
 
   // Poll active K40 remote enrollment job while WaitingFinger (shared for inline & modal)
@@ -418,9 +469,24 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
       return;
     }
 
-    if (lastWsEvent.event === 'device:punch' || lastWsEvent.event === 'device:status') {
+    if (lastWsEvent.event === 'zkteco:sync_complete') {
+      loadDevices(true);
+      loadSyncLogs();
+      loadBioLogs();
+      loadUnmatchedUsers();
+      setLastLiveEventAt(new Date().toLocaleTimeString());
+      return;
+    }
+
+    if (lastWsEvent.event === 'zkteco:unmatched_user') {
+      loadUnmatchedUsers();
+      return;
+    }
+
+    if (lastWsEvent.event === 'device:punch' || lastWsEvent.event === 'device:status' || lastWsEvent.event === 'attendance:updated') {
       loadDevices(true);
       loadRealtimeListeners();
+      loadSyncLogs();
     }
   }, [lastWsEvent]);
 
@@ -430,8 +496,25 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
     setNotice(null);
     try {
       const payload = {
-        ...form,
+        device_type: form.device_type,
+        model: form.model || 'ZKTeco K40',
+        protocol: form.protocol,
+        device_name: form.device_name,
+        ip_address: form.ip_address,
         port: Number(form.port) || 4370,
+        endpoint_url: form.endpoint_url,
+        subnet_mask: form.subnet_mask,
+        gateway: form.gateway,
+        serial_number: form.serial_number,
+        api_key: form.api_key,
+        comm_password: form.comm_password.trim()
+          ? form.comm_password.trim()
+          : editingId !== null && form.has_comm_password
+          ? '********'
+          : '',
+        sync_interval_sec: Math.min(60, Math.max(2, Number(form.sync_interval_sec) || 3)),
+        auto_sync_enabled: Boolean(form.auto_sync_enabled),
+        timezone: 'Africa/Addis_Ababa',
       };
       if (editingId !== null) {
         const updated = await api.put<DeviceRecord>(`/api/devices/${editingId}`, payload);
@@ -445,6 +528,7 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
         setForm(emptyForm);
         setNotice(`Registered device connection "${created.device_name}".`);
       }
+      loadRealtimeListeners();
       onRefreshDashboard();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not save device connection');
@@ -689,7 +773,8 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
     setEditingId(null);
     setForm({
       device_type: 'Biometric Fingerprint Terminal',
-      protocol: 'ZKTeco ADMS / iClock Push',
+      model: 'ZKTeco K40',
+      protocol: 'TCP/IP Socket',
       device_name: 'ZKTeco K40 Biometric Terminal',
       ip_address: '192.168.1.201',
       port: '4370',
@@ -698,8 +783,111 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
       gateway: '192.168.1.1',
       serial_number: `ZKT-K40-${Date.now().toString().slice(-4)}`,
       api_key: '',
+      comm_password: '',
+      sync_interval_sec: '3',
+      auto_sync_enabled: true,
+      has_comm_password: false,
     });
-    setNotice('Loaded ZKTeco K40 preset (TCP 4370 + ADMS /iclock/cdata). Enter your K40 LAN IP & Serial Number and click Save.');
+    setNotice('Loaded ZKTeco K40 Read-Only preset (TCP 4370 + ADMS /iclock/cdata · 3s auto-poll). Enter your K40 LAN IP & Serial Number and click Save.');
+  };
+
+  const handleTestK40Connection = async (dev: DeviceRecord) => {
+    setError(null);
+    setNotice(null);
+    setTestingConnId(dev.id);
+    try {
+      const res = await api.post<{ ok: boolean; latencyMs?: number; message?: string; error?: string; device: DeviceRecord }>(
+        `/api/devices/${dev.id}/zkteco/test-connection`
+      );
+      if (res.device) {
+        setDevices((prev) => prev.map((d) => (d.id === dev.id ? res.device : d)));
+      }
+      setNotice(
+        `Connection verified: ${dev.device_name} responded in ${res.latencyMs ?? 0}ms (${res.message || 'ZKTeco TCP 4370 OK'}).`
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : `Connection test failed for ${dev.device_name}`);
+      loadDevices(true);
+    } finally {
+      setTestingConnId(null);
+    }
+  };
+
+  const handleSyncNowK40 = async (dev: DeviceRecord) => {
+    setError(null);
+    setNotice(null);
+    setSyncingNowId(dev.id);
+    try {
+      const res = await api.post<{
+        device: DeviceRecord;
+        ok: boolean;
+        latencyMs: number;
+        message: string;
+        fetched: number;
+        imported: number;
+        skipped_duplicates: number;
+        unmatched: number;
+      }>(`/api/devices/${dev.id}/zkteco/sync-now`);
+      if (res.device) {
+        setDevices((prev) => prev.map((d) => (d.id === dev.id ? res.device : d)));
+      }
+      setNotice(
+        `Read-Only Sync (${dev.device_name}): fetched ${res.fetched}, imported ${res.imported}, duplicates skipped ${res.skipped_duplicates}, unmatched PINs ${res.unmatched} (${res.latencyMs}ms).`
+      );
+      loadSyncLogs();
+      loadUnmatchedUsers();
+      loadBioLogs();
+      onRefreshDashboard();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'ZKTeco K40 Read-Only Sync failed');
+      loadDevices(true);
+      loadSyncLogs();
+    } finally {
+      setSyncingNowId(null);
+    }
+  };
+
+  const handleToggleAutoSync = async (dev: DeviceRecord) => {
+    setError(null);
+    try {
+      const nextEnabled = !Boolean(dev.auto_sync_enabled);
+      const updated = await api.put<DeviceRecord>(`/api/devices/${dev.id}`, {
+        auto_sync_enabled: nextEnabled,
+        sync_interval_sec: dev.sync_interval_sec || 3,
+      });
+      setDevices((prev) => prev.map((d) => (d.id === dev.id ? updated : d)));
+      setNotice(
+        `${dev.device_name}: Read-Only Auto-Polling ${nextEnabled ? `enabled (${updated.sync_interval_sec || 3}s)` : 'paused'}.`
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to toggle auto-polling');
+    }
+  };
+
+  const handleMapUnmatchedUser = async (row: UnmatchedDeviceUserRecord) => {
+    const empId = (mapTargetById[row.id] || '').trim();
+    if (!empId) {
+      setError(`Select or enter an HR Employee ID for device PIN "${row.device_user_id}" before mapping.`);
+      return;
+    }
+    setError(null);
+    setNotice(null);
+    setMappingId(row.id);
+    try {
+      const res = await api.post<{ ok: boolean; mapped_employee_id: string; backfilled: number }>(
+        `/api/devices/zkteco/unmatched/${row.id}/map`,
+        { employee_id: empId }
+      );
+      setNotice(
+        `Mapped device PIN ${row.device_user_id} to HR Employee ${res.mapped_employee_id} (backfilled ${res.backfilled} raw punch(es)). Physical K40 data was NOT modified.`
+      );
+      await Promise.all([loadUnmatchedUsers(), loadSyncLogs(), loadBioLogs()]);
+      onRefreshDashboard();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to map unmatched PIN');
+    } finally {
+      setMappingId(null);
+    }
   };
 
   const handlePullK40Attendance = async (dev: DeviceRecord) => {
@@ -713,10 +901,13 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
       setDevices((prev) => prev.map((d) => (d.id === dev.id ? res.device : d)));
       setNotice(`${res.message} · Ingested ${res.ingested} attendance record(s) into Attendance Register.`);
       loadBioLogs();
+      loadSyncLogs();
+      loadUnmatchedUsers();
       onRefreshDashboard();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'ZKTeco K40 TCP 4370 pull failed');
       loadDevices(true);
+      loadSyncLogs();
     } finally {
       setPullingId(null);
     }
@@ -1251,11 +1442,53 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
             }`}
           >
             <Fingerprint className="w-3.5 h-3.5 text-[#087CEB]" />
-            Biometric Authentication Logs
+            {t('dev.k40.biometricLogsTab', 'Biometric Auth Logs')}
             <span className="px-1.5 py-0.5 text-[10px] font-mono rounded bg-white/15 dark:bg-slate-700/60 tabular-nums">
               {bioLogs.length}
             </span>
             <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" title="Live WebSocket stream active" />
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setActiveTab('sync-logs');
+              loadSyncLogs();
+            }}
+            className={`inline-flex items-center gap-2 px-4 py-2 text-xs font-bold rounded-lg transition-colors whitespace-nowrap ${
+              activeTab === 'sync-logs'
+                ? 'bg-[#18243A] text-white shadow-sm'
+                : 'text-[#172033] dark:text-slate-300 hover:bg-[#F8FAFC] dark:hover:bg-slate-800'
+            }`}
+          >
+            <Database className="w-3.5 h-3.5 text-[#087CEB]" />
+            {t('dev.k40.syncLogsTab', 'Device Sync Logs')}
+            <span className="px-1.5 py-0.5 text-[10px] font-mono rounded bg-white/15 dark:bg-slate-700/60 tabular-nums">
+              {syncLogs.length}
+            </span>
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setActiveTab('unmatched-pins');
+              loadUnmatchedUsers();
+            }}
+            className={`inline-flex items-center gap-2 px-4 py-2 text-xs font-bold rounded-lg transition-colors whitespace-nowrap ${
+              activeTab === 'unmatched-pins'
+                ? 'bg-[#18243A] text-white shadow-sm'
+                : 'text-[#172033] dark:text-slate-300 hover:bg-[#F8FAFC] dark:hover:bg-slate-800'
+            }`}
+          >
+            <AlertTriangle className="w-3.5 h-3.5 text-amber-500" />
+            {t('dev.k40.unmatchedTab', 'Unmatched PINs')}
+            <span
+              className={`px-1.5 py-0.5 text-[10px] font-mono rounded tabular-nums ${
+                unmatchedUsers.filter((u) => u.status === 'Pending').length > 0
+                  ? 'bg-amber-500 text-white'
+                  : 'bg-white/15 dark:bg-slate-700/60'
+              }`}
+            >
+              {unmatchedUsers.filter((u) => u.status === 'Pending').length}
+            </span>
           </button>
         </div>
 
@@ -1298,12 +1531,20 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
 
       {activeTab === 'connections' && (
         <>
+      <div className="px-4 py-3 rounded-xl border border-emerald-300 dark:border-emerald-800 bg-emerald-50/80 dark:bg-emerald-950/40 flex items-start gap-3 text-xs text-emerald-900 dark:text-emerald-200">
+        <Shield className="w-4 h-4 text-emerald-600 dark:text-emerald-400 shrink-0 mt-0.5" />
+        <div>
+          <span className="font-bold uppercase tracking-wide">Strict Read-Only Protection Active: </span>
+          <span>{t('dev.k40.readOnlyBanner', 'STRICT READ-ONLY MODE: Existing K40 fingerprint templates, users, and device logs are permanently protected. No delete, clear, overwrite, or enrollment commands are sent during sync.')}</span>
+        </div>
+      </div>
+
       <div className="bg-[#FFFFFF] dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-6">
         <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 mb-5">
           <div>
-            <h2 className="text-lg font-bold text-[#172033] dark:text-white">Device Connections Registry</h2>
+            <h2 className="text-lg font-bold text-[#172033] dark:text-white">{t('dev.k40.title', 'ZKTeco K40 Read-Only Device Integration')}</h2>
             <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
-              Manage real TCP/IP sockets, HTTP/REST probes, ZKTeco ADMS push terminals, and local USB/Serial gateways.{' '}
+              Manage real TCP/IP sockets (port 4370), CommKey authentication, 2–5s auto-polling, ADMS push terminals, and downloadable LAN connectors.{' '}
               <span className="font-mono font-semibold text-[#172033] dark:text-slate-200 tabular-nums">
                 {connectedCount}/{devices.length} online · {totalPunches} punches synced
               </span>
@@ -1617,7 +1858,57 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
             />
           </div>
 
-          <div className="flex items-end gap-2">
+          <div>
+            <label className="block text-xs font-medium text-[#172033] dark:text-slate-300 mb-1">Device Model</label>
+            <input
+              type="text"
+              placeholder="ZKTeco K40"
+              value={form.model}
+              onChange={(e) => setForm({ ...form, model: e.target.value })}
+              className="w-full px-3 py-2 text-sm bg-[#F8FAFC] dark:bg-slate-800 text-[#172033] dark:text-white border border-slate-300 dark:border-slate-700 rounded-lg focus:outline-none focus:border-[#087CEB]"
+            />
+          </div>
+
+          <div>
+            <label className="block text-xs font-medium text-[#172033] dark:text-slate-300 mb-1">
+              {t('dev.k40.commKey', 'CommKey Password')} {form.has_comm_password && !form.comm_password ? '(Saved · Encrypted)' : ''}
+            </label>
+            <input
+              type="password"
+              autoComplete="new-password"
+              placeholder={form.has_comm_password ? '•••••••• (unchanged)' : '0 / Optional CommKey'}
+              value={form.comm_password}
+              onChange={(e) => setForm({ ...form, comm_password: e.target.value })}
+              className="w-full px-3 py-2 text-sm font-mono bg-[#F8FAFC] dark:bg-slate-800 text-[#172033] dark:text-white border border-slate-300 dark:border-slate-700 rounded-lg focus:outline-none focus:border-[#087CEB]"
+            />
+          </div>
+
+          <div>
+            <label className="block text-xs font-medium text-[#172033] dark:text-slate-300 mb-1">
+              {t('dev.k40.autoSync', 'Auto-Poll Interval (2–5s)')}
+            </label>
+            <div className="flex items-center gap-2">
+              <input
+                type="number"
+                min={2}
+                max={60}
+                value={form.sync_interval_sec}
+                onChange={(e) => setForm({ ...form, sync_interval_sec: e.target.value })}
+                className="w-20 px-3 py-2 text-sm font-mono bg-[#F8FAFC] dark:bg-slate-800 text-[#172033] dark:text-white border border-slate-300 dark:border-slate-700 rounded-lg focus:outline-none focus:border-[#087CEB]"
+              />
+              <label className="inline-flex items-center gap-1.5 text-xs font-medium text-[#172033] dark:text-slate-300 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={form.auto_sync_enabled}
+                  onChange={(e) => setForm({ ...form, auto_sync_enabled: e.target.checked })}
+                  className="rounded border-slate-300 text-[#087CEB]"
+                />
+                Auto-Sync
+              </label>
+            </div>
+          </div>
+
+          <div className="flex items-end gap-2 md:col-span-2">
             {editingId !== null && (
               <button
                 type="button"
@@ -1688,16 +1979,20 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
                     }`}
                   >
                     <td className="py-3 px-4">
-                      <div className="flex items-center gap-2">
+                      <div className="flex items-center gap-2 flex-wrap">
                         <span className="font-semibold text-[#172033] dark:text-white">{dev.device_name}</span>
                         {isSelected && (
                           <span className="px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wide bg-[#087CEB] text-white rounded">
                             Selected
                           </span>
                         )}
+                        <span className="inline-flex items-center gap-1 px-1.5 py-0.5 text-[10px] font-bold bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300 rounded">
+                          <Lock className="w-2.5 h-2.5" />
+                          READ-ONLY
+                        </span>
                       </div>
                       <div className="text-xs text-slate-500 dark:text-slate-400">
-                        {dev.device_type} · <span className="font-semibold text-[#087CEB]">{dev.protocol || 'TCP/IP Socket'}</span>
+                        {dev.model ? `${dev.model} · ` : ''}{dev.device_type} · <span className="font-semibold text-[#087CEB]">{dev.protocol || 'TCP/IP Socket'}</span>
                       </div>
                     </td>
                     <td className="py-3 px-4 font-mono text-xs text-[#172033] dark:text-slate-200 tabular-nums">
@@ -1716,10 +2011,13 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
                     </td>
                     <td className="py-3 px-4 font-mono text-xs text-slate-700 dark:text-slate-300 tabular-nums">
                       <div>{dev.serial_number}</div>
-                      {dev.api_key && <div className="text-[11px] text-slate-500">Key: {dev.api_key}</div>}
+                      <div className="flex items-center gap-1.5 text-[11px] text-slate-500 flex-wrap">
+                        {dev.has_comm_password && <span className="text-emerald-700 dark:text-emerald-400 font-semibold">CommKey Set</span>}
+                        {dev.api_key && <span>Key: {dev.api_key}</span>}
+                      </div>
                     </td>
                     <td className="py-3 px-4">
-                      <div className="flex items-center gap-1.5">
+                      <div className="flex items-center gap-1.5 flex-wrap">
                         <span
                           className={`text-xs font-semibold ${
                             dev.status === 'Connected'
@@ -1737,12 +2035,37 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
                           </span>
                         )}
                         <span className="text-xs font-mono text-slate-500 dark:text-slate-400 tabular-nums">
-                          · {dev.punch_count || 0} syncs
+                          · {dev.total_imported_count ?? dev.punch_count ?? 0} synced
                         </span>
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleToggleAutoSync(dev);
+                          }}
+                          className={`px-1.5 py-0.5 text-[10px] font-mono font-bold rounded ${
+                            dev.auto_sync_enabled
+                              ? 'bg-sky-100 text-sky-800 dark:bg-sky-950/60 dark:text-sky-300'
+                              : 'bg-slate-100 text-slate-500 dark:bg-slate-800'
+                          }`}
+                          title="Toggle Read-Only Auto-Polling"
+                        >
+                          {dev.auto_sync_enabled ? `Auto ${dev.sync_interval_sec || 3}s` : 'Auto Off'}
+                        </button>
                       </div>
-                      {dev.last_message && (
-                        <div className="text-xs text-slate-500 dark:text-slate-400 truncate max-w-[260px]" title={dev.last_message}>
-                          {dev.last_message}
+                      {dev.last_sync_at && (
+                        <div className="text-[10px] font-mono text-slate-500">
+                          Last Sync: {formatLogTimestamp(dev.last_sync_at).time}
+                        </div>
+                      )}
+                      {(dev.last_error || dev.last_message) && (
+                        <div
+                          className={`text-xs truncate max-w-[260px] ${
+                            dev.last_error ? 'text-red-600 dark:text-red-400' : 'text-slate-500 dark:text-slate-400'
+                          }`}
+                          title={dev.last_error || dev.last_message}
+                        >
+                          {dev.last_error || dev.last_message}
                         </div>
                       )}
                     </td>
@@ -1771,6 +2094,47 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
                           )}
                           Connect
                         </button>
+                        {k40Capable && (
+                          <>
+                            <button
+                              type="button"
+                              disabled={testingConnId === dev.id}
+                              onClick={() => handleTestK40Connection(dev)}
+                              className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-semibold text-[#087CEB] bg-[#EAF4FF] dark:bg-sky-950/60 hover:bg-[#DBEAFE] border border-[#087CEB]/30 disabled:opacity-60 rounded-lg transition-colors whitespace-nowrap shrink-0"
+                              title="Test TCP 4370 Connection"
+                            >
+                              {testingConnId === dev.id ? (
+                                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                              ) : (
+                                <Activity className="w-3.5 h-3.5" />
+                              )}
+                              {t('dev.k40.testConn', 'Test Connection')}
+                            </button>
+                            <button
+                              type="button"
+                              disabled={syncingNowId === dev.id}
+                              onClick={() => handleSyncNowK40(dev)}
+                              className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-semibold text-emerald-800 dark:text-emerald-300 bg-emerald-50 dark:bg-emerald-950/60 hover:bg-emerald-100 border border-emerald-200 dark:border-emerald-800 disabled:opacity-60 rounded-lg transition-colors whitespace-nowrap shrink-0"
+                              title="Read-Only Attendance Pull (never modifies K40 fingerprints or logs)"
+                            >
+                              {syncingNowId === dev.id ? (
+                                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                              ) : (
+                                <RefreshCw className="w-3.5 h-3.5" />
+                              )}
+                              {t('dev.k40.syncNow', 'Read-Only Sync')}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleDownloadBridgeScript(dev.id)}
+                              className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-semibold text-[#18243A] dark:text-slate-200 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 rounded-lg transition-colors whitespace-nowrap shrink-0"
+                              title="Download Local Read-Only LAN Connector"
+                            >
+                              <Download className="w-3.5 h-3.5 text-[#087CEB]" />
+                              LAN Connector
+                            </button>
+                          </>
+                        )}
                         <button
                           type="button"
                           onClick={() => setPunchModalDevice(dev)}
@@ -1778,26 +2142,8 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
                           title="Sync Punch / Live Webhook Endpoint"
                         >
                           <Webhook className="w-3.5 h-3.5 text-[#087CEB]" />
-                          Sync Punch
+                          Webhook
                         </button>
-                        {(dev.device_type.includes('Biometric') ||
-                          (dev.protocol || '').includes('ZKTeco') ||
-                          Number(dev.port) === 4370) && (
-                          <button
-                            type="button"
-                            disabled={pullingId === dev.id}
-                            onClick={() => handlePullK40Attendance(dev)}
-                            className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-semibold text-emerald-800 dark:text-emerald-300 bg-emerald-50 dark:bg-emerald-950/60 hover:bg-emerald-100 border border-emerald-200 dark:border-emerald-800 disabled:opacity-60 rounded-lg transition-colors whitespace-nowrap shrink-0"
-                            title="Pull Attendance Logs directly from ZKTeco K40 via TCP 4370"
-                          >
-                            {pullingId === dev.id ? (
-                              <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                            ) : (
-                              <Download className="w-3.5 h-3.5" />
-                            )}
-                            Pull K40 (4370)
-                          </button>
-                        )}
                         {dev.status === 'Connected' && (
                           <button
                             type="button"
@@ -1815,6 +2161,7 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
                             setEditingId(dev.id);
                             setForm({
                               device_type: dev.device_type,
+                              model: dev.model || 'ZKTeco K40',
                               protocol: dev.protocol || PROTOCOL_OPTIONS[0],
                               device_name: dev.device_name,
                               ip_address: dev.ip_address,
@@ -1824,6 +2171,10 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
                               gateway: dev.gateway,
                               serial_number: dev.serial_number,
                               api_key: dev.api_key || '',
+                              comm_password: '',
+                              sync_interval_sec: String(dev.sync_interval_sec || 3),
+                              auto_sync_enabled: Boolean(dev.auto_sync_enabled ?? true),
+                              has_comm_password: Boolean(dev.has_comm_password),
                             });
                           }}
                           className="p-1.5 text-[#172033] dark:text-slate-200 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 rounded-lg transition-colors"
@@ -2747,6 +3098,220 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
                         </tr>
                       );
                     })
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {activeTab === 'sync-logs' && (
+        <div className="space-y-4">
+          <div className="bg-[#FFFFFF] dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-5 flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h2 className="text-base font-bold text-[#172033] dark:text-white flex items-center gap-2">
+                <Database className="w-4 h-4 text-[#087CEB]" />
+                {t('dev.k40.syncLogsTab', 'ZKTeco K40 Read-Only Synchronization Logs')}
+              </h2>
+              <p className="text-xs text-slate-500 mt-0.5">
+                Every background auto-poll, manual read-only sync, and LAN connector batch records fetched counts, duplicate prevention skips, and real TCP errors.
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={loadSyncLogs}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-[#172033] dark:text-slate-200 bg-[#F8FAFC] dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${syncLogsLoading ? 'animate-spin' : ''}`} />
+              Refresh Sync Logs
+            </button>
+          </div>
+
+          <div className="bg-[#FFFFFF] dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden">
+            <div className="overflow-x-auto">
+              <table className="w-full min-w-[900px] text-left border-collapse text-xs">
+                <thead>
+                  <tr className="border-b border-slate-200 dark:border-slate-800 bg-[#18243A] text-white font-semibold">
+                    <th className="py-3 px-4">Timestamp</th>
+                    <th className="py-3 px-4">Device</th>
+                    <th className="py-3 px-4">Source / Operator</th>
+                    <th className="py-3 px-4 text-right">Fetched</th>
+                    <th className="py-3 px-4 text-right">Imported</th>
+                    <th className="py-3 px-4 text-right">Duplicates Skipped</th>
+                    <th className="py-3 px-4 text-right">Unmatched PINs</th>
+                    <th className="py-3 px-4">Status &amp; Error</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-200 dark:divide-slate-800">
+                  {syncLogs.length === 0 ? (
+                    <tr>
+                      <td colSpan={8} className="py-8 text-center text-slate-500">
+                        No synchronization logs recorded yet. Run Read-Only Sync Now or connect a ZKTeco K40 terminal.
+                      </td>
+                    </tr>
+                  ) : (
+                    syncLogs.map((row) => {
+                      const ts = formatLogTimestamp(row.started_at);
+                      return (
+                        <tr key={row.id} className="hover:bg-[#F8FAFC] dark:hover:bg-slate-800/40">
+                          <td className="py-3 px-4 font-mono tabular-nums whitespace-nowrap">
+                            <div className="font-semibold text-[#172033] dark:text-white">{ts.time}</div>
+                            <div className="text-[11px] text-slate-500">{ts.date}</div>
+                          </td>
+                          <td className="py-3 px-4 font-semibold text-[#172033] dark:text-white">{row.device_name}</td>
+                          <td className="py-3 px-4">
+                            <div className="font-mono text-[11px] text-[#087CEB]">{row.sync_source}</div>
+                            <div className="text-[11px] text-slate-500">{row.triggered_by}</div>
+                          </td>
+                          <td className="py-3 px-4 text-right font-mono tabular-nums">{row.total_fetched}</td>
+                          <td className="py-3 px-4 text-right font-mono font-bold text-emerald-700 dark:text-emerald-400 tabular-nums">
+                            {row.imported_count}
+                          </td>
+                          <td className="py-3 px-4 text-right font-mono text-slate-600 dark:text-slate-300 tabular-nums">
+                            {row.skipped_duplicates}
+                          </td>
+                          <td className="py-3 px-4 text-right font-mono text-amber-600 tabular-nums">{row.unmatched_count}</td>
+                          <td className="py-3 px-4">
+                            <span
+                              className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-bold ${
+                                row.status === 'Success'
+                                  ? 'bg-emerald-50 text-emerald-800 border border-emerald-200'
+                                  : row.status === 'Failed'
+                                  ? 'bg-red-50 text-red-800 border border-red-200'
+                                  : 'bg-slate-100 text-slate-700'
+                              }`}
+                            >
+                              {row.status}
+                            </span>
+                            {row.latency_ms > 0 && (
+                              <span className="ml-2 font-mono text-[11px] text-slate-400">{row.latency_ms}ms</span>
+                            )}
+                            {row.error_message && (
+                              <div className="text-[11px] text-red-600 dark:text-red-400 mt-0.5 max-w-[260px]">
+                                {row.error_message}
+                              </div>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {activeTab === 'unmatched-pins' && (
+        <div className="space-y-4">
+          <div className="bg-[#FFFFFF] dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-5 flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h2 className="text-base font-bold text-[#172033] dark:text-white flex items-center gap-2">
+                <AlertTriangle className="w-4 h-4 text-amber-500" />
+                {t('dev.k40.unmatchedTab', 'Unmatched K40 Device User PINs')}
+              </h2>
+              <p className="text-xs text-slate-500 mt-0.5">
+                Map unlinked ZKTeco K40 User PINs to existing HR employees inside this software. Physical K40 users and fingerprints are NEVER changed or overwritten.
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={loadUnmatchedUsers}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-[#172033] dark:text-slate-200 bg-[#F8FAFC] dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${unmatchedLoading ? 'animate-spin' : ''}`} />
+              Refresh PIN Queue
+            </button>
+          </div>
+
+          <div className="bg-[#FFFFFF] dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden">
+            <div className="overflow-x-auto">
+              <table className="w-full min-w-[880px] text-left border-collapse text-xs">
+                <thead>
+                  <tr className="border-b border-slate-200 dark:border-slate-800 bg-[#18243A] text-white font-semibold">
+                    <th className="py-3 px-4">K40 User PIN</th>
+                    <th className="py-3 px-4">Device &amp; Serial</th>
+                    <th className="py-3 px-4">Sample Punch &amp; Count</th>
+                    <th className="py-3 px-4">Status</th>
+                    <th className="py-3 px-4">Map to HR Employee (Software Only)</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-200 dark:divide-slate-800">
+                  {unmatchedUsers.length === 0 ? (
+                    <tr>
+                      <td colSpan={5} className="py-8 text-center text-slate-500">
+                        No unmatched device PINs found. All K40 punches matched existing HR employees cleanly.
+                      </td>
+                    </tr>
+                  ) : (
+                    unmatchedUsers.map((row) => (
+                      <tr key={row.id} className="hover:bg-[#F8FAFC] dark:hover:bg-slate-800/40">
+                        <td className="py-3 px-4 font-mono font-bold text-[#172033] dark:text-white">
+                          PIN {row.device_user_id}
+                          {row.device_user_name && (
+                            <div className="text-[11px] font-sans font-normal text-slate-500">{row.device_user_name}</div>
+                          )}
+                        </td>
+                        <td className="py-3 px-4">
+                          <div className="font-semibold text-[#172033] dark:text-white">{row.device_name}</div>
+                          <div className="text-[11px] font-mono text-slate-500">{row.device_serial}</div>
+                        </td>
+                        <td className="py-3 px-4 font-mono tabular-nums">
+                          <div>{row.punch_count} punch(es)</div>
+                          <div className="text-[11px] text-slate-500">{row.sample_punch_at}</div>
+                        </td>
+                        <td className="py-3 px-4">
+                          {row.status === 'Mapped' ? (
+                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-emerald-50 text-emerald-800 border border-emerald-200 font-bold">
+                              Mapped → {row.mapped_employee_id}
+                            </span>
+                          ) : (
+                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-amber-50 text-amber-800 border border-amber-200 font-bold">
+                              {row.status}
+                            </span>
+                          )}
+                        </td>
+                        <td className="py-3 px-4">
+                          {row.status === 'Mapped' ? (
+                            <span className="text-[11px] text-slate-500 font-mono">
+                              Mapped by {row.mapped_by}
+                            </span>
+                          ) : (
+                            <div className="flex items-center gap-2">
+                              <select
+                                value={mapTargetById[row.id] || ''}
+                                onChange={(e) =>
+                                  setMapTargetById((prev) => ({ ...prev, [row.id]: e.target.value }))
+                                }
+                                className="px-2.5 py-1.5 text-xs bg-[#F8FAFC] dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg max-w-[220px]"
+                              >
+                                <option value="">-- Select HR Employee --</option>
+                                {employees.map((emp) => (
+                                  <option key={emp.id} value={emp.employee_id}>
+                                    {emp.employee_id} · {emp.full_name}
+                                  </option>
+                                ))}
+                              </select>
+                              <button
+                                type="button"
+                                disabled={mappingId === row.id}
+                                onClick={() => handleMapUnmatchedUser(row)}
+                                className="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-bold text-white bg-[#087CEB] hover:bg-[#0265C4] disabled:opacity-60 rounded-lg whitespace-nowrap"
+                              >
+                                {mappingId === row.id ? (
+                                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                ) : (
+                                  <CheckCircle2 className="w-3.5 h-3.5" />
+                                )}
+                                {t('dev.k40.mapToEmployee', 'Map to Employee')}
+                              </button>
+                            </div>
+                          )}
+                        </td>
+                      </tr>
+                    ))
                   )}
                 </tbody>
               </table>

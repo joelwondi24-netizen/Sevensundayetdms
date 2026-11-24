@@ -62,6 +62,7 @@ import { SupplyChainModule, type SupplyChainTab } from './components/SupplyChain
 import { ALL_COMPANY_FORMS } from './data/companyFormsCatalog';
 import { useOnlineStatus } from './hooks/usePWAInstall';
 import { useRealtimeWS, type WsEventPayload } from './hooks/useRealtimeWS';
+import { LanguageSwitcher, useI18n } from './i18n/I18nProvider';
 import { getPendingQueue, setOfflineSyncKey, syncQueuedMutations } from './offline/syncEngine';
 import type {
   AuthSessionResponse,
@@ -77,7 +78,6 @@ import type {
   UserRole,
 } from './types';
 import {
-  LANGUAGE_OPTIONS,
   translateUi,
   type AppLang,
 } from './utils/ethiopianCalendar';
@@ -242,6 +242,44 @@ const NAV_GROUPS: NavGroup[] = [
   },
 ];
 
+const MODULE_I18N_KEYS: Record<ModuleKey, string> = {
+  dashboard: 'nav.dashboard',
+  approvals: 'nav.approvals',
+  admin: 'nav.admin',
+  hr: 'nav.hr',
+  devices: 'nav.devices',
+  attendance: 'nav.attendance',
+  scheduling: 'nav.scheduling',
+  leave: 'nav.leave',
+  salary: 'nav.salary',
+  payroll: 'nav.payroll',
+  secretary: 'nav.secretary',
+  'company-forms': 'nav.companyForms',
+  'gate-pass': 'nav.gatePass',
+  materials: 'nav.materials',
+  'material-requests': 'nav.materialRequests',
+  grn: 'nav.grn',
+  gin: 'nav.gin',
+  procurement: 'nav.procurement',
+  purchasing: 'nav.purchasing',
+  'sales-crm': 'nav.salesCrm',
+  finance: 'nav.finance',
+  assets: 'nav.assets',
+  vehicles: 'nav.vehicles',
+  reports: 'nav.reports',
+  chat: 'nav.chat',
+  audit: 'nav.audit',
+  sync: 'nav.sync',
+};
+
+const NAV_GROUP_I18N_KEYS: Record<string, string> = {
+  group_command: 'nav.group.executive',
+  group_hr_admin: 'nav.group.workforce',
+  group_inventory: 'nav.group.supply',
+  group_commercial: 'nav.group.finance',
+  group_collab: 'nav.group.collab',
+};
+
 const MODULE_TITLES: Record<ModuleKey, string> = {
   dashboard: 'Dashboard',
   approvals: 'Approvals & Notifications',
@@ -299,15 +337,19 @@ export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [summary, setSummary] = useState<DashboardSummary | null>(null);
   const [notifications, setNotifications] = useState<NotificationItem[]>([]);
-  const [lang, setLang] = useState<AppLang>(() => {
-    try {
-      const saved = localStorage.getItem(LANG_KEY) as AppLang | null;
-      if (saved && VALID_LANGS.includes(saved)) return saved;
-    } catch {
-      // ignore
-    }
+  const {
+    lang: i18nLang,
+    dir: i18nDir,
+    setLanguage: setI18nLanguage,
+    syncUserLanguagePreference,
+    t,
+  } = useI18n();
+  const lang: AppLang = useMemo(() => {
+    if (i18nLang.startsWith('zh')) return 'zh';
+    if (VALID_LANGS.includes(i18nLang as AppLang)) return i18nLang as AppLang;
     return 'en';
-  });
+  }, [i18nLang]);
+
   const [darkMode, setDarkMode] = useState<boolean>(() => {
     try {
       return localStorage.getItem(THEME_KEY) === 'dark';
@@ -325,14 +367,17 @@ export default function App() {
 
   const isOnline = useOnlineStatus();
 
-  const handleChangeLang = useCallback((nextLang: AppLang) => {
-    setLang(nextLang);
-    try {
-      localStorage.setItem(LANG_KEY, nextLang);
-    } catch {
-      // ignore
-    }
-  }, []);
+  const handleChangeLang = useCallback(
+    (nextLang: string) => {
+      void setI18nLanguage(nextLang);
+      try {
+        localStorage.setItem(LANG_KEY, nextLang);
+      } catch {
+        // ignore
+      }
+    },
+    [setI18nLanguage]
+  );
 
   useEffect(() => {
     if (darkMode) {
@@ -343,10 +388,6 @@ export default function App() {
       localStorage.setItem(THEME_KEY, 'light');
     }
   }, [darkMode]);
-
-  useEffect(() => {
-    document.documentElement.lang = lang;
-  }, [lang]);
 
   useEffect(() => {
     if (SUPPLY_CHAIN_KEYS.includes(activeModule)) {
@@ -392,10 +433,10 @@ export default function App() {
       ]);
       setCompany(s);
       setTenants(tList);
-      if (s?.default_language && VALID_LANGS.includes(s.default_language)) {
+      if (s?.default_language) {
         try {
-          if (!localStorage.getItem(LANG_KEY)) {
-            setLang(s.default_language);
+          if (!localStorage.getItem('ss_etms_lang')) {
+            void setI18nLanguage(s.default_language, false);
           }
         } catch {
           // ignore
@@ -404,7 +445,7 @@ export default function App() {
     } catch {
       // ignore initial transient error
     }
-  }, []);
+  }, [setI18nLanguage]);
 
   const refreshDashboard = useCallback(async () => {
     if (!currentUser) return;
@@ -587,6 +628,7 @@ export default function App() {
     setOfflineSyncKey(auth.encrypted_sync_key || null);
     setEncryptedSyncKey(auth.encrypted_sync_key || null);
     setApiActor(user.full_name, user.role);
+    syncUserLanguagePreference(user.preferred_language);
     if (user.tenant_id && user.tenant_id !== activeTenantId) {
       setApiTenant(user.tenant_id);
       setActiveTenantId(user.tenant_id);
@@ -594,6 +636,7 @@ export default function App() {
     }
     setCurrentUser(user);
     setActiveModule('dashboard');
+    void refreshCompanyDeviceStatus();
   };
 
   const handleSignOut = async () => {
@@ -645,23 +688,43 @@ export default function App() {
     );
   }
 
-  const getModuleNavLabel = (key: ModuleKey, fallbackLabel: string) =>
-    translateUi(lang, key, fallbackLabel, platformConfig.custom_module_labels);
+  const getModuleNavLabel = (key: ModuleKey, fallbackLabel: string) => {
+    const custom = platformConfig.custom_module_labels?.[key];
+    if (custom && custom.trim()) return custom.trim();
+    const i18nKey = MODULE_I18N_KEYS[key];
+    if (i18nKey) {
+      const translated = t(i18nKey);
+      if (translated && translated !== i18nKey) return translated;
+    }
+    return translateUi(lang, key, fallbackLabel, platformConfig.custom_module_labels);
+  };
 
   const getModuleHeaderTitle = (key: ModuleKey) => {
     const customTitle = platformConfig.custom_module_titles?.[key];
     if (customTitle && customTitle.trim()) return customTitle.trim();
-    if (lang !== 'en') {
+    if (i18nLang !== 'en') {
+      const i18nKey = MODULE_I18N_KEYS[key];
+      if (i18nKey) {
+        const translated = t(i18nKey);
+        if (translated && translated !== i18nKey) return translated;
+      }
       return translateUi(lang, key, MODULE_TITLES[key]);
     }
     return MODULE_TITLES[key];
   };
 
-  const visibleGroups = NAV_GROUPS.map((g) => ({
-    ...g,
-    displayLabel: translateUi(lang, g.labelKey, g.fallbackGroupLabel),
-    items: g.items.filter((it) => allowedModules.includes(it.key)),
-  })).filter((g) => g.items.length > 0);
+  const visibleGroups = NAV_GROUPS.map((g) => {
+    const grpKey = NAV_GROUP_I18N_KEYS[g.labelKey];
+    const grpTranslated = grpKey ? t(grpKey) : '';
+    return {
+      ...g,
+      displayLabel:
+        grpTranslated && grpTranslated !== grpKey
+          ? grpTranslated
+          : translateUi(lang, g.labelKey, g.fallbackGroupLabel),
+      items: g.items.filter((it) => allowedModules.includes(it.key)),
+    };
+  }).filter((g) => g.items.length > 0);
 
   const searchMatches = globalSearch.trim()
     ? visibleGroups
@@ -695,7 +758,7 @@ export default function App() {
     company?.logo_data && company.logo_data.startsWith('data:')
       ? company.logo_data
       : '/assets/aistudio/Seven_Sunday_Logo_2_desktop_addf2fa7.png';
-  const isRtl = lang === 'ar';
+  const isRtl = i18nDir === 'rtl';
   const selectableTenants = tenants.filter(
     (t) => t.status === 'Active' || currentUser.role === 'System Administrator' || t.id === activeTenantId
   );
@@ -707,7 +770,7 @@ export default function App() {
 
   return (
     <div
-      dir={isRtl ? 'rtl' : 'ltr'}
+      dir={i18nDir}
       className="app-root-shell min-h-screen flex bg-[#F8FAFC] dark:bg-slate-950 text-[#172033] dark:text-slate-100"
     >
       {/* Mobile Sidebar Backdrop */}
@@ -894,24 +957,8 @@ export default function App() {
               </kbd>
             </button>
 
-            {/* Multi-Language Switcher (6 Languages) */}
-            {platformConfig.enable_multi_language !== false && (
-              <div className="flex items-center gap-1 px-2 py-1 bg-[#F8FAFC] dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg">
-                <Globe className="w-3.5 h-3.5 text-[#18243A] dark:text-[#38BDF8] shrink-0" />
-                <select
-                  value={lang}
-                  onChange={(e) => handleChangeLang(e.target.value as AppLang)}
-                  aria-label="Language switcher"
-                  className="text-xs font-semibold bg-transparent text-[#172033] dark:text-slate-200 focus:outline-none"
-                >
-                  {LANGUAGE_OPTIONS.map((opt) => (
-                    <option key={opt.code} value={opt.code} className="text-[#172033]">
-                      {opt.shortLabel} · {opt.label.split(' ')[0]}
-                    </option>
-                  ))}
-                </select>
-              </div>
-            )}
+            {/* Multi-Language Switcher (200+ World Languages + RTL) */}
+            {platformConfig.enable_multi_language !== false && <LanguageSwitcher />}
 
             {/* Dark / Light Theme Toggle */}
             <button
@@ -973,7 +1020,7 @@ export default function App() {
               settings={company}
               onSettingsUpdated={(updated) => {
                 setCompany(updated);
-                if (updated.default_language && VALID_LANGS.includes(updated.default_language)) {
+                if (updated.default_language) {
                   handleChangeLang(updated.default_language);
                 }
                 refreshTenants();

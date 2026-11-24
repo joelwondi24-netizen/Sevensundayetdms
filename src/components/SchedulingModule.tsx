@@ -209,6 +209,15 @@ export const SchedulingModule: React.FC<SchedulingModuleProps> = ({
     scheduling_system: '3-Shift' as ShiftDefinition['scheduling_system'],
     start_time: '08:00',
     end_time: '12:00',
+    in_earliest: '07:45',
+    in_latest: '08:00',
+    out_earliest: '11:58',
+    out_latest: '12:30',
+    ot_start_time: '12:30',
+    ot_end_time: '14:00',
+    require_ot_approval: true,
+    assigned_department: '',
+    is_enabled: true,
     break_minutes: 0,
     working_days: ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'],
     rest_days: ['Sun'],
@@ -1653,9 +1662,15 @@ export const SchedulingModule: React.FC<SchedulingModuleProps> = ({
                       <div className="flex items-center gap-2">
                         <span className="h-2.5 w-2.5 rounded-full shrink-0" style={{ backgroundColor: sh.color_hex || '#2563eb' }} />
                         <div>
-                          <div className="font-semibold text-slate-900 dark:text-slate-100">{sh.shift_name}</div>
+                          <div className="font-semibold text-slate-900 dark:text-slate-100 flex items-center gap-1.5">
+                            <span>{sh.shift_name}</span>
+                            {sh.is_enabled === 0 || sh.is_enabled === false ? (
+                              <span className="px-1.5 py-0.5 text-[10px] font-bold rounded bg-slate-200 text-slate-600">Disabled</span>
+                            ) : null}
+                          </div>
                           <div className="text-[11px] text-slate-500">
                             {sh.shift_code} · {sh.shift_category}
+                            {sh.assigned_department ? ` · ${sh.assigned_department}` : ''}
                           </div>
                         </div>
                       </div>
@@ -1668,14 +1683,21 @@ export const SchedulingModule: React.FC<SchedulingModuleProps> = ({
                       <div className="text-[10px] text-slate-400 font-mono">
                         {formatEthiopianLocalTime(sh.start_time)} – {formatEthiopianLocalTime(sh.end_time)}
                       </div>
-                      <div className="text-[11px] text-slate-500">{sh.break_minutes} min break</div>
+                      <div className="text-[10px] font-mono text-sky-700 dark:text-sky-400">
+                        In: {sh.in_earliest || sh.start_time}–{sh.in_latest || sh.start_time} · Out: {sh.out_earliest || sh.end_time}–{sh.out_latest || sh.end_time}
+                      </div>
+                      {sh.ot_start_time && (
+                        <div className="text-[10px] font-mono text-amber-700 dark:text-amber-400">
+                          OT: {sh.ot_start_time}–{sh.ot_end_time || '19:00'} ({sh.break_minutes}m brk)
+                        </div>
+                      )}
                     </td>
                     <td className="px-3 py-2.5">
                       <div>{sh.is_rotating ? sh.rotation_pattern : 'Fixed Schedule'}</div>
                       <div className="text-[11px] text-slate-500">Min {sh.min_rest_hours}h rest</div>
                     </td>
                     <td className="px-3 py-2.5 tabular-nums">
-                      <div>{sh.ot_multiplier}x OT</div>
+                      <div>{sh.ot_multiplier}x OT · {sh.require_ot_approval === 0 || sh.require_ot_approval === false ? 'Auto-Approve' : 'Mgr Approval'}</div>
                       <div className="text-[11px] text-slate-500">{sh.grace_late_minutes}m late grace</div>
                     </td>
                     {canManageShiftsDepts && (
@@ -1692,6 +1714,15 @@ export const SchedulingModule: React.FC<SchedulingModuleProps> = ({
                                 scheduling_system: sh.scheduling_system,
                                 start_time: sh.start_time,
                                 end_time: sh.end_time,
+                                in_earliest: sh.in_earliest || sh.start_time,
+                                in_latest: sh.in_latest || sh.start_time,
+                                out_earliest: sh.out_earliest || sh.end_time,
+                                out_latest: sh.out_latest || sh.end_time,
+                                ot_start_time: sh.ot_start_time || sh.out_latest || sh.end_time,
+                                ot_end_time: sh.ot_end_time || '19:00',
+                                require_ot_approval: sh.require_ot_approval !== 0 && sh.require_ot_approval !== false,
+                                assigned_department: sh.assigned_department || '',
+                                is_enabled: sh.is_enabled !== 0 && sh.is_enabled !== false,
                                 break_minutes: sh.break_minutes,
                                 working_days: parseDayList(sh.working_days),
                                 rest_days: parseDayList(sh.rest_days),
@@ -1804,6 +1835,77 @@ export const SchedulingModule: React.FC<SchedulingModuleProps> = ({
                   />
                 </label>
               </div>
+              <div className="grid grid-cols-2 gap-2">
+                <label className="block text-xs">
+                  <span className="mb-1 block font-medium">Check-In Earliest</span>
+                  <input
+                    type="time"
+                    value={shiftForm.in_earliest}
+                    onChange={(e) => setShiftForm((p) => ({ ...p, in_earliest: e.target.value }))}
+                    className="w-full rounded-lg border border-slate-200 bg-white px-2 py-2 text-xs font-mono tabular-nums dark:border-slate-700 dark:bg-slate-800"
+                  />
+                </label>
+                <label className="block text-xs">
+                  <span className="mb-1 block font-medium">Check-In Latest</span>
+                  <input
+                    type="time"
+                    value={shiftForm.in_latest}
+                    onChange={(e) => setShiftForm((p) => ({ ...p, in_latest: e.target.value }))}
+                    className="w-full rounded-lg border border-slate-200 bg-white px-2 py-2 text-xs font-mono tabular-nums dark:border-slate-700 dark:bg-slate-800"
+                  />
+                </label>
+                <label className="block text-xs">
+                  <span className="mb-1 block font-medium">Check-Out Earliest</span>
+                  <input
+                    type="time"
+                    value={shiftForm.out_earliest}
+                    onChange={(e) => setShiftForm((p) => ({ ...p, out_earliest: e.target.value }))}
+                    className="w-full rounded-lg border border-slate-200 bg-white px-2 py-2 text-xs font-mono tabular-nums dark:border-slate-700 dark:bg-slate-800"
+                  />
+                </label>
+                <label className="block text-xs">
+                  <span className="mb-1 block font-medium">Check-Out Latest</span>
+                  <input
+                    type="time"
+                    value={shiftForm.out_latest}
+                    onChange={(e) => setShiftForm((p) => ({ ...p, out_latest: e.target.value }))}
+                    className="w-full rounded-lg border border-slate-200 bg-white px-2 py-2 text-xs font-mono tabular-nums dark:border-slate-700 dark:bg-slate-800"
+                  />
+                </label>
+                <label className="block text-xs">
+                  <span className="mb-1 block font-medium">OT Start (EAT)</span>
+                  <input
+                    type="time"
+                    value={shiftForm.ot_start_time}
+                    onChange={(e) => setShiftForm((p) => ({ ...p, ot_start_time: e.target.value }))}
+                    className="w-full rounded-lg border border-slate-200 bg-white px-2 py-2 text-xs font-mono tabular-nums dark:border-slate-700 dark:bg-slate-800"
+                  />
+                </label>
+                <label className="block text-xs">
+                  <span className="mb-1 block font-medium">OT End (EAT)</span>
+                  <input
+                    type="time"
+                    value={shiftForm.ot_end_time}
+                    onChange={(e) => setShiftForm((p) => ({ ...p, ot_end_time: e.target.value }))}
+                    className="w-full rounded-lg border border-slate-200 bg-white px-2 py-2 text-xs font-mono tabular-nums dark:border-slate-700 dark:bg-slate-800"
+                  />
+                </label>
+              </div>
+              <label className="block text-xs">
+                <span className="mb-1 block font-medium">Assigned Department (Optional)</span>
+                <select
+                  value={shiftForm.assigned_department}
+                  onChange={(e) => setShiftForm((p) => ({ ...p, assigned_department: e.target.value }))}
+                  className="w-full rounded-lg border border-slate-200 bg-white px-2.5 py-2 text-xs dark:border-slate-700 dark:bg-slate-800"
+                >
+                  <option value="">All Departments</option>
+                  {departments.map((d) => (
+                    <option key={d.id} value={d.name}>
+                      {d.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
               <div className="grid grid-cols-3 gap-2">
                 <label className="block text-xs">
                   <span className="mb-1 block font-medium">Min Rest (h)</span>
@@ -1834,14 +1936,35 @@ export const SchedulingModule: React.FC<SchedulingModuleProps> = ({
                   />
                 </label>
               </div>
-              <label className="inline-flex items-center gap-2 text-xs">
-                <input
-                  type="checkbox"
-                  checked={shiftForm.is_rotating}
-                  onChange={(e) => setShiftForm((p) => ({ ...p, is_rotating: e.target.checked }))}
-                />
-                Rotating Shift (Day-to-Night / Weekly / Monthly)
-              </label>
+              <div className="flex flex-col gap-1.5 text-xs">
+                <label className="inline-flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={shiftForm.is_rotating}
+                    onChange={(e) => setShiftForm((p) => ({ ...p, is_rotating: e.target.checked }))}
+                  />
+                  Rotating Shift (Day-to-Night / Weekly / Monthly)
+                </label>
+                <label className="inline-flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={shiftForm.require_ot_approval}
+                    onChange={(e) => setShiftForm((p) => ({ ...p, require_ot_approval: e.target.checked }))}
+                  />
+                  Require Manager Overtime Approval
+                </label>
+                <label className="inline-flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={shiftForm.is_enabled}
+                    onChange={(e) => setShiftForm((p) => ({ ...p, is_enabled: e.target.checked }))}
+                  />
+                  Shift Enabled (applies to future attendance)
+                </label>
+              </div>
+              <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                Note: Edits to shift boundaries govern future attendance records while preserving historical records.
+              </p>
               <div className="flex items-center gap-2">
                 <button
                   type="submit"

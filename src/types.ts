@@ -105,6 +105,7 @@ export interface UserAccount {
   role: UserRole;
   status: 'Active' | 'Suspended';
   mfa_enabled?: number | boolean;
+  preferred_language?: string;
   failed_login_attempts?: number;
   locked_until?: string | null;
   last_login: string | null;
@@ -279,6 +280,7 @@ export interface DeviceRecord {
   id: number;
   tenant_id?: number;
   device_type: string;
+  model?: string;
   protocol?: string;
   device_name: string;
   ip_address: string;
@@ -288,12 +290,57 @@ export interface DeviceRecord {
   gateway: string;
   serial_number: string;
   api_key?: string;
+  comm_password?: string;
+  has_comm_password?: boolean;
+  sync_interval_sec?: number;
+  auto_sync_enabled?: number | boolean;
+  read_only_mode?: number | boolean;
+  timezone?: string;
   status: 'Disconnected' | 'Connected' | 'Unreachable';
   last_latency_ms: number | null;
   last_message: string;
+  last_error?: string;
   last_checked_at: string | null;
   last_sync_at?: string | null;
   punch_count?: number;
+  total_imported_count?: number;
+  failed_sync_count?: number;
+}
+
+export interface DeviceSyncLogRecord {
+  id: number;
+  tenant_id: number;
+  device_id: number;
+  device_name: string;
+  sync_source: string;
+  triggered_by: string;
+  status: 'Success' | 'Failed' | 'No New Logs';
+  total_fetched: number;
+  imported_count: number;
+  skipped_duplicates: number;
+  unmatched_count: number;
+  latency_ms: number;
+  error_message: string;
+  started_at: string;
+  finished_at: string;
+}
+
+export interface UnmatchedDeviceUserRecord {
+  id: number;
+  tenant_id: number;
+  device_id: number;
+  device_name: string;
+  device_serial: string;
+  device_user_id: string;
+  device_user_name: string;
+  first_seen_at: string;
+  last_seen_at: string;
+  sample_punch_at: string;
+  punch_count: number;
+  status: 'Pending' | 'Mapped' | 'Ignored';
+  mapped_employee_id: string;
+  mapped_by: string;
+  mapped_at: string | null;
 }
 
 export interface DeviceScanResult {
@@ -354,12 +401,59 @@ export interface AttendanceRecord {
   ot_hours: number;
   ot_multiplier: number;
   ot_pay: number;
+  ot_approval_status?: 'Pending' | 'Approved' | 'Rejected';
+  ot_approved_by?: string;
+  ot_approved_at?: string;
+  ot_adjustment_reason?: string;
+  device_id?: number | null;
+  device_tx_id?: string;
+  machine_timestamp?: string;
+  received_timestamp?: string;
+  verification_method?: string;
+  sync_status?: string;
   status: 'Present' | 'Late' | 'Early Exit' | 'Late & Early' | 'Half-Day' | 'Absent' | 'On Leave';
   register_state: 'Open' | 'Closed';
   notes: string;
   updated_by?: string;
   updated_at?: string;
   created_at: string;
+}
+
+export interface AttendanceAuditLogRecord {
+  id: number;
+  tenant_id: number;
+  attendance_record_id: number;
+  action: string;
+  actor_name: string;
+  actor_role: string;
+  previous_ot_hours: number;
+  new_ot_hours: number;
+  previous_status: string;
+  new_status: string;
+  reason: string;
+  created_at: string;
+}
+
+export interface LiveAttendanceDashboardData {
+  date: string;
+  timezone: string;
+  total_employees: number;
+  present_today: number;
+  absent_today: number;
+  late_today: number;
+  checked_in_count: number;
+  checked_out_count: number;
+  pending_ot_approvals: number;
+  first_check_in: string;
+  last_check_out: string;
+  total_records_today: number;
+  k40_devices: Array<Partial<DeviceRecord>>;
+  k40_connected_count: number;
+  k40_total_count: number;
+  k40_status: 'Online' | 'Offline' | 'Not Configured';
+  last_sync_at: string;
+  pending_unmatched_count: number;
+  recent_records: AttendanceRecord[];
 }
 
 export interface LeaveRecord {
@@ -845,6 +939,15 @@ export interface ShiftDefinition {
   scheduling_system: '3-Shift' | '4-Shift' | 'Standard' | 'Security 24/7';
   start_time: string;
   end_time: string;
+  in_earliest?: string;
+  in_latest?: string;
+  out_earliest?: string;
+  out_latest?: string;
+  ot_start_time?: string;
+  ot_end_time?: string;
+  require_ot_approval?: number | boolean;
+  assigned_department?: string;
+  is_enabled?: number | boolean;
   break_minutes: number;
   working_days: string; // JSON array string e.g. ["Mon","Tue","Wed","Thu","Fri"]
   rest_days: string; // JSON array string
@@ -1107,6 +1210,9 @@ export interface ZkRealtimeListenerStatus {
 
 export interface CompanyDeviceSecurityStatus {
   policy_enabled: boolean;
+  has_users?: boolean;
+  requires_first_admin_setup?: boolean;
+  policy_configured?: boolean;
   device_uid: string;
   device_registered: boolean;
   device_verified: boolean;
@@ -1131,5 +1237,26 @@ export interface AuthorizedCompanyDeviceRecord {
   registered_by: string;
   last_seen_at: string | null;
   created_at: string;
+}
+
+export interface I18nTranslationEntry {
+  id: number;
+  lang_code: string;
+  translation_key: string;
+  value_text: string;
+  is_approved: number | boolean;
+  source: string;
+  updated_by: string;
+  updated_at: string;
+}
+
+export interface I18nConfigResponse {
+  default_language: string;
+  enabled_languages: string[];
+  rtl_auto: boolean;
+  user_preferred_language: string;
+  requested_language: string;
+  translations: Record<string, string>;
+  coverage_counts: Array<{ lang_code: string; count: number }>;
 }
 

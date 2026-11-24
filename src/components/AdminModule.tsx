@@ -19,19 +19,25 @@ import {
   Send,
   Shield,
   Sliders,
+  Sparkles,
   Trash2,
   Unlock,
+  Upload,
   UserCheck,
   UserX,
   Users,
   X,
 } from 'lucide-react';
 import { api, getCompanyDeviceUid, getDetectedDeviceLabel } from '../api';
+import { useI18n } from '../i18n/I18nProvider';
+import { EN_DICTIONARY, STATIC_LOCALE_CODES, WORLD_LANGUAGES, findWorldLanguage } from '../i18n/languages';
 import type {
   AuditLogRecord,
   AuthorizedCompanyDeviceRecord,
   CompanySettings,
   DeviceRecord,
+  I18nConfigResponse,
+  I18nTranslationEntry,
   ModuleKey,
   NotificationChannelConfig,
   PlatformConfig,
@@ -40,7 +46,7 @@ import type {
   UserAccount,
   UserRole,
 } from '../types';
-import { LANGUAGE_OPTIONS, type AppLang } from '../utils/ethiopianCalendar';
+import { type AppLang } from '../utils/ethiopianCalendar';
 import {
   DEFAULT_APPROVING_DEPARTMENTS,
   DEFAULT_PLATFORM_CONFIG,
@@ -228,7 +234,7 @@ export const DEFAULT_RBAC_MATRIX: Record<UserRole, ModuleKey[]> = {
   Viewer: ['dashboard', 'chat', 'sync'],
 };
 
-type AdminTab = 'branding' | 'branches' | 'users' | 'rbac' | 'tenants' | 'platform' | 'logins' | 'device-security' | 'smtp';
+type AdminTab = 'branding' | 'branches' | 'users' | 'rbac' | 'tenants' | 'platform' | 'logins' | 'device-security' | 'languages' | 'smtp';
 
 interface AdminModuleProps {
   settings: CompanySettings | null;
@@ -260,6 +266,7 @@ export const AdminModule: React.FC<AdminModuleProps> = ({
   onSwitchTenant,
   onTenantsChanged,
 }) => {
+  const i18n = useI18n();
   const [tab, setTab] = useState<AdminTab>(
     currentUserRole === 'System Administrator' ? 'platform' : 'branding'
   );
@@ -392,6 +399,21 @@ export const AdminModule: React.FC<AdminModuleProps> = ({
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
+  // Multilingual & Translations Manager state
+  const [i18nDefaultLang, setI18nDefaultLang] = useState<string>('en');
+  const [i18nEnabledLangs, setI18nEnabledLangs] = useState<string[]>([]);
+  const [i18nRtlAuto, setI18nRtlAuto] = useState<boolean>(true);
+  const [i18nSavingSettings, setI18nSavingSettings] = useState<boolean>(false);
+  const [i18nCatalogSearch, setI18nCatalogSearch] = useState<string>('');
+  const [i18nEditorLang, setI18nEditorLang] = useState<string>('am');
+  const [i18nEntries, setI18nEntries] = useState<I18nTranslationEntry[]>([]);
+  const [i18nStaticPack, setI18nStaticPack] = useState<Record<string, string>>({});
+  const [i18nDraftValues, setI18nDraftValues] = useState<Record<string, string>>({});
+  const [i18nKeyFilter, setI18nKeyFilter] = useState<string>('');
+  const [i18nSavingKey, setI18nSavingKey] = useState<string | null>(null);
+  const [i18nBatchAiBusy, setI18nBatchAiBusy] = useState<boolean>(false);
+  const [i18nCoverageMap, setI18nCoverageMap] = useState<Record<string, number>>({});
+
   useEffect(() => {
     if (settings) {
       setForm(settings);
@@ -460,9 +482,56 @@ export const AdminModule: React.FC<AdminModuleProps> = ({
     }
   };
 
+  const loadI18nAdminData = async (targetLang = i18nEditorLang) => {
+    try {
+      const [cfg, rows] = await Promise.all([
+        api.get<I18nConfigResponse>(`/api/i18n/config?lang=${encodeURIComponent(targetLang)}`),
+        api.get<I18nTranslationEntry[]>(`/api/i18n/admin/translations?lang=${encodeURIComponent(targetLang)}`).catch(() => []),
+      ]);
+      setI18nDefaultLang(cfg.default_language || 'en');
+      setI18nEnabledLangs(Array.isArray(cfg.enabled_languages) ? cfg.enabled_languages : []);
+      setI18nRtlAuto(cfg.rtl_auto !== false);
+      setI18nEntries(rows);
+      const cov: Record<string, number> = {};
+      for (const c of cfg.coverage_counts || []) {
+        cov[c.lang_code] = Number(c.count || 0);
+      }
+      setI18nCoverageMap(cov);
+
+      let pack: Record<string, string> = {};
+      if (targetLang === 'en') {
+        pack = EN_DICTIONARY;
+      } else if (STATIC_LOCALE_CODES.has(targetLang)) {
+        try {
+          const res = await fetch(`/locales/${encodeURIComponent(targetLang)}.json`, { cache: 'no-cache' });
+          if (res.ok) pack = (await res.json()) as Record<string, string>;
+        } catch {
+          pack = {};
+        }
+      }
+      setI18nStaticPack(pack);
+
+      const drafts: Record<string, string> = {};
+      const dbMap = new Map(rows.map((r) => [r.translation_key, r.value_text]));
+      for (const k of Object.keys(EN_DICTIONARY)) {
+        drafts[k] = dbMap.get(k) || pack[k] || '';
+      }
+      setI18nDraftValues(drafts);
+    } catch {
+      // non-blocking
+    }
+  };
+
   useEffect(() => {
     loadAdminData();
+    void loadI18nAdminData(i18nEditorLang);
   }, [activeTenantId]);
+
+  useEffect(() => {
+    if (tab === 'languages') {
+      void loadI18nAdminData(i18nEditorLang);
+    }
+  }, [tab, i18nEditorLang]);
 
   const rbacMatrix = useMemo<Record<UserRole, ModuleKey[]>>(() => {
     try {
@@ -872,9 +941,118 @@ export const AdminModule: React.FC<AdminModuleProps> = ({
     }
   };
 
+  const handleSaveI18nSettings = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError(null);
+    setNotice(null);
+    setI18nSavingSettings(true);
+    try {
+      await api.put('/api/i18n/admin/settings', {
+        default_language: i18nDefaultLang,
+        enabled_languages: i18nEnabledLangs,
+        rtl_auto: i18nRtlAuto,
+      });
+      await i18n.refreshConfig();
+      await loadI18nAdminData(i18nEditorLang);
+      setNotice(`Saved global language settings (Default: ${findWorldLanguage(i18nDefaultLang).name}, Auto-RTL: ${i18nRtlAuto ? 'On' : 'Off'}).`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to save language settings');
+    } finally {
+      setI18nSavingSettings(false);
+    }
+  };
+
+  const handleSaveTranslationKey = async (translationKey: string) => {
+    const val = (i18nDraftValues[translationKey] || '').trim();
+    if (!val) {
+      setError(`Enter a translated value for "${translationKey}" before saving.`);
+      return;
+    }
+    setError(null);
+    setI18nSavingKey(translationKey);
+    try {
+      await api.put('/api/i18n/admin/translations', {
+        lang_code: i18nEditorLang,
+        translation_key: translationKey,
+        value_text: val,
+        is_approved: true,
+        source: 'manual',
+      });
+      await Promise.all([loadI18nAdminData(i18nEditorLang), i18n.refreshConfig()]);
+      setNotice(`Saved & approved [${i18nEditorLang}] translation for "${translationKey}".`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to save translation');
+    } finally {
+      setI18nSavingKey(null);
+    }
+  };
+
+  const handleBatchAiTranslateLang = async () => {
+    if (i18nEditorLang === 'en') return;
+    setError(null);
+    setNotice(null);
+    setI18nBatchAiBusy(true);
+    try {
+      const res = await i18n.translateMissingWithAi(i18nEditorLang);
+      await loadI18nAdminData(i18nEditorLang);
+      setNotice(
+        `AI translated ${res.generated} missing label(s) for ${findWorldLanguage(i18nEditorLang).name} (${res.cached} already cached).`
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'AI translation batch failed');
+    } finally {
+      setI18nBatchAiBusy(false);
+    }
+  };
+
+  const handleImportJsonPack = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setError(null);
+    setNotice(null);
+    try {
+      const raw = await file.text();
+      const parsed = JSON.parse(raw) as Record<string, unknown>;
+      const targetLang =
+        typeof parsed.lang_code === 'string' && parsed.lang_code.trim()
+          ? parsed.lang_code.trim()
+          : i18nEditorLang;
+      const translationsObj =
+        parsed.translations && typeof parsed.translations === 'object'
+          ? (parsed.translations as Record<string, unknown>)
+          : parsed;
+      const res = await api.post<{ ok: boolean; lang_code: string; imported: number }>('/api/i18n/admin/import', {
+        lang_code: targetLang,
+        translations: translationsObj,
+      });
+      await Promise.all([loadI18nAdminData(targetLang), i18n.refreshConfig()]);
+      setI18nEditorLang(res.lang_code);
+      setNotice(`Imported ${res.imported} JSON translation keys for "${res.lang_code}".`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Invalid JSON language pack file');
+    } finally {
+      e.target.value = '';
+    }
+  };
+
+  const handleExportJsonPack = () => {
+    const out: Record<string, string> = {};
+    for (const k of Object.keys(EN_DICTIONARY)) {
+      out[k] = i18nDraftValues[k] || i18nStaticPack[k] || (i18nEditorLang === 'en' ? EN_DICTIONARY[k] : '');
+    }
+    const blob = new Blob([JSON.stringify(out, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `sevensunday-locale-${i18nEditorLang}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
   const tabs: Array<{ key: AdminTab; label: string; icon: React.ReactNode }> = [
     { key: 'platform', label: 'System Admin Customizer', icon: <Sliders className="w-3.5 h-3.5" /> },
     { key: 'device-security', label: 'Company Devices & Code', icon: <Lock className="w-3.5 h-3.5" /> },
+    { key: 'languages', label: i18n.t('admin.tab.languages', 'Language & Translations'), icon: <Globe2 className="w-3.5 h-3.5" /> },
     { key: 'tenants', label: 'Tenants (Multi-Tenancy)', icon: <Layers className="w-3.5 h-3.5" /> },
     { key: 'branding', label: 'Company & Branding', icon: <Building2 className="w-3.5 h-3.5" /> },
     { key: 'branches', label: 'Branches & Depts', icon: <GitBranch className="w-3.5 h-3.5" /> },
@@ -896,7 +1074,7 @@ export const AdminModule: React.FC<AdminModuleProps> = ({
               System Administrator & Company Governance Console
             </h2>
             <p className="text-xs text-slate-500 dark:text-slate-400">
-              Full-platform System Administrator controls: customize all {ALL_MATRIX_MODULES.length} modules, multi-tenant workspaces, approving departments, 6 languages, branding, RBAC, and SMTP.
+              Full-platform System Administrator controls: customize all {ALL_MATRIX_MODULES.length} modules, multi-tenant workspaces, approving departments, 200+ languages &amp; RTL, branding, RBAC, and SMTP.
             </p>
           </div>
           <div className="flex items-center gap-2">
@@ -1091,7 +1269,7 @@ export const AdminModule: React.FC<AdminModuleProps> = ({
                   onChange={(e) => setPlatformCfg({ ...platformCfg, enable_multi_language: e.target.checked })}
                   className="w-4 h-4 accent-[#087CEB]"
                 />
-                <span>Enable Multi-Language Switcher (6 Languages)</span>
+                <span>Enable Multi-Language Switcher (200+ Languages)</span>
               </label>
               <label className="flex items-center gap-2.5 p-3 bg-[#F8FAFC] dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 rounded-lg cursor-pointer text-xs font-semibold">
                 <input
@@ -1384,9 +1562,9 @@ export const AdminModule: React.FC<AdminModuleProps> = ({
                   }
                   className="w-full px-3 py-2 text-xs bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg"
                 >
-                  {LANGUAGE_OPTIONS.map((opt) => (
+                  {WORLD_LANGUAGES.map((opt) => (
                     <option key={opt.code} value={opt.code}>
-                      {opt.label}
+                      {opt.name} ({opt.nativeName})
                     </option>
                   ))}
                 </select>
@@ -1769,9 +1947,9 @@ export const AdminModule: React.FC<AdminModuleProps> = ({
                   onChange={(e) => setForm({ ...form, default_language: e.target.value as AppLang })}
                   className="w-full px-3 py-2 text-sm bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg"
                 >
-                  {LANGUAGE_OPTIONS.map((opt) => (
+                  {WORLD_LANGUAGES.map((opt) => (
                     <option key={opt.code} value={opt.code}>
-                      {opt.label}
+                      {opt.nativeName} · {opt.name} ({opt.code})
                     </option>
                   ))}
                 </select>
@@ -2634,6 +2812,324 @@ export const AdminModule: React.FC<AdminModuleProps> = ({
           </div>
         </div>
       )}
+
+      {/* TAB: LANGUAGE & TRANSLATIONS MANAGER (200+ LANGUAGES) */}
+      {tab === 'languages' && (() => {
+        const totalDictKeys = Object.keys(EN_DICTIONARY).length;
+        const catalogFiltered = WORLD_LANGUAGES.filter((l) => {
+          const q = i18nCatalogSearch.trim().toLowerCase();
+          if (!q) return true;
+          return (
+            l.name.toLowerCase().includes(q) ||
+            l.nativeName.toLowerCase().includes(q) ||
+            l.code.toLowerCase().includes(q) ||
+            l.region.toLowerCase().includes(q)
+          );
+        });
+        const dbMap = new Map(i18nEntries.map((r) => [r.translation_key, r]));
+        const editorKeys = Object.keys(EN_DICTIONARY).filter((k) => {
+          const q = i18nKeyFilter.trim().toLowerCase();
+          if (!q) return true;
+          return (
+            k.toLowerCase().includes(q) ||
+            EN_DICTIONARY[k].toLowerCase().includes(q) ||
+            (i18nDraftValues[k] || '').toLowerCase().includes(q)
+          );
+        });
+
+        return (
+          <div className="space-y-6">
+            {/* Global Language Policy */}
+            <form
+              onSubmit={handleSaveI18nSettings}
+              className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-6 space-y-4"
+            >
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <h3 className="text-base font-bold text-[#172033] dark:text-white flex items-center gap-2">
+                    <Globe2 className="w-4 h-4 text-[#087CEB]" />
+                    {i18n.t('admin.i18n.title', 'Multilingual Language & Translation Management')}
+                  </h3>
+                  <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                    Configure default company language, active languages (blank = all {WORLD_LANGUAGES.length}+ world languages), RTL auto-layout, and AI-assisted UI pack caching.
+                  </p>
+                </div>
+                <button
+                  type="submit"
+                  disabled={i18nSavingSettings}
+                  className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-bold text-white bg-[#087CEB] hover:bg-[#0265C4] disabled:opacity-60 rounded-lg whitespace-nowrap"
+                >
+                  <Save className="w-3.5 h-3.5" />
+                  {i18nSavingSettings ? 'Saving...' : 'Save Language Policy'}
+                </button>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4 pt-3 border-t border-slate-200 dark:border-slate-800">
+                <div>
+                  <label className="block text-xs font-medium text-slate-600 dark:text-slate-400 mb-1">
+                    {i18n.t('admin.i18n.defaultLang', 'Default Company Language')}
+                  </label>
+                  <select
+                    value={i18nDefaultLang}
+                    onChange={(e) => setI18nDefaultLang(e.target.value)}
+                    className="w-full px-3 py-2 text-xs bg-[#F8FAFC] dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg"
+                  >
+                    {WORLD_LANGUAGES.map((l) => (
+                      <option key={l.code} value={l.code}>
+                        {l.nativeName} · {l.name} ({l.code})
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div className="flex items-end">
+                  <label className="w-full flex items-center gap-2.5 p-2.5 bg-[#F8FAFC] dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 rounded-lg cursor-pointer text-xs font-semibold">
+                    <input
+                      type="checkbox"
+                      checked={i18nRtlAuto}
+                      onChange={(e) => setI18nRtlAuto(e.target.checked)}
+                      className="w-4 h-4 accent-[#087CEB]"
+                    />
+                    <span>{i18n.t('admin.i18n.autoRtl', 'Automatic RTL Layout (Arabic, Hebrew, Urdu, Persian)')}</span>
+                  </label>
+                </div>
+
+                <div className="flex items-end justify-between gap-2 p-2.5 bg-[#EAF4FF]/60 dark:bg-sky-950/30 border border-[#087CEB]/20 rounded-lg text-xs">
+                  <div>
+                    <div className="font-bold text-[#18243A] dark:text-[#38BDF8]">
+                      Active Catalog: {i18nEnabledLangs.length === 0 ? `All ${WORLD_LANGUAGES.length}+ Languages` : `${i18nEnabledLangs.length} Selected`}
+                    </div>
+                    <div className="text-[11px] text-slate-500">
+                      Current UI: {i18n.currentLanguage.nativeName} ({i18n.lang}) · {i18n.dir.toUpperCase()}
+                    </div>
+                  </div>
+                  {i18nEnabledLangs.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => setI18nEnabledLangs([])}
+                      className="text-[11px] font-semibold text-[#087CEB] hover:underline whitespace-nowrap"
+                    >
+                      Enable All
+                    </button>
+                  )}
+                </div>
+              </div>
+            </form>
+
+            {/* 200+ World Languages Catalog + Coverage */}
+            <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-6 space-y-4">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <h4 className="text-sm font-bold text-[#172033] dark:text-white">
+                    Supported World Languages Directory ({WORLD_LANGUAGES.length} ISO Languages)
+                  </h4>
+                  <p className="text-xs text-slate-500">
+                    Click a language to open its Translation Editor below, or check boxes to restrict the switcher to specific languages.
+                  </p>
+                </div>
+                <input
+                  type="text"
+                  placeholder="Search language, native name, ISO code, region..."
+                  value={i18nCatalogSearch}
+                  onChange={(e) => setI18nCatalogSearch(e.target.value)}
+                  className="px-3 py-1.5 text-xs bg-[#F8FAFC] dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg w-72"
+                />
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2 max-h-72 overflow-y-auto pr-1">
+                {catalogFiltered.map((l) => {
+                  const isStatic = l.code === 'en' || STATIC_LOCALE_CODES.has(l.code);
+                  const dbCount = i18nCoverageMap[l.code] || 0;
+                  const covPct = isStatic ? 100 : Math.min(100, Math.round((dbCount / Math.max(1, totalDictKeys)) * 100));
+                  const isEditing = i18nEditorLang === l.code;
+                  const isEnabled = i18nEnabledLangs.length === 0 || i18nEnabledLangs.includes(l.code);
+
+                  return (
+                    <div
+                      key={l.code}
+                      className={`p-2.5 rounded-lg border text-xs flex items-center justify-between gap-2 transition-colors ${
+                        isEditing
+                          ? 'border-[#087CEB] bg-[#EAF4FF] dark:bg-sky-950/50'
+                          : 'border-slate-200 dark:border-slate-700 bg-[#F8FAFC] dark:bg-slate-800/50 hover:border-[#087CEB]/50'
+                      }`}
+                    >
+                      <button
+                        type="button"
+                        onClick={() => setI18nEditorLang(l.code)}
+                        className="flex-1 text-left min-w-0"
+                      >
+                        <div className="font-bold text-[#172033] dark:text-white truncate">
+                          {l.nativeName} <span className="font-normal text-slate-500">· {l.name}</span>
+                        </div>
+                        <div className="text-[10px] font-mono text-slate-500 flex items-center gap-1.5 mt-0.5">
+                          <span>{l.code}</span>
+                          {l.dir === 'rtl' && (
+                            <span className="px-1 rounded bg-amber-100 text-amber-800 font-bold">RTL</span>
+                          )}
+                          <span
+                            className={`px-1 rounded font-semibold ${
+                              covPct === 100
+                                ? 'bg-emerald-100 text-emerald-700'
+                                : covPct > 0
+                                ? 'bg-sky-100 text-sky-700'
+                                : 'bg-slate-200 text-slate-600'
+                            }`}
+                          >
+                            {covPct}%
+                          </span>
+                        </div>
+                      </button>
+                      <input
+                        type="checkbox"
+                        title="Include when custom language whitelist is active"
+                        checked={isEnabled}
+                        onChange={() => {
+                          setI18nEnabledLangs((prev) => {
+                            const base = prev.length === 0 ? [l.code] : prev.includes(l.code) ? prev.filter((c) => c !== l.code) : [...prev, l.code];
+                            return base;
+                          });
+                        }}
+                        className="accent-[#087CEB] shrink-0"
+                      />
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Translation Editor & JSON Pack Import/Export */}
+            <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden">
+              <div className="p-5 border-b border-slate-200 dark:border-slate-800 flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+                <div>
+                  <h4 className="text-sm font-bold text-[#172033] dark:text-white">
+                    Translation Key Editor — {findWorldLanguage(i18nEditorLang).nativeName} ({i18nEditorLang})
+                  </h4>
+                  <p className="text-xs text-slate-500">
+                    Override or approve UI labels, import/export JSON packs, or auto-translate missing UI labels via Gemini (zero PII/biometrics sent).
+                  </p>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <select
+                    value={i18nEditorLang}
+                    onChange={(e) => setI18nEditorLang(e.target.value)}
+                    className="px-2.5 py-1.5 text-xs bg-[#F8FAFC] dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg"
+                  >
+                    {WORLD_LANGUAGES.map((l) => (
+                      <option key={`ed-${l.code}`} value={l.code}>
+                        {l.nativeName} ({l.code})
+                      </option>
+                    ))}
+                  </select>
+
+                  <input
+                    type="text"
+                    placeholder="Filter key or English text..."
+                    value={i18nKeyFilter}
+                    onChange={(e) => setI18nKeyFilter(e.target.value)}
+                    className="px-2.5 py-1.5 text-xs bg-[#F8FAFC] dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg w-48"
+                  />
+
+                  {i18nEditorLang !== 'en' && (
+                    <button
+                      type="button"
+                      disabled={i18nBatchAiBusy}
+                      onClick={handleBatchAiTranslateLang}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold text-white bg-[#087CEB] hover:bg-[#0265C4] disabled:opacity-60 rounded-lg whitespace-nowrap"
+                    >
+                      <Sparkles className="w-3.5 h-3.5" />
+                      {i18nBatchAiBusy ? 'Translating...' : i18n.t('admin.i18n.aiBatchTranslate', 'AI Translate Missing Keys')}
+                    </button>
+                  )}
+
+                  <label className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-[#172033] dark:text-slate-200 bg-[#F8FAFC] dark:bg-slate-800 border border-slate-300 dark:border-slate-700 hover:border-[#087CEB] rounded-lg cursor-pointer whitespace-nowrap">
+                    <Upload className="w-3.5 h-3.5" />
+                    {i18n.t('admin.i18n.importJson', 'Import JSON Pack')}
+                    <input type="file" accept=".json,application/json" onChange={handleImportJsonPack} className="hidden" />
+                  </label>
+
+                  <button
+                    type="button"
+                    onClick={handleExportJsonPack}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-[#18243A] bg-[#DBEAFE] hover:bg-[#BFDBFE] border border-[#087CEB]/30 rounded-lg whitespace-nowrap"
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                    {i18n.t('admin.i18n.exportJson', 'Export JSON Pack')}
+                  </button>
+                </div>
+              </div>
+
+              <div className="overflow-x-auto max-h-[460px] overflow-y-auto">
+                <table className="w-full text-left border-collapse text-xs">
+                  <thead className="sticky top-0 z-10 bg-[#18243A] text-white">
+                    <tr>
+                      <th className="py-2.5 px-4">Dictionary Key</th>
+                      <th className="py-2.5 px-4">English Source</th>
+                      <th className="py-2.5 px-4">Target Translation ({i18nEditorLang})</th>
+                      <th className="py-2.5 px-4">Origin</th>
+                      <th className="py-2.5 px-4 text-right">Save</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-200 dark:divide-slate-800">
+                    {editorKeys.map((k) => {
+                      const entry = dbMap.get(k);
+                      const hasStatic = Boolean(i18nStaticPack[k]);
+                      return (
+                        <tr key={k} className="hover:bg-[#F8FAFC] dark:hover:bg-slate-800/40">
+                          <td className="py-2 px-4 font-mono font-semibold text-[#172033] dark:text-slate-200 whitespace-nowrap">
+                            {k}
+                          </td>
+                          <td className="py-2 px-4 text-slate-600 dark:text-slate-400 max-w-[240px]">
+                            {EN_DICTIONARY[k]}
+                          </td>
+                          <td className="py-2 px-4 min-w-[260px]">
+                            <input
+                              type="text"
+                              dir={findWorldLanguage(i18nEditorLang).dir}
+                              value={i18nDraftValues[k] ?? ''}
+                              placeholder={EN_DICTIONARY[k]}
+                              onChange={(e) =>
+                                setI18nDraftValues((prev) => ({ ...prev, [k]: e.target.value }))
+                              }
+                              className="w-full px-2.5 py-1.5 text-xs bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded"
+                            />
+                          </td>
+                          <td className="py-2 px-4 whitespace-nowrap">
+                            {entry ? (
+                              <span className="px-2 py-0.5 text-[10px] font-bold rounded bg-emerald-100 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300">
+                                DB · {entry.source}
+                              </span>
+                            ) : hasStatic ? (
+                              <span className="px-2 py-0.5 text-[10px] font-bold rounded bg-sky-100 text-sky-700 dark:bg-sky-950/60 dark:text-sky-300">
+                                Static Pack
+                              </span>
+                            ) : (
+                              <span className="px-2 py-0.5 text-[10px] font-semibold rounded bg-slate-100 text-slate-500 dark:bg-slate-800">
+                                Fallback EN
+                              </span>
+                            )}
+                          </td>
+                          <td className="py-2 px-4 text-right whitespace-nowrap">
+                            <button
+                              type="button"
+                              disabled={i18nSavingKey === k}
+                              onClick={() => handleSaveTranslationKey(k)}
+                              className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] font-bold text-white bg-[#18243A] hover:bg-[#087CEB] disabled:opacity-50 rounded"
+                            >
+                              <Save className="w-3 h-3" />
+                              {i18nSavingKey === k ? '...' : 'Save'}
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       {/* TAB 6: BACKUP, RESET & SMTP */}
       {tab === 'smtp' && (
