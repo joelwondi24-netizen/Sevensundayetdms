@@ -10,6 +10,7 @@ import {
   doc,
   getDocFromServer,
   getFirestore,
+  initializeFirestore,
   type Firestore,
 } from 'firebase/firestore';
 import firebaseConfig from '../../firebase-applet-config.json';
@@ -114,10 +115,21 @@ export const firebaseApp: FirebaseApp = getApps().length
   ? getApp()
   : initializeApp(resolvedFirebaseConfig);
 
-export const db: Firestore = getFirestore(
-  firebaseApp,
-  firebaseConfig.firestoreDatabaseId
-);
+function createFirestoreClient(app: FirebaseApp): Firestore {
+  try {
+    return initializeFirestore(
+      app,
+      {
+        experimentalForceLongPolling: true,
+      },
+      firebaseConfig.firestoreDatabaseId
+    );
+  } catch {
+    return getFirestore(app, firebaseConfig.firestoreDatabaseId);
+  }
+}
+
+export const db: Firestore = createFirestoreClient(firebaseApp);
 
 export const auth: Auth = getAuth(firebaseApp);
 

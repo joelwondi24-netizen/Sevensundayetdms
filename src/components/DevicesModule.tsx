@@ -24,15 +24,31 @@ import {
   Shield,
   ShieldAlert,
   ShieldCheck,
+  SlidersHorizontal,
   Square,
   Trash2,
+  TrendingUp,
   Unplug,
   Usb,
   UserPlus,
   Webhook,
+  WifiOff,
   X,
   XCircle,
 } from 'lucide-react';
+import {
+  Bar,
+  CartesianGrid,
+  ComposedChart,
+  Legend,
+  Line,
+  ReferenceArea,
+  ReferenceLine,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from 'recharts';
 import { api, downloadFile, getApiTenantId } from '../api';
 import { useI18n } from '../i18n/I18nProvider';
 import type { WsEventPayload } from '../hooks/useRealtimeWS';
@@ -41,6 +57,7 @@ import type {
   DeviceRecord,
   DeviceScanResult,
   DeviceSyncLogRecord,
+  DeviceTelemetryResponse,
   EmployeeProfile,
   ModuleKey,
   StaffFingerprintRecord,
@@ -225,6 +242,13 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
   const [modalEnrolledFp, setModalEnrolledFp] = useState<StaffFingerprintRecord | null>(null);
   const [modalCheckinBusy, setModalCheckinBusy] = useState(false);
 
+  // 30-Day Telemetry & Latency Threshold Config state
+  const [telemetry, setTelemetry] = useState<DeviceTelemetryResponse | null>(null);
+  const [telemetryLoading, setTelemetryLoading] = useState(false);
+  const [telemetryChartView, setTelemetryChartView] = useState<'daily' | 'probes'>('daily');
+  const [thresholdInput, setThresholdInput] = useState('150');
+  const [savingThreshold, setSavingThreshold] = useState(false);
+
   const emptyForm = {
     device_type: DEVICE_TYPES[0],
     model: 'ZKTeco K40',
@@ -240,6 +264,7 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
     comm_password: '',
     sync_interval_sec: '3',
     auto_sync_enabled: true,
+    latency_threshold_ms: '150',
     has_comm_password: false,
   };
   const [form, setForm] = useState(emptyForm);
@@ -343,6 +368,18 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
       setRealtimeListeners(list);
     } catch {
       // ignore initial listener fetch error
+    }
+  };
+
+  const loadTelemetry = async (deviceId: number, silent = false) => {
+    try {
+      if (!silent) setTelemetryLoading(true);
+      const res = await api.get<DeviceTelemetryResponse>(`/api/devices/${deviceId}/telemetry?days=30`);
+      setTelemetry(res);
+    } catch {
+      // ignore transient telemetry load failure
+    } finally {
+      if (!silent) setTelemetryLoading(false);
     }
   };
 
@@ -469,11 +506,20 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
       return;
     }
 
+    if (lastWsEvent.event === 'device:telemetry') {
+      const targetId = analyticsDeviceIdRef.current;
+      if (targetId && (payload.id === undefined || Number(payload.id) === targetId)) {
+        loadTelemetry(targetId, true);
+      }
+      return;
+    }
+
     if (lastWsEvent.event === 'zkteco:sync_complete') {
       loadDevices(true);
       loadSyncLogs();
       loadBioLogs();
       loadUnmatchedUsers();
+      if (analyticsDeviceIdRef.current) loadTelemetry(analyticsDeviceIdRef.current, true);
       setLastLiveEventAt(new Date().toLocaleTimeString());
       return;
     }
@@ -493,6 +539,7 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
       loadRealtimeListeners();
       loadSyncLogs();
       loadBioLogs();
+      if (analyticsDeviceIdRef.current) loadTelemetry(analyticsDeviceIdRef.current, true);
     }
   }, [lastWsEvent]);
 
@@ -520,17 +567,23 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
           : '',
         sync_interval_sec: Math.min(60, Math.max(2, Number(form.sync_interval_sec) || 3)),
         auto_sync_enabled: Boolean(form.auto_sync_enabled),
+        latency_threshold_ms: Math.min(10000, Math.max(10, Math.round(Number(form.latency_threshold_ms) || 150))),
         timezone: 'Africa/Addis_Ababa',
       };
       if (editingId !== null) {
         const updated = await api.put<DeviceRecord>(`/api/devices/${editingId}`, payload);
         setDevices((prev) => prev.map((d) => (d.id === editingId ? updated : d)));
+        if (analyticsDeviceIdRef.current === editingId) {
+          setThresholdInput(String(updated.latency_threshold_ms || 150));
+          loadTelemetry(editingId, true);
+        }
         setEditingId(null);
         setForm(emptyForm);
         setNotice(`Saved device connection "${updated.device_name}".`);
       } else {
         const created = await api.post<DeviceRecord>('/api/devices', payload);
         setDevices((prev) => [created, ...prev]);
+        setSelectedDeviceId(created.id);
         setForm(emptyForm);
         setNotice(`Registered device connection "${created.device_name}".`);
       }
@@ -553,6 +606,9 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
           updated.last_latency_ms !== null ? ` (${updated.last_latency_ms}ms)` : ''
         }`
       );
+      if (analyticsDeviceIdRef.current === id) {
+        loadTelemetry(id, true);
+      }
       onRefreshDashboard();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Connection probe failed');
@@ -570,6 +626,9 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
       setDevices(refreshed);
       const onlineCount = refreshed.filter((d) => d.status === 'Connected').length;
       setNotice(`Probed ${refreshed.length} device connections · ${onlineCount} live and connected.`);
+      if (analyticsDeviceIdRef.current) {
+        loadTelemetry(analyticsDeviceIdRef.current, true);
+      }
       onRefreshDashboard();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Batch probe failed');
@@ -792,6 +851,7 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
       comm_password: '',
       sync_interval_sec: '3',
       auto_sync_enabled: true,
+      latency_threshold_ms: '150',
       has_comm_password: false,
     });
     setNotice('Loaded ZKTeco K40 Read-Only preset (TCP 4370 + ADMS /iclock/cdata · 3s auto-poll). Enter your K40 LAN IP & Serial Number and click Save.');
@@ -811,9 +871,15 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
       setNotice(
         `Connection verified: ${dev.device_name} responded in ${res.latencyMs ?? 0}ms (${res.message || 'ZKTeco TCP 4370 OK'}).`
       );
+      if (analyticsDeviceIdRef.current === dev.id) {
+        loadTelemetry(dev.id, true);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : `Connection test failed for ${dev.device_name}`);
       loadDevices(true);
+      if (analyticsDeviceIdRef.current === dev.id) {
+        loadTelemetry(dev.id, true);
+      }
     } finally {
       setTestingConnId(null);
     }
@@ -843,11 +909,17 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
       loadSyncLogs();
       loadUnmatchedUsers();
       loadBioLogs();
+      if (analyticsDeviceIdRef.current === dev.id) {
+        loadTelemetry(dev.id, true);
+      }
       onRefreshDashboard();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'ZKTeco K40 Read-Only Sync failed');
       loadDevices(true);
       loadSyncLogs();
+      if (analyticsDeviceIdRef.current === dev.id) {
+        loadTelemetry(dev.id, true);
+      }
     } finally {
       setSyncingNowId(null);
     }
@@ -1232,6 +1304,55 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
     [devices, selectedDeviceId]
   );
   const selectedIsZktK40 = useMemo(() => isZktK40Device(selectedDevice), [selectedDevice]);
+  const analyticsDevice = useMemo(
+    () =>
+      (selectedDevice && isZktK40Device(selectedDevice) ? selectedDevice : null) ||
+      devices.find((d) => isZktK40Device(d)) ||
+      selectedDevice ||
+      devices[0] ||
+      null,
+    [devices, selectedDevice]
+  );
+  const analyticsDeviceIdRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    analyticsDeviceIdRef.current = analyticsDevice?.id ?? null;
+    if (analyticsDevice) {
+      setThresholdInput(String(analyticsDevice.latency_threshold_ms || 150));
+      loadTelemetry(analyticsDevice.id);
+    } else {
+      setTelemetry(null);
+    }
+  }, [analyticsDevice?.id]);
+
+  const handleSaveLatencyThreshold = async (e?: React.FormEvent, overrideMs?: number) => {
+    if (e) e.preventDefault();
+    if (!analyticsDevice) return;
+    const raw = overrideMs !== undefined ? overrideMs : Number(thresholdInput);
+    if (!Number.isFinite(raw) || raw < 10 || raw > 10000) {
+      setError('Latency threshold must be a number between 10ms and 10,000ms.');
+      return;
+    }
+    const nextThreshold = Math.round(raw);
+    setError(null);
+    setNotice(null);
+    setSavingThreshold(true);
+    try {
+      const updated = await api.patch<DeviceRecord>(`/api/devices/${analyticsDevice.id}/latency-threshold`, {
+        latency_threshold_ms: nextThreshold,
+      });
+      setDevices((prev) => prev.map((d) => (d.id === updated.id ? updated : d)));
+      setThresholdInput(String(updated.latency_threshold_ms || nextThreshold));
+      await loadTelemetry(analyticsDevice.id, true);
+      setNotice(
+        `Latency threshold for ${updated.device_name} updated to ${updated.latency_threshold_ms || nextThreshold}ms. Chart breach highlighting refreshed.`
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to save latency threshold');
+    } finally {
+      setSavingThreshold(false);
+    }
+  };
 
   const handleOpenRegisterBiometricModal = async (targetDev?: DeviceRecord | null) => {
     const dev = targetDev || selectedDevice;
@@ -2185,6 +2306,7 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
                               comm_password: '',
                               sync_interval_sec: String(dev.sync_interval_sec || 3),
                               auto_sync_enabled: Boolean(dev.auto_sync_enabled ?? true),
+                              latency_threshold_ms: String(dev.latency_threshold_ms || 150),
                               has_comm_password: Boolean(dev.has_comm_password),
                             });
                           }}
@@ -2211,6 +2333,616 @@ export const DevicesModule: React.FC<DevicesModuleProps> = ({
             </tbody>
           </table>
         </div>
+      </div>
+
+      {/* 30-Day ZKTeco K40 Connectivity Latency & Downtime Frequency Analytics + Latency Threshold Config */}
+      <div className="bg-[#FFFFFF] dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-6 space-y-5">
+        <div className="flex flex-col xl:flex-row xl:items-center justify-between gap-4">
+          <div>
+            <h3 className="text-base font-bold text-[#172033] dark:text-white flex items-center gap-2">
+              <TrendingUp className="w-4 h-4 text-[#087CEB]" />
+              ZKTeco K40 Hardware Performance · 30-Day Connectivity Latency &amp; Downtime
+            </h3>
+            <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+              Real probe &amp; sync telemetry recorded from TCP 4370 handshakes, background auto-polling, and LAN connector heartbeats. Periods exceeding your threshold are highlighted in red.
+            </p>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            {devices.length > 0 && (
+              <select
+                value={analyticsDevice ? String(analyticsDevice.id) : ''}
+                onChange={(e) => setSelectedDeviceId(Number(e.target.value))}
+                className="px-3 py-1.5 text-xs font-semibold bg-[#F8FAFC] dark:bg-slate-800 text-[#172033] dark:text-white border border-slate-300 dark:border-slate-700 rounded-lg"
+                aria-label="Select device for 30-day latency telemetry"
+              >
+                {devices.map((d) => (
+                  <option key={d.id} value={String(d.id)}>
+                    {d.device_name} ({d.ip_address}:{d.port})
+                  </option>
+                ))}
+              </select>
+            )}
+
+            <div className="inline-flex rounded-lg border border-slate-200 dark:border-slate-700 bg-[#F8FAFC] dark:bg-slate-800 p-0.5">
+              <button
+                type="button"
+                onClick={() => setTelemetryChartView('daily')}
+                className={`px-2.5 py-1 text-[11px] font-bold rounded-md transition-colors ${
+                  telemetryChartView === 'daily'
+                    ? 'bg-[#18243A] text-white'
+                    : 'text-slate-600 dark:text-slate-300 hover:text-[#172033]'
+                }`}
+              >
+                30-Day Trend
+              </button>
+              <button
+                type="button"
+                onClick={() => setTelemetryChartView('probes')}
+                className={`px-2.5 py-1 text-[11px] font-bold rounded-md transition-colors ${
+                  telemetryChartView === 'probes'
+                    ? 'bg-[#18243A] text-white'
+                    : 'text-slate-600 dark:text-slate-300 hover:text-[#172033]'
+                }`}
+              >
+                Live Probes ({telemetry?.recent_checks?.length ?? 0})
+              </button>
+            </div>
+
+            {analyticsDevice && (
+              <>
+                <button
+                  type="button"
+                  disabled={connectingId === analyticsDevice.id}
+                  onClick={() => handleConnect(analyticsDevice.id)}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold text-white bg-[#087CEB] hover:bg-[#0265C4] disabled:opacity-60 rounded-lg whitespace-nowrap"
+                >
+                  {connectingId === analyticsDevice.id ? (
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  ) : (
+                    <Activity className="w-3.5 h-3.5" />
+                  )}
+                  Probe Latency Now
+                </button>
+                <button
+                  type="button"
+                  disabled={telemetryLoading}
+                  onClick={() => loadTelemetry(analyticsDevice.id)}
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-semibold text-[#172033] dark:text-slate-200 bg-[#F8FAFC] dark:bg-slate-800 border border-slate-200 dark:border-slate-700 hover:border-[#087CEB] rounded-lg whitespace-nowrap"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${telemetryLoading ? 'animate-spin' : ''}`} />
+                  Refresh
+                </button>
+              </>
+            )}
+          </div>
+        </div>
+
+        {!analyticsDevice ? (
+          <div className="p-6 rounded-xl border border-dashed border-slate-300 dark:border-slate-700 bg-[#F8FAFC] dark:bg-slate-800/40 text-center space-y-2">
+            <p className="text-xs font-semibold text-[#172033] dark:text-slate-200">
+              No ZKTeco K40 hardware terminal registered yet.
+            </p>
+            <p className="text-xs text-slate-500">
+              Load the ZKTeco K40 Preset or register your terminal above to configure latency thresholds and track real 30-day connectivity latency &amp; downtime.
+            </p>
+          </div>
+        ) : (
+          <>
+            {/* Latency Threshold Configuration Bar */}
+            <form
+              onSubmit={(e) => handleSaveLatencyThreshold(e)}
+              className="p-4 rounded-xl border border-slate-200 dark:border-slate-700 bg-[#F8FAFC] dark:bg-slate-800/50 flex flex-col lg:flex-row lg:items-center justify-between gap-4"
+            >
+              <div className="flex items-start gap-2.5">
+                <div className="w-8 h-8 rounded-lg bg-[#EAF4FF] dark:bg-sky-950/70 text-[#087CEB] flex items-center justify-center shrink-0">
+                  <SlidersHorizontal className="w-4 h-4" />
+                </div>
+                <div>
+                  <div className="text-xs font-bold text-[#172033] dark:text-white">
+                    Latency Threshold Alert Limit · {analyticsDevice.device_name}
+                  </div>
+                  <div className="text-[11px] text-slate-500 dark:text-slate-400">
+                    Active ceiling:{' '}
+                    <span className="font-mono font-bold text-red-600 dark:text-red-400">
+                      {telemetry?.threshold_ms ?? analyticsDevice.latency_threshold_ms ?? 150}ms
+                    </span>
+                    . Chart periods exceeding this limit are shaded red and listed below.
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2">
+                <div className="flex items-center gap-1.5">
+                  {[50, 100, 150, 300, 500].map((preset) => (
+                    <button
+                      key={preset}
+                      type="button"
+                      disabled={savingThreshold}
+                      onClick={() => {
+                        setThresholdInput(String(preset));
+                        void handleSaveLatencyThreshold(undefined, preset);
+                      }}
+                      className={`px-2 py-1 text-[11px] font-mono font-bold rounded border transition-colors ${
+                        Number(thresholdInput) === preset
+                          ? 'bg-[#18243A] text-white border-[#18243A]'
+                          : 'bg-white dark:bg-slate-900 text-slate-600 dark:text-slate-300 border-slate-300 dark:border-slate-700 hover:border-[#087CEB]'
+                      }`}
+                    >
+                      {preset}ms
+                    </button>
+                  ))}
+                </div>
+
+                <div className="flex items-center gap-1.5">
+                  <input
+                    type="number"
+                    min={10}
+                    max={10000}
+                    step={5}
+                    value={thresholdInput}
+                    onChange={(e) => setThresholdInput(e.target.value)}
+                    aria-label="Latency threshold in milliseconds"
+                    className="w-24 px-2.5 py-1.5 text-xs font-mono font-bold bg-white dark:bg-slate-900 text-[#172033] dark:text-white border border-slate-300 dark:border-slate-700 rounded-lg focus:outline-none focus:border-[#087CEB]"
+                  />
+                  <span className="text-xs font-mono text-slate-500">ms</span>
+                  <button
+                    type="submit"
+                    disabled={savingThreshold}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold text-white bg-[#18243A] hover:bg-[#172033] disabled:opacity-60 rounded-lg whitespace-nowrap"
+                  >
+                    {savingThreshold ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Save className="w-3.5 h-3.5 text-[#38BDF8]" />}
+                    Save Threshold
+                  </button>
+                </div>
+              </div>
+            </form>
+
+            {/* 30-Day Telemetry KPI Strip */}
+            <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+              <div className="p-3.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-[#F8FAFC] dark:bg-slate-800/40">
+                <div className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">
+                  30-Day Avg Latency
+                </div>
+                <div className="mt-1 text-xl font-extrabold font-mono text-[#172033] dark:text-white tabular-nums">
+                  {telemetry?.summary.avg_latency_ms !== null && telemetry?.summary.avg_latency_ms !== undefined
+                    ? `${telemetry.summary.avg_latency_ms}ms`
+                    : '--'}
+                </div>
+                <div className="text-[11px] text-slate-500 mt-0.5 tabular-nums">
+                  {telemetry?.summary.online_checks ?? 0} online check(s)
+                </div>
+              </div>
+
+              <div className="p-3.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-[#F8FAFC] dark:bg-slate-800/40">
+                <div className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">
+                  Peak Latency (30d)
+                </div>
+                <div
+                  className={`mt-1 text-xl font-extrabold font-mono tabular-nums ${
+                    telemetry?.summary.peak_latency_ms !== null &&
+                    telemetry?.summary.peak_latency_ms !== undefined &&
+                    telemetry.summary.peak_latency_ms > (telemetry.threshold_ms || 150)
+                      ? 'text-red-600 dark:text-red-400'
+                      : 'text-[#087CEB]'
+                  }`}
+                >
+                  {telemetry?.summary.peak_latency_ms !== null && telemetry?.summary.peak_latency_ms !== undefined
+                    ? `${telemetry.summary.peak_latency_ms}ms`
+                    : '--'}
+                </div>
+                <div className="text-[11px] text-slate-500 mt-0.5 tabular-nums">
+                  Min:{' '}
+                  {telemetry?.summary.min_latency_ms !== null && telemetry?.summary.min_latency_ms !== undefined
+                    ? `${telemetry.summary.min_latency_ms}ms`
+                    : '--'}
+                </div>
+              </div>
+
+              <div className="p-3.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-[#F8FAFC] dark:bg-slate-800/40">
+                <div className="text-[11px] font-semibold uppercase tracking-wider text-amber-700 dark:text-amber-400">
+                  Downtime Frequency
+                </div>
+                <div className="mt-1 text-xl font-extrabold font-mono text-amber-700 dark:text-amber-400 tabular-nums">
+                  {telemetry?.summary.downtime_events ?? 0}
+                </div>
+                <div className="text-[11px] text-slate-500 mt-0.5 tabular-nums">
+                  Uptime:{' '}
+                  {telemetry?.summary.uptime_pct !== null && telemetry?.summary.uptime_pct !== undefined
+                    ? `${telemetry.summary.uptime_pct}%`
+                    : '--'}
+                </div>
+              </div>
+
+              <div
+                className={`p-3.5 rounded-xl border ${
+                  (telemetry?.summary.threshold_breach_count ?? 0) > 0
+                    ? 'border-red-300 dark:border-red-800 bg-red-50/70 dark:bg-red-950/30'
+                    : 'border-slate-200 dark:border-slate-800 bg-[#F8FAFC] dark:bg-slate-800/40'
+                }`}
+              >
+                <div className="text-[11px] font-semibold uppercase tracking-wider text-red-700 dark:text-red-400">
+                  Threshold Breaches (&gt;{telemetry?.threshold_ms ?? 150}ms)
+                </div>
+                <div className="mt-1 text-xl font-extrabold font-mono text-red-700 dark:text-red-400 tabular-nums">
+                  {telemetry?.summary.threshold_breach_count ?? 0}
+                </div>
+                <div className="text-[11px] text-slate-500 mt-0.5 tabular-nums">
+                  Across {telemetry?.summary.exceeded_days_count ?? 0} day(s) in last 30d
+                </div>
+              </div>
+            </div>
+
+            {/* Recharts Connectivity Latency & Downtime Chart */}
+            {telemetryLoading && !telemetry ? (
+              <div className="h-[320px] flex items-center justify-center text-xs text-slate-500 border border-slate-200 dark:border-slate-800 rounded-xl">
+                <Loader2 className="w-4 h-4 animate-spin mr-2 text-[#087CEB]" />
+                Loading 30-day hardware latency &amp; downtime telemetry...
+              </div>
+            ) : !telemetry || telemetry.summary.total_checks === 0 ? (
+              <div className="p-8 rounded-xl border border-dashed border-slate-300 dark:border-slate-700 bg-[#F8FAFC] dark:bg-slate-800/40 text-center space-y-2">
+                <WifiOff className="w-6 h-6 text-slate-400 mx-auto" />
+                <div className="text-xs font-bold text-[#172033] dark:text-white">
+                  No real connectivity samples recorded yet for {analyticsDevice.device_name}
+                </div>
+                <p className="text-xs text-slate-500 max-w-lg mx-auto">
+                  Click <span className="font-semibold text-[#087CEB]">Probe Latency Now</span>, run{' '}
+                  <span className="font-semibold">Test Connection</span>, or enable <span className="font-semibold">Auto-Sync</span> to capture live TCP 4370 latency and downtime telemetry.
+                </p>
+              </div>
+            ) : (
+              <div className="space-y-4">
+                <div className="w-full h-[320px] pt-2">
+                  <ResponsiveContainer width="100%" height="100%">
+                    {telemetryChartView === 'daily' ? (
+                      <ComposedChart
+                        data={telemetry.daily}
+                        margin={{ top: 14, right: 20, left: 4, bottom: 8 }}
+                      >
+                        <CartesianGrid strokeDasharray="3 3" stroke="#cbd5e1" opacity={0.45} />
+                        <XAxis
+                          dataKey="label"
+                          tick={{ fontSize: 11, fill: '#64748b' }}
+                          minTickGap={18}
+                        />
+                        <YAxis
+                          yAxisId="latency"
+                          unit="ms"
+                          tick={{ fontSize: 11, fill: '#087CEB' }}
+                          domain={[
+                            0,
+                            (dataMax: number) =>
+                              Math.max(
+                                Math.ceil((telemetry.threshold_ms || 150) * 1.25),
+                                Math.ceil((Number.isFinite(dataMax) ? dataMax : 100) * 1.15)
+                              ),
+                          ]}
+                        />
+                        <YAxis
+                          yAxisId="downtime"
+                          orientation="right"
+                          allowDecimals={false}
+                          tick={{ fontSize: 11, fill: '#d97706' }}
+                        />
+                        <Tooltip
+                          content={({ active, payload }) => {
+                            if (!active || !payload || payload.length === 0) return null;
+                            const row = payload[0]?.payload as (typeof telemetry.daily)[number] | undefined;
+                            if (!row) return null;
+                            return (
+                              <div className="rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2.5 shadow-lg text-xs space-y-1">
+                                <div className="font-bold text-[#172033] dark:text-white flex items-center justify-between gap-4">
+                                  <span>
+                                    {row.label} ({row.date})
+                                  </span>
+                                  {row.exceeds_threshold && (
+                                    <span className="px-1.5 py-0.5 text-[10px] font-bold bg-red-100 text-red-700 rounded">
+                                      THRESHOLD EXCEEDED
+                                    </span>
+                                  )}
+                                </div>
+                                <div className="font-mono text-[#087CEB]">
+                                  Avg Latency: {row.avg_latency_ms !== null ? `${row.avg_latency_ms}ms` : 'No online probe'}
+                                </div>
+                                <div className="font-mono text-red-600">
+                                  Peak Latency: {row.max_latency_ms !== null ? `${row.max_latency_ms}ms` : '--'}
+                                  {row.exceeds_threshold && row.max_latency_ms !== null
+                                    ? ` (+${row.max_latency_ms - telemetry.threshold_ms}ms over ${telemetry.threshold_ms}ms)`
+                                    : ''}
+                                </div>
+                                <div className="font-mono text-amber-600">
+                                  Downtime Events: {row.downtime_count} · Checks: {row.checks_count}
+                                </div>
+                                {row.uptime_pct !== null && (
+                                  <div className="font-mono text-emerald-600">Uptime: {row.uptime_pct}%</div>
+                                )}
+                              </div>
+                            );
+                          }}
+                        />
+                        <Legend wrapperStyle={{ fontSize: '12px' }} />
+
+                        {/* Highlight daily periods where latency exceeded configured threshold */}
+                        {telemetry.daily.map((d) =>
+                          d.exceeds_threshold ? (
+                            <ReferenceArea
+                              key={`breach-band-${d.date}`}
+                              yAxisId="latency"
+                              x1={d.label}
+                              x2={d.label}
+                              fill="#ef4444"
+                              fillOpacity={0.18}
+                              stroke="#ef4444"
+                              strokeOpacity={0.35}
+                            />
+                          ) : null
+                        )}
+
+                        <ReferenceLine
+                          yAxisId="latency"
+                          y={telemetry.threshold_ms}
+                          stroke="#dc2626"
+                          strokeDasharray="6 4"
+                          strokeWidth={2}
+                          label={{
+                            value: `Limit: ${telemetry.threshold_ms}ms`,
+                            position: 'insideTopRight',
+                            fill: '#dc2626',
+                            fontSize: 11,
+                            fontWeight: 700,
+                          }}
+                        />
+
+                        <Bar
+                          yAxisId="downtime"
+                          dataKey="downtime_count"
+                          name="Downtime Frequency"
+                          fill="#f59e0b"
+                          barSize={14}
+                          radius={[4, 4, 0, 0]}
+                        />
+
+                        <Line
+                          yAxisId="latency"
+                          type="monotone"
+                          dataKey="avg_latency_ms"
+                          name="Avg Latency (ms)"
+                          stroke="#087CEB"
+                          strokeWidth={2.5}
+                          connectNulls
+                          dot={(dotProps) => {
+                            const { cx, cy, payload, index } = dotProps;
+                            if (typeof cx !== 'number' || typeof cy !== 'number') return <g key={`empty-${index}`} />;
+                            const exceeded = Boolean(payload?.exceeds_threshold);
+                            return (
+                              <circle
+                                key={`avg-dot-${index}`}
+                                cx={cx}
+                                cy={cy}
+                                r={exceeded ? 5.5 : 3.5}
+                                fill={exceeded ? '#dc2626' : '#087CEB'}
+                                stroke="#ffffff"
+                                strokeWidth={1.5}
+                              />
+                            );
+                          }}
+                          activeDot={{ r: 6 }}
+                        />
+
+                        <Line
+                          yAxisId="latency"
+                          type="monotone"
+                          dataKey="max_latency_ms"
+                          name="Peak Latency (ms)"
+                          stroke="#ef4444"
+                          strokeWidth={1.75}
+                          strokeDasharray="4 3"
+                          connectNulls
+                          dot={(dotProps) => {
+                            const { cx, cy, payload, index } = dotProps;
+                            if (typeof cx !== 'number' || typeof cy !== 'number') return <g key={`empty-p-${index}`} />;
+                            const exceeded =
+                              payload?.max_latency_ms !== null &&
+                              payload?.max_latency_ms !== undefined &&
+                              Number(payload.max_latency_ms) > telemetry.threshold_ms;
+                            if (!exceeded) return <g key={`normal-p-${index}`} />;
+                            return (
+                              <circle
+                                key={`peak-dot-${index}`}
+                                cx={cx}
+                                cy={cy}
+                                r={5}
+                                fill="#ef4444"
+                                stroke="#ffffff"
+                                strokeWidth={1.5}
+                              />
+                            );
+                          }}
+                        />
+                      </ComposedChart>
+                    ) : (
+                      <ComposedChart
+                        data={telemetry.recent_checks.map((c, idx) => ({
+                          ...c,
+                          indexLabel: `${formatLogTimestamp(c.checked_at).time} (#${idx + 1})`,
+                          shortTime: formatLogTimestamp(c.checked_at).time,
+                          downtime_flag: c.status === 'Offline' ? 1 : 0,
+                          online_latency: c.status === 'Online' ? c.latency_ms : null,
+                        }))}
+                        margin={{ top: 14, right: 20, left: 4, bottom: 8 }}
+                      >
+                        <CartesianGrid strokeDasharray="3 3" stroke="#cbd5e1" opacity={0.45} />
+                        <XAxis
+                          dataKey="shortTime"
+                          tick={{ fontSize: 10, fill: '#64748b' }}
+                          minTickGap={16}
+                        />
+                        <YAxis
+                          yAxisId="latency"
+                          unit="ms"
+                          tick={{ fontSize: 11, fill: '#087CEB' }}
+                          domain={[
+                            0,
+                            (dataMax: number) =>
+                              Math.max(
+                                Math.ceil((telemetry.threshold_ms || 150) * 1.25),
+                                Math.ceil((Number.isFinite(dataMax) ? dataMax : 100) * 1.15)
+                              ),
+                          ]}
+                        />
+                        <YAxis
+                          yAxisId="downtime"
+                          orientation="right"
+                          allowDecimals={false}
+                          domain={[0, 1]}
+                          tick={{ fontSize: 11, fill: '#d97706' }}
+                        />
+                        <Tooltip
+                          content={({ active, payload }) => {
+                            if (!active || !payload || payload.length === 0) return null;
+                            const row = payload[0]?.payload as
+                              | (typeof telemetry.recent_checks)[number] & { shortTime: string }
+                              | undefined;
+                            if (!row) return null;
+                            return (
+                              <div className="rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2.5 shadow-lg text-xs space-y-1">
+                                <div className="font-bold text-[#172033] dark:text-white flex items-center justify-between gap-3">
+                                  <span>
+                                    {formatLogTimestamp(row.checked_at).date} {row.shortTime}
+                                  </span>
+                                  <span
+                                    className={`px-1.5 py-0.5 text-[10px] font-bold rounded ${
+                                      row.status === 'Offline'
+                                        ? 'bg-amber-100 text-amber-800'
+                                        : row.exceeded_threshold
+                                        ? 'bg-red-100 text-red-700'
+                                        : 'bg-emerald-100 text-emerald-800'
+                                    }`}
+                                  >
+                                    {row.status === 'Offline'
+                                      ? 'OFFLINE'
+                                      : row.exceeded_threshold
+                                      ? 'EXCEEDED LIMIT'
+                                      : 'OK'}
+                                  </span>
+                                </div>
+                                <div className="font-mono text-[#087CEB]">Latency: {row.latency_ms}ms</div>
+                                <div className="text-slate-500">Source: {row.source}</div>
+                                {row.error_message && (
+                                  <div className="text-red-600 max-w-[240px] break-words">{row.error_message}</div>
+                                )}
+                              </div>
+                            );
+                          }}
+                        />
+                        <Legend wrapperStyle={{ fontSize: '12px' }} />
+
+                        <ReferenceLine
+                          yAxisId="latency"
+                          y={telemetry.threshold_ms}
+                          stroke="#dc2626"
+                          strokeDasharray="6 4"
+                          strokeWidth={2}
+                          label={{
+                            value: `Limit: ${telemetry.threshold_ms}ms`,
+                            position: 'insideTopRight',
+                            fill: '#dc2626',
+                            fontSize: 11,
+                            fontWeight: 700,
+                          }}
+                        />
+
+                        <Bar
+                          yAxisId="downtime"
+                          dataKey="downtime_flag"
+                          name="Downtime Event"
+                          fill="#f59e0b"
+                          barSize={10}
+                          radius={[3, 3, 0, 0]}
+                        />
+
+                        <Line
+                          yAxisId="latency"
+                          type="monotone"
+                          dataKey="online_latency"
+                          name="Probe Latency (ms)"
+                          stroke="#087CEB"
+                          strokeWidth={2}
+                          connectNulls
+                          dot={(dotProps) => {
+                            const { cx, cy, payload, index } = dotProps;
+                            if (typeof cx !== 'number' || typeof cy !== 'number') return <g key={`empty-r-${index}`} />;
+                            const exceeded = Boolean(payload?.exceeded_threshold);
+                            return (
+                              <circle
+                                key={`probe-dot-${index}`}
+                                cx={cx}
+                                cy={cy}
+                                r={exceeded ? 5.5 : 3.5}
+                                fill={exceeded ? '#dc2626' : '#087CEB'}
+                                stroke="#ffffff"
+                                strokeWidth={1.5}
+                              />
+                            );
+                          }}
+                        />
+                      </ComposedChart>
+                    )}
+                  </ResponsiveContainer>
+                </div>
+
+                {/* Highlighted Threshold Exceeded Periods List */}
+                {telemetry.exceeded_periods.length > 0 ? (
+                  <div className="p-4 rounded-xl border border-red-200 dark:border-red-900 bg-red-50/70 dark:bg-red-950/30 space-y-2.5">
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="text-xs font-bold text-red-800 dark:text-red-300 flex items-center gap-1.5">
+                        <AlertTriangle className="w-4 h-4 shrink-0" />
+                        Periods Exceeding {telemetry.threshold_ms}ms Latency Threshold ({telemetry.exceeded_periods.length})
+                      </div>
+                      <span className="text-[11px] font-mono text-red-700 dark:text-red-400">
+                        Total Breaches: {telemetry.summary.threshold_breach_count}
+                      </span>
+                    </div>
+                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2">
+                      {telemetry.exceeded_periods.map((ep) => (
+                        <div
+                          key={ep.date}
+                          className="p-2.5 rounded-lg bg-white dark:bg-slate-900 border border-red-200 dark:border-red-800/70 flex items-center justify-between gap-2 text-xs"
+                        >
+                          <div>
+                            <div className="font-bold text-[#172033] dark:text-white">
+                              {ep.label}{' '}
+                              <span className="font-mono font-normal text-slate-500">({ep.date})</span>
+                            </div>
+                            <div className="text-[11px] text-slate-500 font-mono">
+                              Avg: {ep.avg_latency_ms !== null ? `${ep.avg_latency_ms}ms` : '--'} · {ep.exceeded_count} breach(es)
+                            </div>
+                          </div>
+                          <div className="text-right font-mono shrink-0">
+                            <div className="font-extrabold text-red-600 dark:text-red-400">
+                              {ep.peak_latency_ms}ms
+                            </div>
+                            <div className="text-[10px] font-bold text-red-700 dark:text-red-300">
+                              +{ep.over_by_ms}ms over
+                            </div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ) : (
+                  <div className="px-4 py-2.5 rounded-xl border border-emerald-200 dark:border-emerald-900 bg-emerald-50/70 dark:bg-emerald-950/30 text-xs text-emerald-800 dark:text-emerald-300 flex items-center gap-2">
+                    <CheckCircle2 className="w-4 h-4 shrink-0" />
+                    <span>
+                      All {telemetry.summary.online_checks} recorded online check(s) in the last 30 days remained within the{' '}
+                      <span className="font-mono font-bold">{telemetry.threshold_ms}ms</span> latency threshold.
+                    </span>
+                  </div>
+                )}
+              </div>
+            )}
+          </>
+        )}
       </div>
 
       <div className="bg-[#FFFFFF] dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-4 flex items-center justify-between text-xs text-slate-600 dark:text-slate-400">

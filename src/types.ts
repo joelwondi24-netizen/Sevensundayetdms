@@ -295,6 +295,7 @@ export interface DeviceRecord {
   sync_interval_sec?: number;
   auto_sync_enabled?: number | boolean;
   read_only_mode?: number | boolean;
+  latency_threshold_ms?: number;
   timezone?: string;
   status: 'Disconnected' | 'Connected' | 'Unreachable';
   last_latency_ms: number | null;
@@ -309,6 +310,63 @@ export interface DeviceRecord {
   k40_fp_count?: number | null;
   k40_attlog_count?: number | null;
   k40_device_time?: string | null;
+}
+
+export interface DeviceTelemetryDailyPoint {
+  date: string;
+  label: string;
+  checks_count: number;
+  online_count: number;
+  downtime_count: number;
+  avg_latency_ms: number | null;
+  max_latency_ms: number | null;
+  min_latency_ms: number | null;
+  uptime_pct: number | null;
+  exceeded_count: number;
+  exceeds_threshold: boolean;
+}
+
+export interface DeviceTelemetryCheck {
+  id: number;
+  device_id: number;
+  status: 'Online' | 'Offline';
+  latency_ms: number;
+  threshold_ms: number;
+  exceeded_threshold: boolean;
+  source: string;
+  error_message: string;
+  checked_at: string;
+}
+
+export interface DeviceTelemetryExceededPeriod {
+  date: string;
+  label: string;
+  peak_latency_ms: number;
+  avg_latency_ms: number | null;
+  exceeded_count: number;
+  downtime_count: number;
+  threshold_ms: number;
+  over_by_ms: number;
+}
+
+export interface DeviceTelemetryResponse {
+  device: DeviceRecord;
+  days: number;
+  threshold_ms: number;
+  summary: {
+    total_checks: number;
+    online_checks: number;
+    downtime_events: number;
+    avg_latency_ms: number | null;
+    peak_latency_ms: number | null;
+    min_latency_ms: number | null;
+    uptime_pct: number | null;
+    threshold_breach_count: number;
+    exceeded_days_count: number;
+  };
+  daily: DeviceTelemetryDailyPoint[];
+  recent_checks: DeviceTelemetryCheck[];
+  exceeded_periods: DeviceTelemetryExceededPeriod[];
 }
 
 export interface DeviceSyncLogRecord {

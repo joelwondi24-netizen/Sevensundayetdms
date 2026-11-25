@@ -1063,6 +1063,7 @@ ensureColumn('devices', 'k40_user_count', 'INTEGER NOT NULL DEFAULT 0');
 ensureColumn('devices', 'k40_fp_count', 'INTEGER NOT NULL DEFAULT 0');
 ensureColumn('devices', 'k40_attlog_count', 'INTEGER NOT NULL DEFAULT 0');
 ensureColumn('devices', 'k40_device_time', "TEXT NOT NULL DEFAULT ''");
+ensureColumn('devices', 'latency_threshold_ms', 'INTEGER NOT NULL DEFAULT 150');
 
 ensureColumn('staff_fingerprints', 'auth_source', "TEXT NOT NULL DEFAULT 'ZKTeco K40'");
 ensureColumn('staff_fingerprints', 'credential_id', "TEXT NOT NULL DEFAULT ''");
@@ -1166,6 +1167,21 @@ CREATE TABLE IF NOT EXISTS unmatched_device_users (
   UNIQUE(tenant_id, device_id, device_user_id)
 );
 
+CREATE TABLE IF NOT EXISTS device_health_checks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id INTEGER NOT NULL DEFAULT 1,
+  device_id INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'Online',
+  latency_ms INTEGER NOT NULL DEFAULT 0,
+  threshold_ms INTEGER NOT NULL DEFAULT 150,
+  exceeded_threshold INTEGER NOT NULL DEFAULT 0,
+  source TEXT NOT NULL DEFAULT 'Probe',
+  error_message TEXT NOT NULL DEFAULT '',
+  checked_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_device_health_checks_lookup
+  ON device_health_checks (tenant_id, device_id, checked_at DESC);
+
 CREATE TABLE IF NOT EXISTS attendance_audit_logs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   tenant_id INTEGER NOT NULL DEFAULT 1,
@@ -1217,6 +1233,7 @@ const TENANT_SCOPED_TABLES = [
   'zk_enroll_jobs',
   'device_raw_punches',
   'device_sync_logs',
+  'device_health_checks',
   'unmatched_device_users',
   'attendance_audit_logs',
   'authorized_company_devices',
@@ -5216,6 +5233,72 @@ async function httpProbe(urlString: string, timeoutMs = 2500): Promise<{ ok: boo
   }
 }
 
+const lastTelemetryRecordedAt = new Map<number, { atMs: number; status: string }>();
+
+function recordDeviceHealthCheck(params: {
+  tenantId: number;
+  deviceId: number;
+  status: 'Online' | 'Offline';
+  latencyMs: number;
+  source: string;
+  errorMessage?: string;
+  throttleMs?: number;
+  checkedAt?: string;
+}) {
+  try {
+    const devRow = db
+      .prepare('SELECT latency_threshold_ms FROM devices WHERE id = ? AND tenant_id = ?')
+      .get(params.deviceId, params.tenantId) as { latency_threshold_ms?: number } | undefined;
+    const thresholdMs = Math.max(10, Number(devRow?.latency_threshold_ms) || 150);
+    const cleanLatency = Math.max(0, Math.round(Number(params.latencyMs) || 0));
+    const exceeded = params.status === 'Online' && cleanLatency > thresholdMs ? 1 : 0;
+    const nowMs = Date.now();
+    const prev = lastTelemetryRecordedAt.get(params.deviceId);
+    const throttleMs = Number(params.throttleMs || 0);
+
+    if (
+      throttleMs > 0 &&
+      prev &&
+      prev.status === params.status &&
+      exceeded === 0 &&
+      nowMs - prev.atMs < throttleMs
+    ) {
+      return { recorded: false, exceeded: false, thresholdMs };
+    }
+
+    const checkedAt = params.checkedAt || new Date().toISOString();
+    db.prepare(
+      `INSERT INTO device_health_checks (
+        tenant_id, device_id, status, latency_ms, threshold_ms, exceeded_threshold, source, error_message, checked_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      params.tenantId,
+      params.deviceId,
+      params.status,
+      cleanLatency,
+      thresholdMs,
+      exceeded,
+      String(params.source || 'Probe').slice(0, 64),
+      String(params.errorMessage || '').slice(0, 500),
+      checkedAt
+    );
+
+    lastTelemetryRecordedAt.set(params.deviceId, { atMs: nowMs, status: params.status });
+    broadcastWs('device:telemetry', {
+      id: params.deviceId,
+      tenant_id: params.tenantId,
+      status: params.status,
+      latency_ms: cleanLatency,
+      threshold_ms: thresholdMs,
+      exceeded_threshold: Boolean(exceeded),
+      checked_at: checkedAt,
+    });
+    return { recorded: true, exceeded: Boolean(exceeded), thresholdMs };
+  } catch {
+    return { recorded: false, exceeded: false, thresholdMs: 150 };
+  }
+}
+
 async function probeDeviceRecord(dev: {
   id: number;
   tenant_id: number;
@@ -5272,6 +5355,15 @@ async function probeDeviceRecord(dev: {
         dev.id
       );
     }
+    recordDeviceHealthCheck({
+      tenantId: dev.tenant_id,
+      deviceId: dev.id,
+      status: zkRes.ok ? 'Online' : 'Offline',
+      latencyMs: zkRes.latencyMs,
+      source: 'TCP 4370 Probe',
+      errorMessage: zkRes.ok ? '' : zkRes.message,
+      checkedAt: now,
+    });
     return {
       probe: { ok: zkRes.ok, latencyMs: zkRes.latencyMs, message: zkRes.message },
       status,
@@ -5302,6 +5394,15 @@ async function probeDeviceRecord(dev: {
       dev.id
     );
   }
+  recordDeviceHealthCheck({
+    tenantId: dev.tenant_id,
+    deviceId: dev.id,
+    status: probe.ok ? 'Online' : 'Offline',
+    latencyMs: probe.latencyMs,
+    source: useHttp ? 'HTTP Probe' : 'TCP Probe',
+    errorMessage: probe.ok ? '' : probe.message,
+    checkedAt: now,
+  });
   return { probe, status, updated: maskDeviceRow(db.prepare('SELECT * FROM devices WHERE id = ?').get(dev.id)) };
 }
 
@@ -5317,6 +5418,7 @@ function maskDeviceRow(row: unknown) {
     read_only_mode: r.read_only_mode === undefined ? 1 : Number(r.read_only_mode),
     sync_interval_sec: Number(r.sync_interval_sec || 3),
     auto_sync_enabled: Number(r.auto_sync_enabled || 0),
+    latency_threshold_ms: Math.max(10, Number(r.latency_threshold_ms) || 150),
     timezone: String(r.timezone || 'Africa/Addis_Ababa'),
   };
 }
@@ -5341,6 +5443,7 @@ app.post('/api/devices', (req, res) => {
   const encryptedCommPw = rawCommPw && rawCommPw !== '********' ? encryptField(rawCommPw) : '';
   const syncInterval = Math.min(60, Math.max(2, Number(b.sync_interval_sec) || 3));
   const autoSyncEnabled = b.auto_sync_enabled ? 1 : 0;
+  const latencyThresholdMs = Math.min(10000, Math.max(10, Math.round(Number(b.latency_threshold_ms) || 150)));
   const model = String(b.model || 'ZKTeco K40').trim() || 'ZKTeco K40';
   const info = db
     .prepare(
@@ -5348,9 +5451,9 @@ app.post('/api/devices', (req, res) => {
     INSERT INTO devices (
       tenant_id, device_type, protocol, device_name, model, ip_address, port, endpoint_url,
       subnet_mask, gateway, serial_number, api_key, comm_password_enc, sync_interval_sec, auto_sync_enabled,
-      read_only_mode, timezone, status, last_message
+      read_only_mode, latency_threshold_ms, timezone, status, last_message
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 'Disconnected', 'Registered (Read-Only Sync Mode) · Ready to probe')
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 'Disconnected', 'Registered (Read-Only Sync Mode) · Ready to probe')
   `
     )
     .run(
@@ -5369,6 +5472,7 @@ app.post('/api/devices', (req, res) => {
       encryptedCommPw,
       syncInterval,
       autoSyncEnabled,
+      latencyThresholdMs,
       String(b.timezone || 'Africa/Addis_Ababa')
     );
   const created = maskDeviceRow(db.prepare('SELECT * FROM devices WHERE id = ?').get(info.lastInsertRowid));
@@ -5380,53 +5484,268 @@ app.put('/api/devices/:id', (req, res) => {
   const tid = getTenantId(req);
   const id = Number(req.params.id);
   const b = req.body || {};
-  const existing = db.prepare('SELECT api_key, comm_password_enc FROM devices WHERE id = ? AND tenant_id = ?').get(id, tid) as
-    | { api_key?: string; comm_password_enc?: string }
+  const existing = db.prepare('SELECT * FROM devices WHERE id = ? AND tenant_id = ?').get(id, tid) as
+    | Record<string, unknown>
     | undefined;
+  if (!existing) {
+    res.status(404).json({ error: 'Device not found in active tenant workspace' });
+    return;
+  }
   const incomingKey = String(b.api_key || '').trim();
   const nextEncryptedKey =
     !incomingKey || incomingKey === '********'
-      ? existing?.api_key || encryptField(`SS-DEV-${id}`)
+      ? String(existing.api_key || '') || encryptField(`SS-DEV-${id}`)
       : encryptField(incomingKey);
   const incomingComm = String(b.comm_password || '').trim();
   const nextCommEnc =
     incomingComm === '********'
-      ? existing?.comm_password_enc || ''
+      ? String(existing.comm_password_enc || '')
       : incomingComm
       ? encryptField(incomingComm)
       : b.clear_comm_password
       ? ''
-      : existing?.comm_password_enc || '';
-  const syncInterval = Math.min(60, Math.max(2, Number(b.sync_interval_sec) || 3));
-  const autoSyncEnabled = b.auto_sync_enabled ? 1 : 0;
+      : String(existing.comm_password_enc || '');
+  const syncInterval = Math.min(60, Math.max(2, Number(b.sync_interval_sec ?? existing.sync_interval_sec) || 3));
+  const autoSyncEnabled =
+    b.auto_sync_enabled !== undefined ? (b.auto_sync_enabled ? 1 : 0) : Number(existing.auto_sync_enabled || 0);
+  const latencyThresholdMs =
+    b.latency_threshold_ms !== undefined
+      ? Math.min(10000, Math.max(10, Math.round(Number(b.latency_threshold_ms) || 150)))
+      : Math.max(10, Number(existing.latency_threshold_ms) || 150);
   db.prepare(
     `
     UPDATE devices SET
       device_type=?, protocol=?, device_name=?, model=?, ip_address=?, port=?, endpoint_url=?,
       subnet_mask=?, gateway=?, serial_number=?, api_key=?, comm_password_enc=?,
-      sync_interval_sec=?, auto_sync_enabled=?, read_only_mode=1, timezone=?
+      sync_interval_sec=?, auto_sync_enabled=?, read_only_mode=1, latency_threshold_ms=?, timezone=?
     WHERE id=? AND tenant_id=?
   `
   ).run(
-    b.device_type,
-    b.protocol || 'TCP/IP Socket',
-    b.device_name,
-    String(b.model || 'ZKTeco K40'),
-    b.ip_address,
-    Number(b.port) || 4370,
-    b.endpoint_url || '',
-    b.subnet_mask || '255.255.255.0',
-    b.gateway || '192.168.10.1',
-    b.serial_number || '',
+    b.device_type ?? existing.device_type,
+    b.protocol ?? existing.protocol ?? 'TCP/IP Socket',
+    b.device_name ?? existing.device_name,
+    String(b.model ?? existing.model ?? 'ZKTeco K40'),
+    b.ip_address ?? existing.ip_address,
+    Number(b.port ?? existing.port) || 4370,
+    b.endpoint_url ?? existing.endpoint_url ?? '',
+    b.subnet_mask ?? existing.subnet_mask ?? '255.255.255.0',
+    b.gateway ?? existing.gateway ?? '192.168.10.1',
+    b.serial_number ?? existing.serial_number ?? '',
     nextEncryptedKey,
     nextCommEnc,
     syncInterval,
     autoSyncEnabled,
-    String(b.timezone || 'Africa/Addis_Ababa'),
+    latencyThresholdMs,
+    String(b.timezone ?? existing.timezone ?? 'Africa/Addis_Ababa'),
     id,
     tid
   );
   res.json(maskDeviceRow(db.prepare('SELECT * FROM devices WHERE id = ? AND tenant_id = ?').get(id, tid)));
+});
+
+app.patch('/api/devices/:id/latency-threshold', (req, res) => {
+  const tid = getTenantId(req);
+  const id = Number(req.params.id);
+  const existing = db
+    .prepare('SELECT id, device_name, latency_threshold_ms FROM devices WHERE id = ? AND tenant_id = ?')
+    .get(id, tid) as { id: number; device_name: string; latency_threshold_ms?: number } | undefined;
+  if (!existing) {
+    res.status(404).json({ error: 'Device not found in active tenant workspace' });
+    return;
+  }
+  const raw = Number(req.body?.latency_threshold_ms);
+  if (!Number.isFinite(raw) || raw < 10 || raw > 10000) {
+    res.status(400).json({ error: 'Latency threshold must be between 10ms and 10,000ms.' });
+    return;
+  }
+  const nextThreshold = Math.round(raw);
+  db.prepare('UPDATE devices SET latency_threshold_ms = ? WHERE id = ? AND tenant_id = ?').run(nextThreshold, id, tid);
+  logAudit(
+    req,
+    'UPDATE_THRESHOLD',
+    'Device Connections',
+    `Updated latency threshold for ${existing.device_name} to ${nextThreshold}ms`,
+    tid
+  );
+  broadcastWs('device:telemetry', { id, tenant_id: tid, threshold_ms: nextThreshold });
+  res.json(maskDeviceRow(db.prepare('SELECT * FROM devices WHERE id = ? AND tenant_id = ?').get(id, tid)));
+});
+
+app.get('/api/devices/:id/telemetry', (req, res) => {
+  const tid = getTenantId(req);
+  const id = Number(req.params.id);
+  const days = Math.min(90, Math.max(1, Math.round(Number(req.query.days) || 30)));
+  const dev = db.prepare('SELECT * FROM devices WHERE id = ? AND tenant_id = ?').get(id, tid) as
+    | Record<string, unknown>
+    | undefined;
+  if (!dev) {
+    res.status(404).json({ error: 'Device not found in active tenant workspace' });
+    return;
+  }
+
+  const thresholdMs = Math.max(10, Number(dev.latency_threshold_ms) || 150);
+  const now = new Date();
+  const cutoffIso = new Date(now.getTime() - days * 86400000).toISOString();
+
+  const rows = db
+    .prepare(
+      `SELECT id, device_id, status, latency_ms, threshold_ms, exceeded_threshold, source, error_message, checked_at
+       FROM device_health_checks
+       WHERE tenant_id = ? AND device_id = ? AND checked_at >= ?
+       ORDER BY checked_at ASC, id ASC`
+    )
+    .all(tid, id, cutoffIso) as Array<{
+    id: number;
+    device_id: number;
+    status: string;
+    latency_ms: number;
+    threshold_ms: number;
+    exceeded_threshold: number;
+    source: string;
+    error_message: string;
+    checked_at: string;
+  }>;
+
+  const dayMap = new Map<
+    string,
+    {
+      checks: number;
+      online: number;
+      downtime: number;
+      latSum: number;
+      latMax: number | null;
+      latMin: number | null;
+      exceeded: number;
+    }
+  >();
+
+  const dateKeys: string[] = [];
+  for (let i = days - 1; i >= 0; i--) {
+    const d = new Date(now.getTime() - i * 86400000);
+    const key = formatDateToEatParts(d).date;
+    if (!dayMap.has(key)) {
+      dateKeys.push(key);
+      dayMap.set(key, {
+        checks: 0,
+        online: 0,
+        downtime: 0,
+        latSum: 0,
+        latMax: null,
+        latMin: null,
+        exceeded: 0,
+      });
+    }
+  }
+
+  let totalOnline = 0;
+  let totalDowntime = 0;
+  let totalLatSum = 0;
+  let globalPeak: number | null = null;
+  let globalMin: number | null = null;
+  let totalBreaches = 0;
+
+  for (const r of rows) {
+    const eatDate = parseTimestampToEat(r.checked_at).date;
+    const bucket = dayMap.get(eatDate);
+    const isOnline = r.status === 'Online';
+    const lat = Math.max(0, Number(r.latency_ms) || 0);
+    const breached = isOnline && lat > thresholdMs;
+
+    if (isOnline) {
+      totalOnline += 1;
+      totalLatSum += lat;
+      if (globalPeak === null || lat > globalPeak) globalPeak = lat;
+      if (globalMin === null || lat < globalMin) globalMin = lat;
+      if (breached) totalBreaches += 1;
+    } else {
+      totalDowntime += 1;
+    }
+
+    if (bucket) {
+      bucket.checks += 1;
+      if (isOnline) {
+        bucket.online += 1;
+        bucket.latSum += lat;
+        if (bucket.latMax === null || lat > bucket.latMax) bucket.latMax = lat;
+        if (bucket.latMin === null || lat < bucket.latMin) bucket.latMin = lat;
+        if (breached) bucket.exceeded += 1;
+      } else {
+        bucket.downtime += 1;
+      }
+    }
+  }
+
+  const monthFmt = new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric' });
+  const daily = dateKeys.map((dateStr) => {
+    const b = dayMap.get(dateStr)!;
+    const [yyyy, mm, dd] = dateStr.split('-').map(Number);
+    const label = monthFmt.format(new Date(Date.UTC(yyyy, (mm || 1) - 1, dd || 1, 12, 0, 0)));
+    const avgLatency = b.online > 0 ? Math.round(b.latSum / b.online) : null;
+    const exceedsThreshold = b.exceeded > 0 || (b.latMax !== null && b.latMax > thresholdMs);
+    return {
+      date: dateStr,
+      label,
+      checks_count: b.checks,
+      online_count: b.online,
+      downtime_count: b.downtime,
+      avg_latency_ms: avgLatency,
+      max_latency_ms: b.latMax,
+      min_latency_ms: b.latMin,
+      uptime_pct: b.checks > 0 ? Number(((b.online / b.checks) * 100).toFixed(1)) : null,
+      exceeded_count: b.exceeded,
+      exceeds_threshold: exceedsThreshold,
+    };
+  });
+
+  const exceededPeriods = daily
+    .filter((d) => d.exceeds_threshold && d.max_latency_ms !== null)
+    .map((d) => ({
+      date: d.date,
+      label: d.label,
+      peak_latency_ms: d.max_latency_ms!,
+      avg_latency_ms: d.avg_latency_ms,
+      exceeded_count: d.exceeded_count,
+      downtime_count: d.downtime_count,
+      threshold_ms: thresholdMs,
+      over_by_ms: Math.max(0, d.max_latency_ms! - thresholdMs),
+    }));
+
+  const recentChecks = rows.slice(-60).map((r) => {
+    const isOnline = r.status === 'Online';
+    const lat = Math.max(0, Number(r.latency_ms) || 0);
+    return {
+      id: r.id,
+      device_id: r.device_id,
+      status: isOnline ? ('Online' as const) : ('Offline' as const),
+      latency_ms: lat,
+      threshold_ms: thresholdMs,
+      exceeded_threshold: isOnline && lat > thresholdMs,
+      source: r.source,
+      error_message: r.error_message,
+      checked_at: r.checked_at,
+    };
+  });
+
+  const totalChecks = rows.length;
+  res.json({
+    device: maskDeviceRow(dev),
+    days,
+    threshold_ms: thresholdMs,
+    summary: {
+      total_checks: totalChecks,
+      online_checks: totalOnline,
+      downtime_events: totalDowntime,
+      avg_latency_ms: totalOnline > 0 ? Math.round(totalLatSum / totalOnline) : null,
+      peak_latency_ms: globalPeak,
+      min_latency_ms: globalMin,
+      uptime_pct: totalChecks > 0 ? Number(((totalOnline / totalChecks) * 100).toFixed(1)) : null,
+      threshold_breach_count: totalBreaches,
+      exceeded_days_count: exceededPeriods.length,
+    },
+    daily,
+    recent_checks: recentChecks,
+    exceeded_periods: exceededPeriods,
+  });
 });
 
 app.post('/api/devices/:id/connect', async (req, res) => {
@@ -8317,6 +8636,16 @@ function ingestReadOnlyK40Punches(opts: {
     dev.id
   );
 
+  recordDeviceHealthCheck({
+    tenantId: tid,
+    deviceId: dev.id,
+    status: 'Online',
+    latencyMs,
+    source: triggeredBy || syncSource,
+    throttleMs: triggeredBy === 'Auto-Poller' ? 30000 : 0,
+    checkedAt: completedAt,
+  });
+
   broadcastWs('device:status', { id: dev.id, status: 'Connected', tenant_id: tid });
   broadcastWs('zkteco:sync_complete', {
     device_id: dev.id,
@@ -8386,6 +8715,16 @@ async function syncZktecoDeviceReadOnly(
         `${result.message}. Retrying automatically when LAN returns (or use Local Read-Only LAN Connector / ADMS).`,
         dev.id
       );
+      recordDeviceHealthCheck({
+        tenantId: dev.tenant_id,
+        deviceId: dev.id,
+        status: 'Offline',
+        latencyMs: result.latencyMs,
+        source: triggeredBy,
+        errorMessage: result.message,
+        throttleMs: triggeredBy === 'Auto-Poller' ? 30000 : 0,
+        checkedAt: now,
+      });
       broadcastWs('device:status', { id: dev.id, status: 'Unreachable', tenant_id: dev.tenant_id });
       return { ok: false, latencyMs: result.latencyMs, error: result.message };
     }
@@ -8452,6 +8791,15 @@ app.post('/api/devices/:id/zkteco/test-connection', async (req, res) => {
       id
     );
     const updated = maskDeviceRow(db.prepare('SELECT * FROM devices WHERE id = ?').get(id));
+    recordDeviceHealthCheck({
+      tenantId: tid,
+      deviceId: id,
+      status: testRes.ok ? 'Online' : 'Offline',
+      latencyMs: testRes.latencyMs,
+      source: 'Test Connection',
+      errorMessage: testRes.ok ? '' : testRes.message,
+      checkedAt: now,
+    });
     broadcastWs('device:status', { id, status: testRes.ok ? 'Connected' : 'Unreachable', tenant_id: tid });
     if (!testRes.ok) {
       res.status(502).json({
@@ -8674,6 +9022,15 @@ app.post('/api/devices/zkteco/connector/heartbeat', (req, res) => {
       k40_attlog_count = COALESCE(?, k40_attlog_count)
     WHERE id = ?`
   ).run(now, fsizes?.users ?? null, fsizes?.fingerprints ?? null, fsizes?.attlogs ?? null, check.dev.id);
+  recordDeviceHealthCheck({
+    tenantId: check.dev.tenant_id,
+    deviceId: check.dev.id,
+    status: 'Online',
+    latencyMs: Number(req.body?.latency_ms) || 0,
+    source: 'LAN Connector Heartbeat',
+    throttleMs: 30000,
+    checkedAt: now,
+  });
   broadcastWs('device:status', { id: check.dev.id, status: 'Connected', tenant_id: check.dev.tenant_id });
   res.json({ ok: true });
 });
@@ -9300,7 +9657,9 @@ app.post('/api/devices/:id/disconnect', (req, res) => {
 
 app.delete('/api/devices/:id', (req, res) => {
   const tid = getTenantId(req);
-  db.prepare('DELETE FROM devices WHERE id = ? AND tenant_id = ?').run(Number(req.params.id), tid);
+  const devId = Number(req.params.id);
+  db.prepare('DELETE FROM device_health_checks WHERE device_id = ? AND tenant_id = ?').run(devId, tid);
+  db.prepare('DELETE FROM devices WHERE id = ? AND tenant_id = ?').run(devId, tid);
   res.json({ ok: true });
 });
 
