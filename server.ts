@@ -2695,6 +2695,7 @@ app.use('/api', (req: AuthedRequest, res, next) => {
     !fullPath.startsWith('/api/iclock/') &&
     !fullPath.startsWith('/api/devices/zkteco/bridge/') &&
     !fullPath.startsWith('/api/devices/zkteco/connector/') &&
+    !fullPath.startsWith('/api/i18n/translate') &&
     req.headers.origin
   ) {
     try {
@@ -14636,7 +14637,8 @@ async function translateWithGtxBatch(texts: string[], targetLang: string): Promi
 async function translateTextsReal(
   targetLang: string,
   targetLangName: string,
-  uniqueTexts: string[]
+  uniqueTexts: string[],
+  preferFast = false
 ): Promise<{
   translations: Record<string, string>;
   cached: number;
@@ -14666,13 +14668,13 @@ async function translateTextsReal(
   if (missing.length > 0) {
     const newlyTranslated: Array<{ source: string; translated: string; provider: string }> = [];
     let stillMissing = [...missing];
-
-    // 1) Primary: Fast Gemini call (bounded timeout so UI never stalls) when GEMINI_API_KEY is available
     const ai = getGeminiClient();
-    if (ai && stillMissing.length > 0) {
+
+    const runGeminiPass = async (itemsToTranslate: string[]) => {
+      if (!ai || itemsToTranslate.length === 0) return itemsToTranslate;
       try {
         const indexedObj: Record<string, string> = {};
-        stillMissing.forEach((txt, idx) => {
+        itemsToTranslate.forEach((txt, idx) => {
           indexedObj[String(idx)] = txt;
         });
         const aiPromise = ai.models.generateContent({
@@ -14687,7 +14689,7 @@ async function translateTextsReal(
         const rawText = (response.text || '').trim();
         const parsed = JSON.parse(rawText) as Record<string, unknown>;
         const remaining: string[] = [];
-        stillMissing.forEach((src, idx) => {
+        itemsToTranslate.forEach((src, idx) => {
           const val = parsed[String(idx)];
           if (typeof val === 'string' && val.trim()) {
             const clean = val.trim();
@@ -14697,30 +14699,65 @@ async function translateTextsReal(
             remaining.push(src);
           }
         });
-        stillMissing = remaining;
-        if (newlyTranslated.length > 0) usedProvider = 'ai';
+        if (newlyTranslated.some((x) => x.provider === 'ai')) {
+          usedProvider = usedProvider === 'gtx' ? 'gtx+ai' : 'ai';
+        }
+        return remaining;
       } catch (err) {
-        console.warn('[i18n Gemini fallback to GTX]', err instanceof Error ? err.message : err);
+        console.warn('[i18n Gemini fallback]', err instanceof Error ? err.message : err);
+        return itemsToTranslate;
       }
-    }
+    };
 
-    // 2) Secondary / Reliable Real Translation Engine: Google Translate GTX -> clients5 -> MyMemory
-    if (stillMissing.length > 0) {
+    if (preferFast && stillMissing.length > 3) {
+      // Fast real-time UI path: GTX parallel chunks (<800ms), then Gemini fallback if any string missed/untranslated
       const gtxMap = await translateWithGtxBatch(stillMissing, targetLang);
+      let unchangedCount = 0;
+      const gtxRemaining: string[] = [];
       for (const src of stillMissing) {
         const clean = gtxMap[src];
         if (clean && clean.trim()) {
+          if (clean.trim().toLowerCase() === src.trim().toLowerCase()) {
+            unchangedCount += 1;
+          }
           result[src] = clean.trim();
           newlyTranslated.push({ source: src, translated: clean.trim(), provider: 'gtx' });
+        } else {
+          gtxRemaining.push(src);
         }
       }
       if (newlyTranslated.some((x) => x.provider === 'gtx')) {
-        usedProvider = usedProvider === 'ai' ? 'ai+gtx' : 'gtx';
+        usedProvider = 'gtx';
+      }
+      // If GTX didn't support the language (e.g. Sidamo/Ge'ez returning mostly identical text) or missed items, invoke Gemini
+      if (gtxRemaining.length > 0 || (stillMissing.length >= 4 && unchangedCount / stillMissing.length > 0.75)) {
+        const retryList = unchangedCount / stillMissing.length > 0.75 ? stillMissing : gtxRemaining;
+        await runGeminiPass(retryList);
+      }
+    } else {
+      // Primary Gemini for small/explicit requests, then GTX fallback
+      stillMissing = await runGeminiPass(stillMissing);
+      if (stillMissing.length > 0) {
+        const gtxMap = await translateWithGtxBatch(stillMissing, targetLang);
+        for (const src of stillMissing) {
+          const clean = gtxMap[src];
+          if (clean && clean.trim()) {
+            result[src] = clean.trim();
+            newlyTranslated.push({ source: src, translated: clean.trim(), provider: 'gtx' });
+          }
+        }
+        if (newlyTranslated.some((x) => x.provider === 'gtx')) {
+          usedProvider = usedProvider === 'ai' ? 'ai+gtx' : 'gtx';
+        }
       }
     }
 
-    // 3) Persist to SQLite phrase cache
+    // Persist to SQLite phrase cache (deduping if Gemini overwrote an unchanged GTX entry)
     if (newlyTranslated.length > 0) {
+      const deduped = new Map<string, { source: string; translated: string; provider: string }>();
+      for (const item of newlyTranslated) {
+        deduped.set(item.source, item);
+      }
       const now = new Date().toISOString();
       const insStmt = db.prepare(
         `INSERT INTO i18n_phrase_cache (lang_code, source_hash, source_text, translated_text, provider, updated_at)
@@ -14731,12 +14768,12 @@ async function translateTextsReal(
            updated_at = excluded.updated_at`
       );
       const tx = db.transaction(() => {
-        for (const item of newlyTranslated) {
+        for (const item of deduped.values()) {
           insStmt.run(targetLang, sha256Hex(item.source), item.source, item.translated, item.provider, now);
         }
       });
       tx();
-      generatedCount = newlyTranslated.length;
+      generatedCount = deduped.size;
     }
   }
 
@@ -14791,7 +14828,7 @@ app.post('/api/i18n/translate-batch', async (req, res) => {
     return;
   }
 
-  const out = await translateTextsReal(targetLang, targetLangName, uniqueTexts);
+  const out = await translateTextsReal(targetLang, targetLangName, uniqueTexts, true);
   res.json({
     target_lang: targetLang,
     ...out,

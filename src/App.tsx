@@ -62,7 +62,7 @@ import { SupplyChainModule, type SupplyChainTab } from './components/SupplyChain
 import { ALL_COMPANY_FORMS } from './data/companyFormsCatalog';
 import { useOnlineStatus } from './hooks/usePWAInstall';
 import { useRealtimeWS, type WsEventPayload } from './hooks/useRealtimeWS';
-import { LanguageSwitcher, useI18n } from './i18n/I18nProvider';
+import { LanguageSwitcher, WorkspaceTranslationBar, useI18n } from './i18n/I18nProvider';
 import { getPendingQueue, setOfflineSyncKey, syncQueuedMutations } from './offline/syncEngine';
 import type {
   AuthSessionResponse,
@@ -342,6 +342,7 @@ export default function App() {
     dir: i18nDir,
     setLanguage: setI18nLanguage,
     syncUserLanguagePreference,
+    triggerDomScan,
     t,
   } = useI18n();
   const lang: AppLang = useMemo(() => {
@@ -408,8 +409,19 @@ export default function App() {
     document.documentElement.style.setProperty('--ss-accent', platformConfig.accent_color || '#38BDF8');
     if (platformConfig.platform_title || company?.brand_name) {
       document.title = platformConfig.platform_title || company?.brand_name || 'Seven Sunday ETMS';
+      triggerDomScan();
     }
-  }, [platformConfig, company?.brand_name]);
+  }, [platformConfig, company?.brand_name, triggerDomScan]);
+
+  // Ensure switching modules on the left sidebar or refreshing dashboard/tenant data always triggers right-side translation
+  useEffect(() => {
+    if (!currentUser || i18nLang === 'en') return;
+    triggerDomScan();
+    const timer = window.setTimeout(() => {
+      triggerDomScan();
+    }, 350);
+    return () => window.clearTimeout(timer);
+  }, [currentUser, activeModule, activeTenantId, tenantRefreshKey, i18nLang, summary, triggerDomScan]);
 
   const refreshQueueCount = useCallback(async () => {
     const q = await getPendingQueue();
@@ -1007,6 +1019,9 @@ export default function App() {
 
         {/* Keyed by activeTenantId + tenantRefreshKey so switching tenant cleanly reloads all module data */}
         <main key={`${activeTenantId}-${tenantRefreshKey}`} className="app-main-shell relative z-0 flex-1 min-w-0 p-3 sm:p-6 max-w-[1440px] w-full mx-auto">
+          {platformConfig.enable_multi_language !== false && (
+            <WorkspaceTranslationBar activeModule={activeModule} />
+          )}
           {activeModule === 'dashboard' && (
             <DashboardModule
               summary={summary}

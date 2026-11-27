@@ -2872,6 +2872,7 @@ export const AdminModule: React.FC<AdminModuleProps> = ({
                   <select
                     value={i18nDefaultLang}
                     onChange={(e) => setI18nDefaultLang(e.target.value)}
+                    data-no-translate="true"
                     className="w-full px-3 py-2 text-xs bg-[#F8FAFC] dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg"
                   >
                     {WORLD_LANGUAGES.map((l) => (
@@ -2958,7 +2959,7 @@ export const AdminModule: React.FC<AdminModuleProps> = ({
                         onClick={() => setI18nEditorLang(l.code)}
                         className="flex-1 text-left min-w-0"
                       >
-                        <div className="font-bold text-[#172033] dark:text-white truncate">
+                        <div data-no-translate="true" className="font-bold text-[#172033] dark:text-white truncate">
                           {l.nativeName} <span className="font-normal text-slate-500">· {l.name}</span>
                         </div>
                         <div className="text-[10px] font-mono text-slate-500 flex items-center gap-1.5 mt-0.5">
@@ -3013,6 +3014,7 @@ export const AdminModule: React.FC<AdminModuleProps> = ({
                   <select
                     value={i18nEditorLang}
                     onChange={(e) => setI18nEditorLang(e.target.value)}
+                    data-no-translate="true"
                     className="px-2.5 py-1.5 text-xs bg-[#F8FAFC] dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg"
                   >
                     {WORLD_LANGUAGES.map((l) => (

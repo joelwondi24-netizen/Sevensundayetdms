@@ -17,6 +17,8 @@ interface I18nContextValue {
   enabledLanguages: string[];
   rtlAuto: boolean;
   isTranslating: boolean;
+  translatedPhraseCount: number;
+  translationError: string | null;
   coveragePercent: (code: string) => number;
   favorites: string[];
   recents: string[];
@@ -25,6 +27,8 @@ interface I18nContextValue {
   syncUserLanguagePreference: (userLang?: string) => void;
   refreshConfig: () => Promise<void>;
   translateMissingWithAi: (targetCode?: string) => Promise<{ cached: number; generated: number }>;
+  translateNow: (scopeEl?: HTMLElement | null) => Promise<{ translated: number; error: string | null }>;
+  triggerDomScan: () => void;
   translateText: (text: string, targetCode?: string) => Promise<string>;
   t: (key: string, fallback?: string, vars?: Record<string, string | number>) => string;
   allDictionaryKeys: string[];
@@ -98,13 +102,21 @@ function shouldSkipElement(el: Element | null): boolean {
   return false;
 }
 
+const KEEP_ACRONYMS = new Set([
+  'ID', 'IP', 'OT', 'GRN', 'GIN', 'RFQ', 'CRM', 'ERP', 'ETB', 'USD', 'EUR', 'GBP', 'EAT',
+  'ADMS', 'TCP/IP', '2FA', 'MFA', 'SSO', 'RTL', 'LTR', 'CSV', 'PDF', 'XLSX', 'API', 'HTTP',
+  'URL', 'UID', 'PIN', 'K40', 'HQ', 'HR', 'IT', 'QR', 'A4', 'UTC+3', 'OK', 'N/A', 'AM', 'PM',
+  'MS', 'DB', 'UI', 'LAN', 'WAN', 'MAC', 'SMS', 'GPS', 'VAT', 'TIN', 'PLC', 'ETMS', 'EMS',
+]);
+
 function shouldTranslatePhrase(core: string): boolean {
   const trimmed = core.trim();
   if (!trimmed || trimmed.length > 1200) return false;
   // Must contain at least 2 Unicode letters
   if (!/\p{L}{2,}/u.test(trimmed)) return false;
-  // Keep short all-uppercase technical codes/abbreviations verbatim (ETB, GRN, GIN, ID, OT, TCP/IP, ADMS, K40, etc.)
-  if (/^[A-Z0-9/+.\-_]{1,6}$/.test(trimmed)) return false;
+  // Keep known technical acronyms / hardware codes verbatim while translating normal uppercase labels like LIVE, SYNC, PAID, LATE, SAVE
+  if (KEEP_ACRONYMS.has(trimmed.toUpperCase()) && !/^[a-z]/.test(trimmed)) return false;
+  if (/^[A-Z0-9]{1,3}$/.test(trimmed) && /\d/.test(trimmed)) return false;
   // Emails
   if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmed)) return false;
   // URLs or API paths
@@ -147,8 +159,12 @@ export const I18nProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [rtlAuto, setRtlAuto] = useState<boolean>(true);
   const [staticPack, setStaticPack] = useState<Record<string, string>>(EN_DICTIONARY);
   const [serverOverrides, setServerOverrides] = useState<Record<string, string>>({});
+  const serverOverridesRef = useRef<Record<string, string>>({});
+  serverOverridesRef.current = serverOverrides;
   const [coverageCounts, setCoverageCounts] = useState<Record<string, number>>({});
   const [isTranslating, setIsTranslating] = useState<boolean>(false);
+  const [translatedPhraseCount, setTranslatedPhraseCount] = useState<number>(0);
+  const [translationError, setTranslationError] = useState<string | null>(null);
   const [favorites, setFavorites] = useState<string[]>(() =>
     readJsonArray(LS_FAV_KEY, ['en', 'am', 'om', 'ti', 'ar', 'zh-CN'])
   );
@@ -167,10 +183,13 @@ export const I18nProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const trackedAttrsRef = useRef<Set<Element>>(new Set());
   const pendingQueueRef = useRef<Set<string>>(new Set());
   const inFlightPhrasesRef = useRef<Set<string>>(new Set());
+  const isFlushingRef = useRef<boolean>(false);
   const isApplyingDomRef = useRef<boolean>(false);
   const scanTimerRef = useRef<number | null>(null);
   const flushTimerRef = useRef<number | null>(null);
   const autoKeyTranslatedRef = useRef<Set<string>>(new Set());
+  const originalTitleRef = useRef<string>(typeof document !== 'undefined' ? document.title : '');
+  const lastAppliedTitleRef = useRef<string | null>(null);
 
   const currentLanguage = useMemo(() => findWorldLanguage(lang), [lang]);
   const dir: 'ltr' | 'rtl' = useMemo(() => {
@@ -249,7 +268,18 @@ export const I18nProvider: React.FC<{ children: React.ReactNode }> = ({ children
         setDefaultLanguage(String(data.default_language || 'en'));
         setEnabledLanguages(Array.isArray(data.enabled_languages) ? data.enabled_languages : []);
         setRtlAuto(data.rtl_auto !== false);
-        setServerOverrides(data.translations && typeof data.translations === 'object' ? data.translations : {});
+        const nextOverrides: Record<string, string> =
+          data.translations && typeof data.translations === 'object' ? data.translations : {};
+        const prevOverrides = serverOverridesRef.current;
+        const prevKeys = Object.keys(prevOverrides);
+        const nextKeys = Object.keys(nextOverrides);
+        const changed =
+          prevKeys.length !== nextKeys.length ||
+          nextKeys.some((k) => prevOverrides[k] !== nextOverrides[k]);
+        if (changed) {
+          serverOverridesRef.current = nextOverrides;
+          setServerOverrides(nextOverrides);
+        }
         const map: Record<string, number> = {};
         if (Array.isArray(data.coverage_counts)) {
           for (const c of data.coverage_counts) {
@@ -278,7 +308,9 @@ export const I18nProvider: React.FC<{ children: React.ReactNode }> = ({ children
           const rec = textStateMapRef.current.get(node);
           if (!rec) continue;
           const current = node.nodeValue ?? '';
-          if (rec.lastApplied !== null && current !== rec.lastApplied && current !== rec.original) {
+          if (rec.lastApplied === null && current !== rec.original) {
+            rec.original = current;
+          } else if (rec.lastApplied !== null && current !== rec.lastApplied && current !== rec.original) {
             rec.original = current;
             rec.lastApplied = null;
           }
@@ -304,7 +336,7 @@ export const I18nProvider: React.FC<{ children: React.ReactNode }> = ({ children
           }
         }
 
-        // 2) Attributes
+        // 2) Attributes + input button values
         for (const el of Array.from(trackedAttrsRef.current)) {
           if (!el.isConnected) {
             trackedAttrsRef.current.delete(el);
@@ -312,18 +344,23 @@ export const I18nProvider: React.FC<{ children: React.ReactNode }> = ({ children
           }
           const recMap = attrStateMapRef.current.get(el);
           if (!recMap) continue;
-          for (const attr of TRANSLATABLE_ATTRS) {
+          const attrKeys = [...TRANSLATABLE_ATTRS, 'value'] as const;
+          for (const attr of attrKeys) {
             const rec = recMap[attr];
             if (!rec) continue;
-            const current = el.getAttribute(attr);
+            const current =
+              attr === 'value' && el instanceof HTMLInputElement ? el.value : el.getAttribute(attr);
             if (current === null) continue;
-            if (rec.lastApplied !== null && current !== rec.lastApplied && current !== rec.original) {
+            if (rec.lastApplied === null && current !== rec.original) {
+              rec.original = current;
+            } else if (rec.lastApplied !== null && current !== rec.lastApplied && current !== rec.original) {
               rec.original = current;
               rec.lastApplied = null;
             }
             if (targetLang === 'en') {
               if (current !== rec.original) {
-                el.setAttribute(attr, rec.original);
+                if (attr === 'value' && el instanceof HTMLInputElement) el.value = rec.original;
+                else el.setAttribute(attr, rec.original);
               }
               rec.lastApplied = rec.original;
             } else if (phraseMap) {
@@ -332,13 +369,29 @@ export const I18nProvider: React.FC<{ children: React.ReactNode }> = ({ children
               if (translated) {
                 const nextVal = `${lead}${translated}${trail}`;
                 if (current !== nextVal) {
-                  el.setAttribute(attr, nextVal);
+                  if (attr === 'value' && el instanceof HTMLInputElement) el.value = nextVal;
+                  else el.setAttribute(attr, nextVal);
                 }
                 rec.lastApplied = nextVal;
               } else if (rec.lastApplied && current === rec.lastApplied && current !== rec.original) {
-                el.setAttribute(attr, rec.original);
+                if (attr === 'value' && el instanceof HTMLInputElement) el.value = rec.original;
+                else el.setAttribute(attr, rec.original);
                 rec.lastApplied = null;
               }
+            }
+          }
+        }
+
+        // 3) Document title
+        if (originalTitleRef.current) {
+          if (targetLang === 'en') {
+            if (document.title !== originalTitleRef.current) document.title = originalTitleRef.current;
+            lastAppliedTitleRef.current = originalTitleRef.current;
+          } else if (phraseMap) {
+            const trTitle = phraseMap.get(originalTitleRef.current.trim());
+            if (trTitle) {
+              if (document.title !== trTitle) document.title = trTitle;
+              lastAppliedTitleRef.current = trTitle;
             }
           }
         }
@@ -349,65 +402,96 @@ export const I18nProvider: React.FC<{ children: React.ReactNode }> = ({ children
     [getPhraseMap]
   );
 
-  const flushTranslationQueue = useCallback(async () => {
-    const targetLang = activeLangRef.current;
-    if (!targetLang || targetLang === 'en') {
-      pendingQueueRef.current.clear();
-      return;
-    }
-    const batch = Array.from(pendingQueueRef.current).filter((s) => !inFlightPhrasesRef.current.has(s));
-    pendingQueueRef.current.clear();
-    if (batch.length === 0) return;
-
-    const meta = findWorldLanguage(targetLang);
-    const phraseMap = getPhraseMap(targetLang);
-
-    // Send in chunks of up to 75 unique phrases
-    setIsTranslating(true);
+  const flushTranslationQueue = useCallback(async (): Promise<{ translated: number; error: string | null }> => {
+    if (isFlushingRef.current) return { translated: 0, error: null };
+    isFlushingRef.current = true;
+    let totalTranslated = 0;
+    let lastError: string | null = null;
     try {
-      for (let i = 0; i < batch.length; i += 75) {
-        if (activeLangRef.current !== targetLang) break;
-        const slice = batch.slice(i, i + 75);
-        slice.forEach((s) => inFlightPhrasesRef.current.add(s));
-        try {
-          const token = sessionStorage.getItem('ss_etms_token') || localStorage.getItem('ss_etms_token') || '';
-          const res = await fetch('/api/i18n/translate-batch', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              ...(token ? { Authorization: `Bearer ${token}` } : {}),
-            },
-            body: JSON.stringify({
-              target_lang: targetLang,
-              target_lang_name: meta.name,
-              texts: slice,
-            }),
-          });
-          if (res.ok) {
-            const data = (await res.json()) as { translations?: Record<string, string> };
-            if (data.translations) {
-              for (const [src, tr] of Object.entries(data.translations)) {
-                if (typeof tr === 'string' && tr.trim()) {
-                  phraseMap.set(src, tr.trim());
+      while (pendingQueueRef.current.size > 0) {
+        const targetLang = activeLangRef.current;
+        if (!targetLang || targetLang === 'en') {
+          pendingQueueRef.current.clear();
+          break;
+        }
+        const batch = Array.from(pendingQueueRef.current).filter((s) => !inFlightPhrasesRef.current.has(s));
+        pendingQueueRef.current.clear();
+        if (batch.length === 0) break;
+
+        const meta = findWorldLanguage(targetLang);
+        const phraseMap = getPhraseMap(targetLang);
+        setIsTranslating(true);
+
+        const chunks: string[][] = [];
+        for (let i = 0; i < batch.length; i += 65) {
+          chunks.push(batch.slice(i, i + 65));
+        }
+
+        // Execute up to 3 chunks concurrently so large pages translate in < 1s
+        for (let i = 0; i < chunks.length; i += 3) {
+          if (activeLangRef.current !== targetLang) break;
+          const wave = chunks.slice(i, i + 3);
+          await Promise.all(
+            wave.map(async (slice) => {
+              slice.forEach((s) => inFlightPhrasesRef.current.add(s));
+              try {
+                const token = sessionStorage.getItem('ss_etms_token') || localStorage.getItem('ss_etms_token') || '';
+                const res = await fetch('/api/i18n/translate-batch', {
+                  method: 'POST',
+                  headers: {
+                    'Content-Type': 'application/json',
+                    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+                  },
+                  body: JSON.stringify({
+                    target_lang: targetLang,
+                    target_lang_name: meta.name,
+                    texts: slice,
+                  }),
+                });
+                if (res.ok) {
+                  const data = (await res.json()) as { translations?: Record<string, string> };
+                  if (data.translations) {
+                    let countInSlice = 0;
+                    for (const [src, tr] of Object.entries(data.translations)) {
+                      if (typeof tr === 'string' && tr.trim()) {
+                        phraseMap.set(src, tr.trim());
+                        countInSlice += 1;
+                      }
+                    }
+                    totalTranslated += countInSlice;
+                    persistLocalPhraseCache(targetLang, phraseMap);
+                    if (activeLangRef.current === targetLang) {
+                      setTranslatedPhraseCount(phraseMap.size);
+                      setTranslationError(null);
+                      applyCachedDomTranslations(targetLang);
+                    }
+                  }
+                } else {
+                  let errMsg = `Translation request failed (${res.status})`;
+                  try {
+                    const errJson = (await res.json()) as { error?: string };
+                    if (errJson?.error) errMsg = errJson.error;
+                  } catch {
+                    // ignore
+                  }
+                  lastError = errMsg;
+                  setTranslationError(errMsg);
                 }
+              } catch (err) {
+                lastError = err instanceof Error ? err.message : 'Translation network error';
+                setTranslationError(lastError);
+              } finally {
+                slice.forEach((s) => inFlightPhrasesRef.current.delete(s));
               }
-              persistLocalPhraseCache(targetLang, phraseMap);
-              if (activeLangRef.current === targetLang) {
-                applyCachedDomTranslations(targetLang);
-              }
-            }
-          }
-        } catch {
-          // non-blocking
-        } finally {
-          slice.forEach((s) => inFlightPhrasesRef.current.delete(s));
+            })
+          );
         }
       }
     } finally {
-      if (activeLangRef.current === targetLang) {
-        setIsTranslating(false);
-      }
+      isFlushingRef.current = false;
+      setIsTranslating(false);
     }
+    return { translated: totalTranslated, error: lastError };
   }, [applyCachedDomTranslations, getPhraseMap]);
 
   const scheduleFlush = useCallback(() => {
@@ -417,24 +501,12 @@ export const I18nProvider: React.FC<{ children: React.ReactNode }> = ({ children
     flushTimerRef.current = window.setTimeout(() => {
       flushTimerRef.current = null;
       void flushTranslationQueue();
-    }, 55);
+    }, 35);
   }, [flushTranslationQueue]);
 
-  const scanAndTranslateDom = useCallback(() => {
-    const targetLang = activeLangRef.current;
-    if (!document.body) return;
-
-    if (targetLang === 'en') {
-      applyCachedDomTranslations('en');
-      return;
-    }
-
-    const phraseMap = getPhraseMap(targetLang);
-    const localizedSkip = alreadyLocalizedRef.current;
-
-    isApplyingDomRef.current = true;
-    try {
-      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+  const scanRootDom = useCallback(
+    (rootEl: Element, targetLang: string, phraseMap: Map<string, string>, localizedSkip: Set<string>) => {
+      const walker = document.createTreeWalker(rootEl, NodeFilter.SHOW_TEXT);
       let node = walker.nextNode() as Text | null;
       while (node) {
         const parentEl = node.parentElement;
@@ -442,7 +514,6 @@ export const I18nProvider: React.FC<{ children: React.ReactNode }> = ({ children
           const current = node.nodeValue ?? '';
           let rec = textStateMapRef.current.get(node);
           if (!rec) {
-            // Do not capture strings that already came directly from staticPack/UI_LABELS/cache
             const trimmedCurrent = current.trim();
             if (trimmedCurrent && !localizedSkip.has(trimmedCurrent)) {
               rec = { original: current, lastApplied: null };
@@ -450,8 +521,15 @@ export const I18nProvider: React.FC<{ children: React.ReactNode }> = ({ children
               trackedTextsRef.current.add(node);
             }
           } else {
-            if (rec.lastApplied !== null && current !== rec.lastApplied && current !== rec.original) {
-              // React updated this node with new source text
+            if (rec.lastApplied === null && current !== rec.original) {
+              const trimmedCurrent = current.trim();
+              if (localizedSkip.has(trimmedCurrent)) {
+                rec.original = current;
+                rec.lastApplied = current;
+              } else {
+                rec.original = current;
+              }
+            } else if (rec.lastApplied !== null && current !== rec.lastApplied && current !== rec.original) {
               const trimmedCurrent = current.trim();
               if (localizedSkip.has(trimmedCurrent)) {
                 rec.original = current;
@@ -484,7 +562,7 @@ export const I18nProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
       // Scan translatable attributes on elements
       const selector = TRANSLATABLE_ATTRS.map((a) => `[${a}]`).join(',');
-      const elements = document.body.querySelectorAll(selector);
+      const elements = rootEl.querySelectorAll(selector);
       elements.forEach((el) => {
         if (shouldSkipElement(el)) return;
         let recMap = attrStateMapRef.current.get(el);
@@ -502,6 +580,8 @@ export const I18nProvider: React.FC<{ children: React.ReactNode }> = ({ children
             }
             rec = { original: current, lastApplied: null };
             recMap[attr] = rec;
+          } else if (rec.lastApplied === null && current !== rec.original) {
+            rec.original = current;
           } else if (rec.lastApplied !== null && current !== rec.lastApplied && current !== rec.original) {
             rec.original = current;
             rec.lastApplied = null;
@@ -522,14 +602,105 @@ export const I18nProvider: React.FC<{ children: React.ReactNode }> = ({ children
           }
         }
       });
-    } finally {
-      isApplyingDomRef.current = false;
-    }
 
-    if (pendingQueueRef.current.size > 0) {
-      scheduleFlush();
-    }
-  }, [applyCachedDomTranslations, getPhraseMap, scheduleFlush]);
+      // Scan input buttons (submit/button/reset) value attributes
+      const inputBtns = rootEl.querySelectorAll('input[type="button"], input[type="submit"], input[type="reset"]');
+      inputBtns.forEach((el) => {
+        if (!(el instanceof HTMLInputElement) || shouldSkipElement(el)) return;
+        const current = el.value;
+        if (!current) return;
+        let recMap = attrStateMapRef.current.get(el);
+        let rec = recMap?.value;
+        if (!rec) {
+          const trimmed = current.trim();
+          if (!trimmed || localizedSkip.has(trimmed)) return;
+          if (!recMap) {
+            recMap = {};
+            attrStateMapRef.current.set(el, recMap);
+            trackedAttrsRef.current.add(el);
+          }
+          rec = { original: current, lastApplied: null };
+          recMap.value = rec;
+        } else if (rec.lastApplied === null && current !== rec.original) {
+          rec.original = current;
+        } else if (rec.lastApplied !== null && current !== rec.lastApplied && current !== rec.original) {
+          rec.original = current;
+          rec.lastApplied = null;
+        }
+        const { lead, core, trail } = splitWhitespace(rec.original);
+        if (core && !localizedSkip.has(core) && shouldTranslatePhrase(core)) {
+          const cached = phraseMap.get(core);
+          if (cached) {
+            const nextVal = `${lead}${cached}${trail}`;
+            if (current !== nextVal) el.value = nextVal;
+            rec.lastApplied = nextVal;
+          } else if (!inFlightPhrasesRef.current.has(core)) {
+            pendingQueueRef.current.add(core);
+          }
+        }
+      });
+    },
+    []
+  );
+
+  const scanAndTranslateDom = useCallback(
+    (scopeEl?: Element | null) => {
+      const targetLang = activeLangRef.current;
+      if (!document.body) return;
+
+      if (targetLang === 'en') {
+        applyCachedDomTranslations('en');
+        return;
+      }
+
+      const phraseMap = getPhraseMap(targetLang);
+      const localizedSkip = alreadyLocalizedRef.current;
+
+      isApplyingDomRef.current = true;
+      try {
+        // Prioritize right-side <main class="app-main-shell"> first so the active page translates immediately
+        if (scopeEl) {
+          scanRootDom(scopeEl, targetLang, phraseMap, localizedSkip);
+        } else {
+          const mainEl = document.querySelector('main.app-main-shell');
+          if (mainEl) {
+            scanRootDom(mainEl, targetLang, phraseMap, localizedSkip);
+          }
+          scanRootDom(document.body, targetLang, phraseMap, localizedSkip);
+        }
+
+        // Document title (keep synced if App.tsx updated document.title after company loaded)
+        const curTitle = document.title.trim();
+        if (
+          curTitle &&
+          curTitle !== originalTitleRef.current.trim() &&
+          curTitle !== (lastAppliedTitleRef.current || '').trim() &&
+          !localizedSkip.has(curTitle)
+        ) {
+          originalTitleRef.current = document.title;
+          lastAppliedTitleRef.current = null;
+        }
+        const rawTitle = originalTitleRef.current.trim();
+        if (rawTitle && shouldTranslatePhrase(rawTitle)) {
+          const trTitle = phraseMap.get(rawTitle);
+          if (trTitle) {
+            if (document.title !== trTitle) document.title = trTitle;
+            lastAppliedTitleRef.current = trTitle;
+          } else if (!inFlightPhrasesRef.current.has(rawTitle)) {
+            pendingQueueRef.current.add(rawTitle);
+          }
+        }
+      } finally {
+        isApplyingDomRef.current = false;
+      }
+
+      setTranslatedPhraseCount(phraseMap.size);
+      if (pendingQueueRef.current.size > 0) {
+        scheduleFlush();
+      }
+    },
+    [applyCachedDomTranslations, getPhraseMap, scanRootDom, scheduleFlush]
+  );
 
   const scheduleDomScan = useCallback(() => {
     if (scanTimerRef.current !== null) {
@@ -538,10 +709,10 @@ export const I18nProvider: React.FC<{ children: React.ReactNode }> = ({ children
     scanTimerRef.current = window.setTimeout(() => {
       scanTimerRef.current = null;
       scanAndTranslateDom();
-    }, 35);
+    }, 30);
   }, [scanAndTranslateDom]);
 
-  // Observe DOM mutations so modals, tabs, tables, toasts, and dynamic text translate immediately
+  // Observe DOM mutations + post-click follow-up scans so clicking any button inside the platform immediately translates new views/modals/notices
   useEffect(() => {
     if (!document.body) return;
     const observer = new MutationObserver(() => {
@@ -554,10 +725,31 @@ export const I18nProvider: React.FC<{ children: React.ReactNode }> = ({ children
       subtree: true,
       characterData: true,
       attributes: true,
-      attributeFilter: ['placeholder', 'title', 'aria-label', 'alt'],
+      attributeFilter: ['placeholder', 'title', 'aria-label', 'alt', 'value'],
     });
+
+    let clickTimer1: number | null = null;
+    let clickTimer2: number | null = null;
+    const onDocClick = () => {
+      if (activeLangRef.current === 'en') return;
+      if (clickTimer1 !== null) window.clearTimeout(clickTimer1);
+      if (clickTimer2 !== null) window.clearTimeout(clickTimer2);
+      clickTimer1 = window.setTimeout(() => {
+        clickTimer1 = null;
+        if (activeLangRef.current !== 'en') scheduleDomScan();
+      }, 50);
+      clickTimer2 = window.setTimeout(() => {
+        clickTimer2 = null;
+        if (activeLangRef.current !== 'en') scheduleDomScan();
+      }, 240);
+    };
+    document.addEventListener('click', onDocClick, true);
+
     return () => {
       observer.disconnect();
+      document.removeEventListener('click', onDocClick, true);
+      if (clickTimer1 !== null) window.clearTimeout(clickTimer1);
+      if (clickTimer2 !== null) window.clearTimeout(clickTimer2);
       if (scanTimerRef.current !== null) {
         window.clearTimeout(scanTimerRef.current);
         scanTimerRef.current = null;
@@ -571,13 +763,14 @@ export const I18nProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const translateMissingWithAi = useCallback(
     async (targetCode?: string): Promise<{ cached: number; generated: number }> => {
-      const target = (targetCode || lang).trim();
+      const target = (targetCode || activeLangRef.current).trim();
       if (!target || target === 'en') return { cached: 0, generated: 0 };
       const meta = findWorldLanguage(target);
       const staticForTarget = await loadStaticLocale(target);
+      const currentOverrides = serverOverridesRef.current;
       const missingPayload: Record<string, string> = {};
       for (const [k, enVal] of Object.entries(EN_DICTIONARY)) {
-        if (!staticForTarget[k] && !(target === lang && serverOverrides[k])) {
+        if (!staticForTarget[k] && !(target === activeLangRef.current && currentOverrides[k])) {
           missingPayload[k] = enVal;
         }
       }
@@ -601,10 +794,14 @@ export const I18nProvider: React.FC<{ children: React.ReactNode }> = ({ children
         });
         if (!res.ok) return { cached: 0, generated: 0 };
         const data = await res.json();
-        if (target === lang && data.translations) {
-          setServerOverrides((prev) => ({ ...prev, ...data.translations }));
+        if (target === activeLangRef.current && data.translations) {
+          setServerOverrides((prev) => {
+            const merged = { ...prev, ...data.translations };
+            serverOverridesRef.current = merged;
+            return merged;
+          });
         }
-        await loadConfigForLang(lang);
+        await loadConfigForLang(target);
         return {
           cached: Number(data.cached || 0),
           generated: Number(data.generated || 0),
@@ -613,54 +810,102 @@ export const I18nProvider: React.FC<{ children: React.ReactNode }> = ({ children
         setIsTranslating(false);
       }
     },
-    [lang, loadStaticLocale, serverOverrides, totalKeys, loadConfigForLang]
+    [loadStaticLocale, totalKeys, loadConfigForLang]
   );
 
   // Load locale pack, server config, server phrase cache, and run full-platform DOM translation whenever lang changes
   useEffect(() => {
     let active = true;
     pendingQueueRef.current.clear();
+    inFlightPhrasesRef.current.clear();
+    setTranslationError(null);
 
-    // Immediately restore English or apply local cache for the newly selected language so old language never lingers
+    if (lang === 'en') {
+      setStaticPack(EN_DICTIONARY);
+      setTranslatedPhraseCount(0);
+      applyCachedDomTranslations('en');
+      void loadConfigForLang('en');
+      return () => {
+        active = false;
+      };
+    }
+
+    // Immediately apply local phrase cache and queue DOM scan right away (don't wait on network waterfalls)
+    const initialMap = getPhraseMap(lang);
+    setTranslatedPhraseCount(initialMap.size);
     applyCachedDomTranslations(lang);
+    scheduleDomScan();
 
     (async () => {
-      const pack = await loadStaticLocale(lang);
-      if (active) setStaticPack(pack);
-      await loadConfigForLang(lang);
-
-      if (lang !== 'en') {
-        try {
-          const res = await fetch(`/api/i18n/phrase-cache?lang=${encodeURIComponent(lang)}`);
-          if (res.ok && active) {
-            const data = (await res.json()) as { phrases?: Record<string, string> };
-            if (data.phrases) {
-              const m = getPhraseMap(lang);
-              for (const [src, tr] of Object.entries(data.phrases)) {
-                if (typeof tr === 'string' && tr.trim()) m.set(src, tr.trim());
+      const [pack] = await Promise.all([
+        loadStaticLocale(lang),
+        loadConfigForLang(lang),
+        (async () => {
+          try {
+            const res = await fetch(`/api/i18n/phrase-cache?lang=${encodeURIComponent(lang)}`);
+            if (res.ok && active) {
+              const data = (await res.json()) as { phrases?: Record<string, string> };
+              if (data.phrases) {
+                const m = getPhraseMap(lang);
+                for (const [src, tr] of Object.entries(data.phrases)) {
+                  if (typeof tr === 'string' && tr.trim()) m.set(src, tr.trim());
+                }
+                persistLocalPhraseCache(lang, m);
+                setTranslatedPhraseCount(m.size);
               }
-              persistLocalPhraseCache(lang, m);
             }
+          } catch {
+            // ignore
           }
-        } catch {
-          // ignore
-        }
+        })(),
+      ]);
 
-        if (active && !STATIC_LOCALE_CODES.has(lang) && !autoKeyTranslatedRef.current.has(lang)) {
-          autoKeyTranslatedRef.current.add(lang);
-          void translateMissingWithAi(lang);
-        }
-      }
+      if (!active) return;
+      setStaticPack(pack);
+      applyCachedDomTranslations(lang);
+      scanAndTranslateDom();
 
-      if (active) {
-        scheduleDomScan();
+      if (!STATIC_LOCALE_CODES.has(lang) && !autoKeyTranslatedRef.current.has(lang)) {
+        autoKeyTranslatedRef.current.add(lang);
+        void translateMissingWithAi(lang);
       }
     })();
 
     return () => {
       active = false;
     };
-  }, [lang, loadStaticLocale, loadConfigForLang, getPhraseMap, applyCachedDomTranslations, scheduleDomScan, translateMissingWithAi]);
+  }, [lang, loadStaticLocale, loadConfigForLang, getPhraseMap, applyCachedDomTranslations, scheduleDomScan, scanAndTranslateDom, translateMissingWithAi]);
+
+  const translateNow = useCallback(
+    async (scopeEl?: HTMLElement | null): Promise<{ translated: number; error: string | null }> => {
+      const targetLang = activeLangRef.current;
+      if (!targetLang || targetLang === 'en') {
+        applyCachedDomTranslations('en');
+        return { translated: 0, error: null };
+      }
+      setTranslationError(null);
+      if (flushTimerRef.current !== null) {
+        window.clearTimeout(flushTimerRef.current);
+        flushTimerRef.current = null;
+      }
+      scanAndTranslateDom(scopeEl || undefined);
+      const res = await flushTranslationQueue();
+      applyCachedDomTranslations(targetLang);
+      scanAndTranslateDom(scopeEl || undefined);
+      if (pendingQueueRef.current.size > 0) {
+        const res2 = await flushTranslationQueue();
+        return { translated: res.translated + res2.translated, error: res2.error || res.error };
+      }
+      return res;
+    },
+    [applyCachedDomTranslations, scanAndTranslateDom, flushTranslationQueue]
+  );
+
+  const triggerDomScan = useCallback(() => {
+    if (activeLangRef.current !== 'en') {
+      scheduleDomScan();
+    }
+  }, [scheduleDomScan]);
 
   const translateText = useCallback(
     async (text: string, targetCode?: string): Promise<string> => {
@@ -801,6 +1046,8 @@ export const I18nProvider: React.FC<{ children: React.ReactNode }> = ({ children
       enabledLanguages,
       rtlAuto,
       isTranslating,
+      translatedPhraseCount,
+      translationError,
       coveragePercent,
       favorites,
       recents,
@@ -809,6 +1056,8 @@ export const I18nProvider: React.FC<{ children: React.ReactNode }> = ({ children
       syncUserLanguagePreference,
       refreshConfig,
       translateMissingWithAi,
+      translateNow,
+      triggerDomScan,
       translateText,
       t,
       allDictionaryKeys,
@@ -821,6 +1070,8 @@ export const I18nProvider: React.FC<{ children: React.ReactNode }> = ({ children
       enabledLanguages,
       rtlAuto,
       isTranslating,
+      translatedPhraseCount,
+      translationError,
       coveragePercent,
       favorites,
       recents,
@@ -829,6 +1080,8 @@ export const I18nProvider: React.FC<{ children: React.ReactNode }> = ({ children
       syncUserLanguagePreference,
       refreshConfig,
       translateMissingWithAi,
+      translateNow,
+      triggerDomScan,
       translateText,
       t,
       allDictionaryKeys,
@@ -849,6 +1102,8 @@ export function useI18n(): I18nContextValue {
       enabledLanguages: [],
       rtlAuto: true,
       isTranslating: false,
+      translatedPhraseCount: 0,
+      translationError: null,
       coveragePercent: () => 100,
       favorites: ['en', 'am', 'om'],
       recents: ['en'],
@@ -857,6 +1112,8 @@ export function useI18n(): I18nContextValue {
       syncUserLanguagePreference: () => {},
       refreshConfig: async () => {},
       translateMissingWithAi: async () => ({ cached: 0, generated: 0 }),
+      translateNow: async () => ({ translated: 0, error: null }),
+      triggerDomScan: () => {},
       translateText: async (text: string) => text,
       t: (key: string, fallback?: string) => EN_DICTIONARY[key] || fallback || key,
       allDictionaryKeys: Object.keys(EN_DICTIONARY),
@@ -1134,3 +1391,185 @@ export const LanguageSwitcher: React.FC<{ compact?: boolean }> = ({ compact = fa
     </div>
   );
 };
+
+export const WorkspaceTranslationBar: React.FC<{
+  activeModule?: string;
+  onAfterTranslate?: () => void;
+}> = ({ activeModule, onAfterTranslate }) => {
+  const {
+    lang,
+    currentLanguage,
+    enabledLanguages,
+    isTranslating,
+    translatedPhraseCount,
+    translationError,
+    setLanguage,
+    translateNow,
+  } = useI18n();
+  const [justTranslated, setJustTranslated] = useState(false);
+
+  const availablePool = useMemo(() => {
+    if (enabledLanguages.length === 0) return WORLD_LANGUAGES;
+    const set = new Set(enabledLanguages);
+    set.add('en');
+    const filtered = WORLD_LANGUAGES.filter((l) => set.has(l.code));
+    return filtered.length > 0 ? filtered : WORLD_LANGUAGES;
+  }, [enabledLanguages]);
+
+  const quickLangCodes = useMemo(() => {
+    const preferred = ['en', 'am', 'om', 'ti', 'ar', 'fr', 'zh-CN'];
+    const poolSet = new Set(availablePool.map((l) => l.code));
+    return preferred
+      .filter((c) => poolSet.has(c))
+      .map((c) => findWorldLanguage(c));
+  }, [availablePool]);
+
+  const handleSelectTarget = async (code: string) => {
+    setJustTranslated(false);
+    await setLanguage(code);
+    window.setTimeout(async () => {
+      await translateNow();
+      setJustTranslated(true);
+      onAfterTranslate?.();
+    }, 60);
+  };
+
+  const handleTranslateClick = async () => {
+    const target = lang === 'en' ? 'am' : lang;
+    if (lang === 'en') {
+      await setLanguage(target);
+      window.setTimeout(async () => {
+        await translateNow();
+        setJustTranslated(true);
+        onAfterTranslate?.();
+      }, 60);
+      return;
+    }
+    const mainEl = document.querySelector('main.app-main-shell') as HTMLElement | null;
+    await translateNow(mainEl);
+    setJustTranslated(true);
+    onAfterTranslate?.();
+  };
+
+  return (
+    <div
+      data-testid="workspace-translation-bar"
+      className="no-print mb-4 px-3.5 py-2.5 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 flex flex-wrap items-center justify-between gap-2.5 text-xs shadow-2xs"
+    >
+      <div className="flex flex-wrap items-center gap-2 min-w-0">
+        <span className="inline-flex items-center gap-1.5 font-bold text-[#172033] dark:text-white shrink-0">
+          <svg
+            className="w-4 h-4 text-[#087CEB] shrink-0"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden="true"
+          >
+            <path d="m5 8 6 6" />
+            <path d="m4 14 6-6 2-3" />
+            <path d="M2 5h12" />
+            <path d="M7 2h1" />
+            <path d="m22 22-5-10-5 10" />
+            <path d="M14 18h6" />
+          </svg>
+          <span>Translation Service</span>
+        </span>
+
+        <span
+          data-no-translate="true"
+          className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md text-[11px] font-semibold border ${
+            translationError
+              ? 'bg-rose-50 dark:bg-rose-950/50 text-rose-700 dark:text-rose-300 border-rose-200 dark:border-rose-800'
+              : lang === 'en'
+                ? 'bg-slate-50 dark:bg-slate-800 text-slate-600 dark:text-slate-300 border-slate-200 dark:border-slate-700'
+                : 'bg-[#EAF4FF] dark:bg-sky-950/60 text-[#087CEB] dark:text-sky-300 border-[#087CEB]/30'
+          }`}
+        >
+          {isTranslating && (
+            <span className="w-2 h-2 rounded-full bg-[#087CEB] animate-pulse shrink-0" />
+          )}
+          {translationError
+            ? translationError
+            : lang === 'en'
+              ? 'English (Original)'
+              : isTranslating
+                ? `Translating → ${currentLanguage.nativeName} (${currentLanguage.code})...`
+                : `${currentLanguage.nativeName} (${currentLanguage.code}) · ${translatedPhraseCount} cached${
+                    justTranslated ? ' ✓' : ''
+                  }`}
+        </span>
+
+        {activeModule && lang !== 'en' && (
+          <span className="hidden md:inline text-[11px] text-slate-500 dark:text-slate-400">
+            Active view auto-translated
+          </span>
+        )}
+      </div>
+
+      <div className="flex flex-wrap items-center gap-1.5 shrink-0">
+        <div className="hidden sm:flex flex-wrap items-center gap-1" data-no-translate="true">
+          {quickLangCodes.map((item) => {
+            const active = item.code === lang;
+            return (
+              <button
+                key={`ws-lang-${item.code}`}
+                type="button"
+                onClick={() => void handleSelectTarget(item.code)}
+                className={`px-2 py-1 rounded-lg text-[11px] font-semibold border transition-colors ${
+                  active
+                    ? 'bg-[#087CEB] text-white border-[#087CEB]'
+                    : 'bg-[#F8FAFC] dark:bg-slate-800 text-[#172033] dark:text-slate-200 border-slate-200 dark:border-slate-700 hover:border-[#087CEB]'
+                }`}
+              >
+                {item.nativeName}
+              </button>
+            );
+          })}
+        </div>
+
+        <select
+          data-no-translate="true"
+          aria-label="Target workspace translation language"
+          value={lang}
+          onChange={(e) => void handleSelectTarget(e.target.value)}
+          className="px-2.5 py-1 text-[11px] font-semibold bg-[#F8FAFC] dark:bg-slate-800 text-[#172033] dark:text-slate-100 border border-slate-200 dark:border-slate-700 rounded-lg focus:outline-none focus:border-[#087CEB]"
+        >
+          {availablePool.map((item) => (
+            <option key={`ws-opt-${item.code}`} value={item.code}>
+              {item.nativeName} · {item.name} ({item.code})
+            </option>
+          ))}
+        </select>
+
+        <button
+          type="button"
+          disabled={isTranslating}
+          onClick={() => void handleTranslateClick()}
+          className="inline-flex items-center gap-1.5 px-3 py-1 text-[11px] font-bold text-white bg-[#087CEB] hover:bg-[#0265C4] disabled:opacity-60 rounded-lg transition-colors whitespace-nowrap"
+        >
+          <span>
+            {isTranslating
+              ? 'Translating...'
+              : lang === 'en'
+                ? 'Translate Page'
+                : 'Translate Page Now'}
+          </span>
+        </button>
+
+        {lang !== 'en' && (
+          <button
+            type="button"
+            onClick={() => void handleSelectTarget('en')}
+            className="px-2.5 py-1 text-[11px] font-semibold text-slate-600 dark:text-slate-300 bg-[#F8FAFC] dark:bg-slate-800 border border-slate-200 dark:border-slate-700 hover:border-slate-400 rounded-lg transition-colors whitespace-nowrap"
+          >
+            English
+          </button>
+        )}
+      </div>
+    </div>
+  );
+};
+
