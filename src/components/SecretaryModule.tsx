@@ -1,12 +1,12 @@
 import React, { useEffect, useState } from 'react';
 import { Columns2, Eye, FileText, Languages, Pencil, Printer, Rows2, Save, Trash2, X } from 'lucide-react';
 import { api } from '../api';
+import { useI18n } from '../i18n/I18nProvider';
 import type { CompanyDocument, CompanySettings } from '../types';
 import {
   DOCUMENT_TEMPLATES,
   LANGUAGE_OPTIONS,
   toEthiopianDateString,
-  translatePhraseDictionary,
   type AppLang,
 } from '../utils/ethiopianCalendar';
 import { ImportFilesButton } from './ImportFilesModal';
@@ -44,11 +44,13 @@ interface SecretaryModuleProps {
 }
 
 export const SecretaryModule: React.FC<SecretaryModuleProps> = ({ company, onRefreshDashboard }) => {
+  const { translateText } = useI18n();
   const [docs, setDocs] = useState<CompanyDocument[]>([]);
   const [selectedDoc, setSelectedDoc] = useState<CompanyDocument | null>(null);
   const [editingId, setEditingId] = useState<number | null>(null);
   const [search, setSearch] = useState('');
   const [targetLang, setTargetLang] = useState<AppLang>('am');
+  const [translatingDraft, setTranslatingDraft] = useState(false);
   const [bilingualLayout, setBilingualLayout] = useState<'side-by-side' | 'stacked'>('side-by-side');
   const [letterOrientation, setLetterOrientation] = useState<PaperOrientation>('portrait');
   const [notice, setNotice] = useState<string | null>(null);
@@ -98,10 +100,22 @@ export const SecretaryModule: React.FC<SecretaryModuleProps> = ({ company, onRef
     }));
   };
 
-  const handleTranslateDraft = (lang: AppLang) => {
+  const handleTranslateDraft = async (lang: AppLang) => {
     setTargetLang(lang);
-    const translated = translatePhraseDictionary(form.content || form.title, lang);
-    setForm((prev) => ({ ...prev, translated_content: translated }));
+    const sourceText = form.content || form.title;
+    if (!sourceText.trim()) return;
+    if (lang === 'en') {
+      setForm((prev) => ({ ...prev, translated_content: sourceText }));
+      return;
+    }
+    setTranslatingDraft(true);
+    try {
+      const apiLang = lang === 'zh' ? 'zh-CN' : lang;
+      const translated = await translateText(sourceText, apiLang);
+      setForm((prev) => ({ ...prev, translated_content: translated }));
+    } finally {
+      setTranslatingDraft(false);
+    }
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -331,13 +345,14 @@ export const SecretaryModule: React.FC<SecretaryModuleProps> = ({ company, onRef
                 <Languages className="w-3.5 h-3.5 text-[#087CEB]" />
                 Translated Copy
               </label>
-              <div className="flex flex-wrap items-center gap-1">
+              <div className="flex flex-wrap items-center gap-1" data-no-translate="true">
                 {LANGUAGE_OPTIONS.map((opt) => (
                   <button
                     key={opt.code}
                     type="button"
-                    onClick={() => handleTranslateDraft(opt.code)}
-                    className={`px-2 py-0.5 text-[11px] font-semibold rounded ${
+                    disabled={translatingDraft}
+                    onClick={() => void handleTranslateDraft(opt.code)}
+                    className={`px-2 py-0.5 text-[11px] font-semibold rounded disabled:opacity-50 ${
                       targetLang === opt.code ? 'bg-[#18243A] text-[#38BDF8]' : 'bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300'
                     }`}
                   >

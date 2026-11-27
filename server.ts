@@ -1217,6 +1217,18 @@ CREATE TABLE IF NOT EXISTS i18n_translations (
   updated_at TEXT NOT NULL,
   UNIQUE(lang_code, translation_key)
 );
+
+CREATE TABLE IF NOT EXISTS i18n_phrase_cache (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  lang_code TEXT NOT NULL,
+  source_hash TEXT NOT NULL,
+  source_text TEXT NOT NULL,
+  translated_text TEXT NOT NULL,
+  provider TEXT NOT NULL DEFAULT 'gtx',
+  updated_at TEXT NOT NULL,
+  UNIQUE(lang_code, source_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_i18n_phrase_lang_hash ON i18n_phrase_cache(lang_code, source_hash);
 `);
 
 ensureColumn('device_sync_logs', 'k40_fp_count', 'INTEGER');
@@ -2656,6 +2668,9 @@ const PUBLIC_API_EXEMPT = new Set([
   '/api/devices/zkteco/connector/ingest',
   '/api/devices/zkteco/connector/heartbeat',
   '/api/i18n/config',
+  '/api/i18n/phrase-cache',
+  '/api/i18n/translate',
+  '/api/i18n/translate-batch',
 ]);
 
 app.use('/api', (req: AuthedRequest, res, next) => {
@@ -14426,6 +14441,363 @@ app.post('/api/i18n/admin/import', (req, res) => {
   res.json({ ok: true, lang_code: langCode, imported: count });
 });
 
+function mapToGtxLangCode(langCode: string): string {
+  const clean = String(langCode || 'en').trim();
+  const lower = clean.toLowerCase();
+  if (lower === 'zh' || lower === 'zh-cn') return 'zh-CN';
+  if (lower === 'zh-tw' || lower === 'zh-hk') return 'zh-TW';
+  if (lower === 'he') return 'iw';
+  if (lower === 'fil') return 'tl';
+  if (lower === 'nb' || lower === 'nn') return 'no';
+  if (lower === 'prs') return 'fa';
+  if (lower === 'ary' || lower === 'arz') return 'ar';
+  return clean;
+}
+
+function maskPlaceholders(text: string): { masked: string; tokens: string[] } {
+  const tokens: string[] = [];
+  const masked = text.replace(/\{\{?[a-zA-Z0-9_.-]+\}?\}/g, (match) => {
+    const idx = tokens.length;
+    tokens.push(match);
+    return `__SSV${idx}__`;
+  });
+  return { masked, tokens };
+}
+
+function unmaskPlaceholders(text: string, tokens: string[]): string {
+  if (tokens.length === 0) return text;
+  return text.replace(/__\s*SSV\s*(\d+)\s*__/gi, (full, idxStr) => {
+    const idx = Number(idxStr);
+    return Number.isInteger(idx) && idx >= 0 && idx < tokens.length ? tokens[idx] : full;
+  });
+}
+
+async function fetchGtxSingle(text: string, gtxLang: string): Promise<string | null> {
+  const { masked, tokens } = maskPlaceholders(text);
+  const endpoints = [
+    `https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=${encodeURIComponent(gtxLang)}&dt=t&q=${encodeURIComponent(masked)}`,
+    `https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=en&tl=${encodeURIComponent(gtxLang)}&q=${encodeURIComponent(masked)}`,
+  ];
+  for (const url of endpoints) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5000);
+    try {
+      const resp = await fetch(url, {
+        signal: controller.signal,
+        headers: { 'User-Agent': 'Mozilla/5.0' },
+      });
+      if (!resp.ok) continue;
+      const data = (await resp.json()) as unknown;
+      if (Array.isArray(data) && typeof data[0] === 'string') {
+        const unmasked = unmaskPlaceholders(data[0], tokens).trim();
+        if (unmasked) return unmasked;
+      }
+      if (Array.isArray(data) && Array.isArray(data[0])) {
+        const joined = (data[0] as unknown[])
+          .map((seg) => (Array.isArray(seg) && typeof seg[0] === 'string' ? seg[0] : typeof seg === 'string' ? seg : ''))
+          .join('');
+        const unmasked = unmaskPlaceholders(joined, tokens).trim();
+        if (unmasked) return unmasked;
+      }
+    } catch {
+      // try next endpoint
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  // Tertiary fallback: MyMemory real translation API for short/medium strings
+  if (masked.length <= 450) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5000);
+    try {
+      const mmUrl = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(masked)}&langpair=${encodeURIComponent(`en|${gtxLang}`)}`;
+      const resp = await fetch(mmUrl, { signal: controller.signal });
+      if (resp.ok) {
+        const data = (await resp.json()) as { responseStatus?: number; responseData?: { translatedText?: string } };
+        const txt = data?.responseData?.translatedText;
+        if (data?.responseStatus === 200 && typeof txt === 'string' && txt.trim()) {
+          return unmaskPlaceholders(txt, tokens).trim();
+        }
+      }
+    } catch {
+      // ignore
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  return null;
+}
+
+async function translateWithGtxBatch(texts: string[], targetLang: string): Promise<Record<string, string>> {
+  const gtxLang = mapToGtxLangCode(targetLang);
+  const out: Record<string, string> = {};
+  if (texts.length === 0) return out;
+
+  const singleLineQueue: string[] = [];
+  const directQueue: string[] = [];
+  for (const s of texts) {
+    if (s.includes('\n') || s.length > 260) {
+      directQueue.push(s);
+    } else {
+      singleLineQueue.push(s);
+    }
+  }
+
+  const chunks: string[][] = [];
+  let currentChunk: string[] = [];
+  let currentLen = 0;
+  for (const s of singleLineQueue) {
+    const est = s.length + 12;
+    if (currentChunk.length >= 18 || (currentChunk.length > 0 && currentLen + est > 1300)) {
+      chunks.push(currentChunk);
+      currentChunk = [];
+      currentLen = 0;
+    }
+    currentChunk.push(s);
+    currentLen += est;
+  }
+  if (currentChunk.length > 0) chunks.push(currentChunk);
+
+  const fallbackSingles: string[] = [...directQueue];
+  for (let i = 0; i < chunks.length; i += 3) {
+    const slice = chunks.slice(i, i + 3);
+    await Promise.all(
+      slice.map(async (chunk) => {
+        const maskedItems = chunk.map((item) => maskPlaceholders(item));
+        const payload = maskedItems.map((m, idx) => `[[[${idx}]]] ${m.masked}`).join('\n');
+        const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=${encodeURIComponent(gtxLang)}&dt=t&q=${encodeURIComponent(payload)}`;
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 5000);
+        let parsedOk = false;
+        try {
+          const resp = await fetch(url, {
+            signal: controller.signal,
+            headers: { 'User-Agent': 'Mozilla/5.0' },
+          });
+          if (resp.ok) {
+            const data = (await resp.json()) as unknown;
+            if (Array.isArray(data) && Array.isArray(data[0])) {
+              const rawOut = (data[0] as unknown[])
+                .map((seg) => (Array.isArray(seg) && typeof seg[0] === 'string' ? seg[0] : ''))
+                .join('');
+              const markerRx = /(?:^|\n)\s*\[{1,3}(\d+)\]{1,3}\s*/g;
+              const matches = [...rawOut.matchAll(markerRx)];
+              if (matches.length === chunk.length) {
+                let allMatch = true;
+                for (let mIdx = 0; mIdx < matches.length; mIdx += 1) {
+                  const numIdx = Number(matches[mIdx][1]);
+                  if (numIdx !== mIdx) {
+                    allMatch = false;
+                    break;
+                  }
+                  const start = (matches[mIdx].index ?? 0) + matches[mIdx][0].length;
+                  const end = mIdx + 1 < matches.length ? (matches[mIdx + 1].index ?? rawOut.length) : rawOut.length;
+                  const piece = unmaskPlaceholders(rawOut.slice(start, end), maskedItems[mIdx].tokens).trim();
+                  if (piece) {
+                    out[chunk[mIdx]] = piece;
+                  } else {
+                    allMatch = false;
+                    break;
+                  }
+                }
+                parsedOk = allMatch;
+              }
+            }
+          }
+        } catch {
+          parsedOk = false;
+        } finally {
+          clearTimeout(timer);
+        }
+        if (!parsedOk) {
+          for (const item of chunk) {
+            if (!out[item]) fallbackSingles.push(item);
+          }
+        }
+      })
+    );
+  }
+
+  for (let i = 0; i < fallbackSingles.length; i += 6) {
+    const batch = fallbackSingles.slice(i, i + 6);
+    await Promise.all(
+      batch.map(async (item) => {
+        if (out[item]) return;
+        const translated = await fetchGtxSingle(item, gtxLang);
+        if (translated) out[item] = translated;
+      })
+    );
+  }
+
+  return out;
+}
+
+async function translateTextsReal(
+  targetLang: string,
+  targetLangName: string,
+  uniqueTexts: string[]
+): Promise<{
+  translations: Record<string, string>;
+  cached: number;
+  generated: number;
+  provider: string;
+}> {
+  const result: Record<string, string> = {};
+  const missing: string[] = [];
+
+  const lookupStmt = db.prepare(
+    'SELECT source_text, translated_text FROM i18n_phrase_cache WHERE lang_code = ? AND source_hash = ?'
+  );
+  for (const txt of uniqueTexts) {
+    const h = sha256Hex(txt);
+    const cached = lookupStmt.get(targetLang, h) as { source_text: string; translated_text: string } | undefined;
+    if (cached && cached.source_text === txt && cached.translated_text) {
+      result[txt] = cached.translated_text;
+    } else {
+      missing.push(txt);
+    }
+  }
+
+  const cachedCount = uniqueTexts.length - missing.length;
+  let generatedCount = 0;
+  let usedProvider = 'cache';
+
+  if (missing.length > 0) {
+    const newlyTranslated: Array<{ source: string; translated: string; provider: string }> = [];
+    let stillMissing = [...missing];
+
+    // 1) Primary: Fast Gemini call (bounded timeout so UI never stalls) when GEMINI_API_KEY is available
+    const ai = getGeminiClient();
+    if (ai && stillMissing.length > 0) {
+      try {
+        const indexedObj: Record<string, string> = {};
+        stillMissing.forEach((txt, idx) => {
+          indexedObj[String(idx)] = txt;
+        });
+        const aiPromise = ai.models.generateContent({
+          model: 'gemini-3.1-flash-lite',
+          contents: `Translate these English ERP/Attendance/HR UI strings into ${targetLangName} (${targetLang}). Return ONLY a valid JSON object mapping each exact numeric string key to its concise, natural translation. Preserve placeholders like {name}, {count} verbatim. Keep acronyms like ZKTeco K40, EAT, ETB, USD, TCP/IP, GRN, GIN intact.\n\n${JSON.stringify(indexedObj)}`,
+          config: { responseMimeType: 'application/json' },
+        });
+        const response = await Promise.race([
+          aiPromise,
+          new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Gemini translation timeout')), 4500)),
+        ]);
+        const rawText = (response.text || '').trim();
+        const parsed = JSON.parse(rawText) as Record<string, unknown>;
+        const remaining: string[] = [];
+        stillMissing.forEach((src, idx) => {
+          const val = parsed[String(idx)];
+          if (typeof val === 'string' && val.trim()) {
+            const clean = val.trim();
+            result[src] = clean;
+            newlyTranslated.push({ source: src, translated: clean, provider: 'ai' });
+          } else {
+            remaining.push(src);
+          }
+        });
+        stillMissing = remaining;
+        if (newlyTranslated.length > 0) usedProvider = 'ai';
+      } catch (err) {
+        console.warn('[i18n Gemini fallback to GTX]', err instanceof Error ? err.message : err);
+      }
+    }
+
+    // 2) Secondary / Reliable Real Translation Engine: Google Translate GTX -> clients5 -> MyMemory
+    if (stillMissing.length > 0) {
+      const gtxMap = await translateWithGtxBatch(stillMissing, targetLang);
+      for (const src of stillMissing) {
+        const clean = gtxMap[src];
+        if (clean && clean.trim()) {
+          result[src] = clean.trim();
+          newlyTranslated.push({ source: src, translated: clean.trim(), provider: 'gtx' });
+        }
+      }
+      if (newlyTranslated.some((x) => x.provider === 'gtx')) {
+        usedProvider = usedProvider === 'ai' ? 'ai+gtx' : 'gtx';
+      }
+    }
+
+    // 3) Persist to SQLite phrase cache
+    if (newlyTranslated.length > 0) {
+      const now = new Date().toISOString();
+      const insStmt = db.prepare(
+        `INSERT INTO i18n_phrase_cache (lang_code, source_hash, source_text, translated_text, provider, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(lang_code, source_hash) DO UPDATE SET
+           translated_text = excluded.translated_text,
+           provider = excluded.provider,
+           updated_at = excluded.updated_at`
+      );
+      const tx = db.transaction(() => {
+        for (const item of newlyTranslated) {
+          insStmt.run(targetLang, sha256Hex(item.source), item.source, item.translated, item.provider, now);
+        }
+      });
+      tx();
+      generatedCount = newlyTranslated.length;
+    }
+  }
+
+  return {
+    translations: result,
+    cached: cachedCount,
+    generated: generatedCount,
+    provider: usedProvider,
+  };
+}
+
+app.get('/api/i18n/phrase-cache', (req, res) => {
+  const lang = String(req.query.lang || '').trim().slice(0, 16);
+  if (!lang || lang === 'en') {
+    res.json({ lang_code: 'en', phrases: {}, count: 0 });
+    return;
+  }
+  const rows = db
+    .prepare('SELECT source_text, translated_text FROM i18n_phrase_cache WHERE lang_code = ? ORDER BY id DESC LIMIT 5000')
+    .all(lang) as Array<{ source_text: string; translated_text: string }>;
+  const phrases: Record<string, string> = {};
+  for (const r of rows) {
+    if (r.source_text && r.translated_text) {
+      phrases[r.source_text] = r.translated_text;
+    }
+  }
+  res.json({ lang_code: lang, phrases, count: rows.length });
+});
+
+app.post('/api/i18n/translate-batch', async (req, res) => {
+  const b = (req.body || {}) as Record<string, unknown>;
+  const targetLang = String(b.target_lang || '').trim().slice(0, 16);
+  const targetLangName = String(b.target_lang_name || targetLang).trim().slice(0, 64);
+  if (!targetLang || targetLang === 'en' || !/^[a-zA-Z0-9_-]{2,16}$/.test(targetLang)) {
+    res.status(400).json({ error: 'Valid non-English target_lang is required.' });
+    return;
+  }
+  const rawTexts = Array.isArray(b.texts) ? b.texts : [];
+  const seen = new Set<string>();
+  const uniqueTexts: string[] = [];
+  for (const item of rawTexts) {
+    if (typeof item !== 'string') continue;
+    const trimmed = item.trim();
+    if (!trimmed || trimmed.length > 4000 || seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    uniqueTexts.push(trimmed);
+    if (uniqueTexts.length >= 100) break;
+  }
+
+  if (uniqueTexts.length === 0) {
+    res.json({ target_lang: targetLang, translations: {}, cached: 0, generated: 0, provider: 'none' });
+    return;
+  }
+
+  const out = await translateTextsReal(targetLang, targetLangName, uniqueTexts);
+  res.json({
+    target_lang: targetLang,
+    ...out,
+  });
+});
+
 app.post('/api/i18n/translate', async (req: AuthedRequest, res) => {
   const b = (req.body || {}) as Record<string, unknown>;
   const targetLang = String(b.target_lang || '').trim().slice(0, 16);
@@ -14436,7 +14808,7 @@ app.post('/api/i18n/translate', async (req: AuthedRequest, res) => {
     return;
   }
 
-  // Strictly restrict to static UI dictionary keys (reject large payloads or potential PII)
+  // Strictly restrict to static UI dictionary keys
   const cleanEntries = Object.entries(items)
     .filter(([k, v]) => /^[a-z0-9_.-]{2,96}$/i.test(k) && typeof v === 'string' && v.trim().length > 0 && v.trim().length <= 160)
     .slice(0, 150) as Array<[string, string]>;
@@ -14459,41 +14831,29 @@ app.post('/api/i18n/translate', async (req: AuthedRequest, res) => {
 
   let generatedCount = 0;
   if (missing.length > 0) {
-    const ai = getGeminiClient();
-    if (ai) {
-      try {
-        const promptObj: Record<string, string> = {};
-        for (const [k, v] of missing) promptObj[k] = v;
-        const response = await ai.models.generateContent({
-          model: 'gemini-4-hydrogen',
-          contents: `Translate the following Enterprise Attendance, HR, Biometric Device, and ERP UI labels from English into ${targetLangName} (${targetLang}). Return ONLY a valid JSON object mapping the exact same keys to their natural, concise, professional UI translations. Do not translate placeholder tokens like {name} or {count}. Keep acronyms like ZKTeco K40, EAT, ETB, TCP/IP intact.\n\n${JSON.stringify(promptObj)}`,
-          config: { responseMimeType: 'application/json' },
-        });
-        const rawText = (response.text || '').trim();
-        const parsed = JSON.parse(rawText) as Record<string, unknown>;
-        const now = new Date().toISOString();
-        const insStmt = db.prepare(
-          `INSERT INTO i18n_translations (lang_code, translation_key, value_text, is_approved, source, updated_by, updated_at)
-           VALUES (?, ?, ?, 1, 'ai', ?, ?)
-           ON CONFLICT(lang_code, translation_key) DO UPDATE SET
-             value_text = CASE WHEN i18n_translations.source = 'manual' THEN i18n_translations.value_text ELSE excluded.value_text END,
-             updated_at = excluded.updated_at`
-        );
-        const actor = req.authUser?.full_name || 'System i18n';
-        const tx = db.transaction(() => {
-          for (const [k, v] of Object.entries(parsed)) {
-            if (typeof v === 'string' && v.trim() && promptObj[k]) {
-              result[k] = v.trim();
-              insStmt.run(targetLang, k, v.trim(), actor, now);
-              generatedCount += 1;
-            }
-          }
-        });
-        tx();
-      } catch (err) {
-        console.warn('[i18n Gemini fallback]', err instanceof Error ? err.message : err);
+    const uniqueEnVals = Array.from(new Set(missing.map(([, v]) => v.trim())));
+    const translatedRes = await translateTextsReal(targetLang, targetLangName, uniqueEnVals);
+    const now = new Date().toISOString();
+    const insStmt = db.prepare(
+      `INSERT INTO i18n_translations (lang_code, translation_key, value_text, is_approved, source, updated_by, updated_at)
+       VALUES (?, ?, ?, 1, ?, ?, ?)
+       ON CONFLICT(lang_code, translation_key) DO UPDATE SET
+         value_text = CASE WHEN i18n_translations.source = 'manual' THEN i18n_translations.value_text ELSE excluded.value_text END,
+         updated_at = excluded.updated_at`
+    );
+    const actor = req.authUser?.full_name || 'System i18n';
+    const srcLabel = translatedRes.provider === 'ai' ? 'ai' : 'auto';
+    const tx = db.transaction(() => {
+      for (const [k, enVal] of missing) {
+        const tVal = translatedRes.translations[enVal.trim()];
+        if (tVal && tVal.trim()) {
+          result[k] = tVal.trim();
+          insStmt.run(targetLang, k, tVal.trim(), srcLabel, actor, now);
+          generatedCount += 1;
+        }
       }
-    }
+    });
+    tx();
   }
 
   res.json({

@@ -457,15 +457,7 @@ export function translatePhraseDictionary(text: string, lang: AppLang): string {
   for (const [rx, rep] of dictMap[lang]) {
     out = out.replace(rx, rep);
   }
-  const prefixMap: Record<Exclude<AppLang, 'en'>, string> = {
-    am: '[አማርኛ ትርጉም] ',
-    om: '[Hiika Afaan Oromoo] ',
-    ti: '[ትግርኛ ትርጉም] ',
-    ar: '[الترجمة العربية] ',
-    zh: '[中文译文] ',
-  };
-  const prefix = prefixMap[lang];
-  return out.startsWith(prefix) ? out : `${prefix}${out}`;
+  return out;
 }
 
 export interface DocumentTemplateDef {
